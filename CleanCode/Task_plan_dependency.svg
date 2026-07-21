@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1080" viewBox="0 0 1500 1080">
+<defs>
+<marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+<path d="M0,0 L0,6 L9,3 z" fill="#4d4d4d"/></marker>
+<marker id="arrowGray" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+<path d="M0,0 L0,6 L9,3 z" fill="#808080"/></marker>
+<style><![CDATA[text{font-family:Arial,"Noto Sans SC","Microsoft YaHei",sans-serif;}.laneTitle{font-size:16px;font-weight:700;fill:#333;}.nodeText{font-size:14px;font-weight:700;fill:#222;text-anchor:middle;}.legend{font-size:13px;fill:#333;}]]></style>
+</defs>
+<rect width="1500" height="1080" fill="#ffffff"/>
+<text x="750" y="28" text-anchor="middle" font-size="22" font-weight="700">vLLM-GR 重构任务依赖关系</text>
+<rect x="45" y="155" width="320" height="450" rx="14" fill="#fff5f5" stroke="#d79b9b" stroke-width="2" stroke-dasharray="8 6"/>
+<text class="laneTitle" x="61" y="183">安全与工程基线</text>
+<rect x="395" y="155" width="310" height="300" rx="14" fill="#f4fbf3" stroke="#a9d18e" stroke-width="2" stroke-dasharray="8 6"/>
+<text class="laneTitle" x="411" y="183">Beam 领域</text>
+<rect x="720" y="155" width="310" height="420" rx="14" fill="#fffaf0" stroke="#e5c365" stroke-width="2" stroke-dasharray="8 6"/>
+<text class="laneTitle" x="736" y="183">Engine / Runtime</text>
+<rect x="1045" y="155" width="330" height="300" rx="14" fill="#faf5fc" stroke="#bfa6ca" stroke-width="2" stroke-dasharray="8 6"/>
+<text class="laneTitle" x="1061" y="183">平台与 Attention</text>
+<path d="M760.0,104 V162.0 H205.0 V220" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M760.0,104 V209.5 H205.0 V315" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M760.0,104 V257.0 H205.0 V410" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M760.0,104 V304.5 H205.0 V505" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M760.0,104 V162.0 H550.0 V220" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M760.0,104 V162.0 H875.0 V220" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M760.0,104 V162.0 H1210.0 V220" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M760.0,104 V352.0 H712.5 V600" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M550.0,284 V312.0 H550.0 V340" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M875.0,284 V312.0 H875.0 V340" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M875.0,404 V432.0 H875.0 V460" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M1210.0,284 V312.0 H1210.0 V340" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M205.0,379 V554.5 H760.0 V730" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M550.0,404 V567.0 H760.0 V730" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M875.0,524 V627.0 H760.0 V730" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M1210.0,404 V567.0 H760.0 V730" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M760.0,794 V817.0 H760.0 V840" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M712.5,664 V752.0 H760.0 V840" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M760.0,912 V938.5 H760.0 V965" fill="none" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<path d="M205.0,284 V562.0 H760.0 V840" fill="none" stroke="#808080" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#arrowGray)"/>
+<path d="M205.0,474 V657.0 H760.0 V840" fill="none" stroke="#808080" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#arrowGray)"/>
+<path d="M205.0,569 V767.0 H760.0 V965" fill="none" stroke="#808080" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#arrowGray)"/>
+<rect x="620" y="40" width="280" height="64" rx="12" fill="#dae8fc" stroke="#6c8ebf" stroke-width="2"/>
+<text class="nodeText" x="760.0" y="77.0">T0 现状基线与兼容矩阵</text>
+<rect x="80" y="220" width="250" height="64" rx="12" fill="#f8cecc" stroke="#b85450" stroke-width="2"/>
+<text class="nodeText" x="205.0" y="247.0">T1 修复 SamplingParams</text>
+<text class="nodeText" x="205.0" y="268.0">全局副作用</text>
+<rect x="80" y="315" width="250" height="64" rx="12" fill="#f8cecc" stroke="#b85450" stroke-width="2"/>
+<text class="nodeText" x="205.0" y="342.0">T2 补丁注册与</text>
+<text class="nodeText" x="205.0" y="363.0">原子初始化</text>
+<rect x="80" y="410" width="250" height="64" rx="12" fill="#f8cecc" stroke="#b85450" stroke-width="2"/>
+<text class="nodeText" x="205.0" y="447.0">T3 类型化 GR 配置</text>
+<rect x="80" y="505" width="250" height="64" rx="12" fill="#f8cecc" stroke="#b85450" stroke-width="2"/>
+<text class="nodeText" x="205.0" y="532.0">T12 Ruff / mypy / CI</text>
+<text class="nodeText" x="205.0" y="553.0">质量基线</text>
+<rect x="430" y="220" width="240" height="64" rx="12" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
+<text class="nodeText" x="550.0" y="247.0">T4 Beam Search</text>
+<text class="nodeText" x="550.0" y="268.0">领域模型</text>
+<rect x="430" y="340" width="240" height="64" rx="12" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
+<text class="nodeText" x="550.0" y="367.0">T5 统一在线 / 离线</text>
+<text class="nodeText" x="550.0" y="388.0">Beam 状态机</text>
+<rect x="755" y="220" width="240" height="64" rx="12" fill="#fff2cc" stroke="#d6b656" stroke-width="2"/>
+<text class="nodeText" x="875.0" y="247.0">T6 EngineCore</text>
+<text class="nodeText" x="875.0" y="268.0">扩展协议</text>
+<rect x="755" y="340" width="240" height="64" rx="12" fill="#fff2cc" stroke="#d6b656" stroke-width="2"/>
+<text class="nodeText" x="875.0" y="367.0">T7 Scheduler</text>
+<text class="nodeText" x="875.0" y="388.0">Beam 上下文</text>
+<rect x="755" y="460" width="240" height="64" rx="12" fill="#fff2cc" stroke="#d6b656" stroke-width="2"/>
+<text class="nodeText" x="875.0" y="487.0">T8 ModelRunner</text>
+<text class="nodeText" x="875.0" y="508.0">Adapter</text>
+<rect x="1080" y="220" width="260" height="64" rx="12" fill="#e1d5e7" stroke="#9673a6" stroke-width="2"/>
+<text class="nodeText" x="1210.0" y="247.0">T9 Attention Backend</text>
+<text class="nodeText" x="1210.0" y="268.0">兼容隔离</text>
+<rect x="1080" y="340" width="260" height="64" rx="12" fill="#e1d5e7" stroke="#9673a6" stroke-width="2"/>
+<text class="nodeText" x="1210.0" y="367.0">T10 GPU / NPU</text>
+<text class="nodeText" x="1210.0" y="388.0">平台策略</text>
+<rect x="430" y="600" width="565" height="64" rx="12" fill="#e3c800" stroke="#b09500" stroke-width="2"/>
+<text class="nodeText" x="712.5" y="637.0">T11 测试分层与兼容契约测试（贯穿各阶段）</text>
+<rect x="620" y="730" width="280" height="64" rx="12" fill="#d5e8d4" stroke="#82b366" stroke-width="2"/>
+<text class="nodeText" x="760.0" y="767.0">T13 目录结构重组</text>
+<rect x="620" y="840" width="280" height="72" rx="12" fill="#f8cecc" stroke="#b85450" stroke-width="2"/>
+<text class="nodeText" x="760.0" y="871.0">T14 删除旧补丁、动态字段</text>
+<text class="nodeText" x="760.0" y="892.0">和重复实现</text>
+<rect x="620" y="965" width="280" height="72" rx="12" fill="#dae8fc" stroke="#6c8ebf" stroke-width="2"/>
+<text class="nodeText" x="760.0" y="996.0">T15 文档、迁移说明</text>
+<text class="nodeText" x="760.0" y="1017.0">和最终质量收口</text>
+<rect x="1045" y="600" width="330" height="80" rx="10" fill="#f5f5f5" stroke="#666666"/>
+<line x1="1065" y1="625" x2="1135" y2="625" stroke="#4d4d4d" stroke-width="2" marker-end="url(#arrow)"/>
+<text class="legend" x="1150" y="630">必须依赖</text>
+<line x1="1065" y1="653" x2="1135" y2="653" stroke="#808080" stroke-width="2" stroke-dasharray="7 6" marker-end="url(#arrowGray)"/>
+<text class="legend" x="1150" y="658">支撑或收口依赖</text>
+</svg>
