@@ -22,7 +22,7 @@
 - [13. NPU BeamKV Provider 设计](#13-npu-beamkv-provider-设计)
 - [14. ACS、NVIDIA 与目标方案对比](#14-acsnvidia-与目标方案对比)
 - [15. 与 L0/L1/L2 执行层级的关系](#15-与-l0l1l2-执行层级的关系)
-- [16. Graph 模式约束](#16-graph-模式约束)
+- [16. CUDA Graph / ACLGraph 与 BeamKV 联动设计](#16-cuda-graph--aclgraph-与-beamkv-联动设计)
 - [17. 推荐接口与代码组织](#17-推荐接口与代码组织)
 - [18. 对当前 vLLM-GR 代码的改造点](#18-对当前-vllm-gr-代码的改造点)
 - [19. 可观测性、测试与验收标准](#19-可观测性测试与验收标准)
@@ -1235,55 +1235,751 @@ BeamTransition + BeamKVStepTransaction
 
 ---
 
-## 16. Graph 模式约束
+## 16. CUDA Graph / ACLGraph 与 BeamKV 联动设计
 
-### 16.1 必须稳定的对象
+### 16.1 先给结论
 
-- BeamKVPool base address；
-- slot stride；
-- binding input buffer 地址；
-- parent/permutation buffer 地址；
-- Attention metadata buffer 地址；
-- postprocess output buffer 地址；
-- operator workspace；
-- graph signature 对应的 batch/beam/step geometry。
+Graph 化 Beam decode 的关键不是“把 BeamKV Tensor 放进图里”，而是同时固定执行拓扑、
+设备地址、launch geometry 和 workspace，并把每一步变化的内容改造成固定地址 Buffer 中的
+数据更新。
 
-### 16.2 Graph signature
+因此：
 
-推荐至少包含：
+1. 固定 BeamKVPool 是 Graph 的必要条件，但不是充分条件；
+2. Scheduler admission 解决“物理 slot 是否够”，Graph dispatcher 解决“当前 shape 是否有图”，
+   两者不能合并成一个判断；
+3. `batch * beam` 相同不代表 Graph signature 相同，例如 `2 x beam4` 和 `1 x beam8`
+   都是 8 个 token row，但 Beam 分组、lineage 和 KV layout 完全不同；
+4. CUDA 推荐固定 append target，通过 lineage 改变逻辑父子关系；
+5. NPU 推荐固定 continuous slot，通过 `select_unshared_kv` 改变物理 Beam 顺序；
+6. 第一阶段的“Full Graph”应明确指 **一次 model forward，包括 Beam Attention 和 KV append**，
+   Beam top-k/commit 可以先在图外；
+7. 后续才把 LM Head、Beam top-k、lineage/reorder 和状态提交并入完整 step graph；
+8. 多 step graph 需要固定 window 和 device-resident loop state，不应作为第一阶段目标；
+9. Graph pool、Graph workspace 与 BeamKVPool 都要纳入 EngineCore 的统一显存计划；
+10. Graph miss 只能导致降级执行或受控 capture，不能绕过 Beam slot 容量限制。
+
+最重要的区分是：
 
 ```text
-platform
-batch_bucket
-beam_width_bucket
-decode_step_bucket 或固定 window
-dtype
-kv_layout
-attention_backend
-postprocess_variant
+Capacity admission:
+    这个请求有没有可用的物理 Beam slot？
+
+Graph dispatch:
+    这个已获准执行的物理 batch，有没有匹配的 Graph executable？
 ```
 
-### 16.3 禁止的 hot-path 行为
+前者失败时请求必须等待；后者失败时可以安全回退 Eager。
 
-- `torch.cat` 扩展 BeamKV；
-- Pool 在线 grow；
-- 按请求重新申请 parent buffer；
-- 重新创建 metadata Tensor；
-- 运行时在 Common hot path 判断 CUDA/NPU；
-- Graph capture 后改变 Pool 地址；
-- 因一个 session 完成而 `zero_()` 整个 Pool。
+### 16.2 Graph 固定的到底是什么
 
-### 16.4 Fallback
+Graph capture 记录的不是某个逻辑 request，而是一组可复用的设备执行关系。对 BeamKV 而言，
+对象可以分成三类。
 
-不满足 bucket、地址或 kernel 能力时，必须安全回退：
+| 类别 | 典型对象 | replay 时是否可变 | 处理方式 |
+| --- | --- | --- | --- |
+| 地址和拓扑 | BeamKVPool base、每层 K/V Tensor、workspace、输出 Buffer | 不可改变 | Pool 生命周期内固定 |
+| launch geometry | token bucket、beam width、head 数、layout、kernel variant | 通常不可改变 | 进入 Graph key |
+| Buffer 内容 | slot id、step、parent id、block table、length、active mask | 可以改变 | replay 前原地 `copy_()` / `fill_()` |
+| Host 控制状态 | admission、请求等待队列、取消、slot owner | 不进入图 | Scheduler/Manager 管理 |
+
+必须稳定的地址至少包括：
+
+- NativeKVPool 和 BeamKVPool 的 base address；
+- 每个 Layer 的 K/V view 地址；
+- slot stride 和平台物理 layout；
+- input id、position、slot binding Buffer；
+- parent、permutation、active mask Buffer；
+- Attention metadata 和 block table Buffer；
+- LM Head / Beam postprocess 输出 Buffer；
+- operator workspace；
+- generation、step cursor 和完成标志 Buffer；
+- CUDA Graph 或 ACLGraph executable 所引用的所有中间 Tensor。
+
+允许变化的是这些 Buffer 的**内容**，而不是用新的 Tensor 替换它们。例如：
+
+```python
+# 正确：地址不变，只更新内容
+graph_inputs.slot_ids[:actual].copy_(runtime_slot_ids)
+graph_inputs.decode_steps[:actual].copy_(runtime_steps)
+graph_inputs.active_mask.fill_(False)
+graph_inputs.active_mask[:actual].fill_(True)
+
+# 错误：替换 Tensor，Graph 仍引用旧地址
+graph_inputs.slot_ids = runtime_slot_ids
+graph_inputs.decode_steps = torch.tensor(runtime_steps, device=device)
+```
+
+### 16.3 Graph 显存必须进入统一 CachePlan
+
+#### 16.3.1 vLLM CUDA 当前做法
+
+vLLM `GPUWorker.determine_available_memory()` 的实际思路是：
+
+1. `profile_run()` 测量模型权重之外的峰值 activation/non-torch memory；
+2. 启用 CUDA Graph 时，通过 `profile_cudagraph_memory()` 估算 Graph pool；
+3. 从 requested device memory 中扣除 non-KV 和 Graph estimate；
+4. 把剩余值交给 EngineCore；
+5. EngineCore 生成 KVCacheConfig 并让 Worker 分配 KV；
+6. 随后真正 capture Graph，并比较实际 Graph memory 与估算值。
+
+这意味着 BeamKV 不能在原生 Paged KV 已经吃完这个“剩余值”后再单独申请，否则是对同一份
+余量的重复消费。
+
+#### 16.3.2 BeamKV 目标公式
+
+统一预算应满足：
 
 ```text
-FULL GRAPH
-  -> PIECEWISE GRAPH
+M_device_budget
+  = M_requested
+  - M_weights
+  - M_peak_activation
+  - M_non_framework
+  - M_graph_pool
+  - M_operator_workspace
+  - M_safety_margin
+
+M_native_kv + M_beam_kv <= M_device_budget
+```
+
+其中 `M_graph_pool` 必须覆盖 Beam 专属 Graph，而不仅是原生 vLLM decode Graph。
+
+推荐的初始化顺序：
+
+```mermaid
+flowchart TB
+    P["Worker profile model"]
+    G["Profile or reserve Graph memory"]
+    R["Report usable cache bytes"]
+    C["EngineCore builds CachePlan"]
+    A["Worker allocates NativeKV + BeamKV"]
+    W["Warm up Beam kernels"]
+    X["Capture Graph buckets"]
+    V["Verify actual memory and capacity"]
+
+    P --> G --> R --> C --> A --> W --> X --> V
+```
+
+Beam Graph 内存可以用两种方式纳入预算：
+
+- **Profile 方式**：用临时 Beam proxy Buffer 运行 Beam Graph profile，销毁临时 executable，
+  得到 Graph pool estimate，再生成最终 CachePlan；
+- **Reserve 方式**：按配置显式保留 `beam_graph_memory_reserve_bytes`，完成最终 capture 后用实际值
+  校验，超出保留量则启动失败或减少 Native/Beam 容量后重新规划。
+
+第一版更推荐 Reserve 方式，流程简单、可控；稳定后再做精确 profile。
+
+#### 16.3.3 ACS 当前路径的风险
+
+ACS 的 `NPUWorker.determine_available_memory()` 当前主要用 `profile_run()` 计算可用于 KV 的内存，
+`capture_model()` 在 KV 初始化后的 warm-up 阶段发生。也就是说，ACLGraph 的真实内存占用没有像
+CUDA 新路径那样显式进入可用 KV 预算。
+
+同时，当前 `_ensure_beam_search_buffer_pool()` 支持运行中扩容，扩容后会删除旧的 Beam ACLGraph
+entry 和 task-group 参数。它适合验证功能，但不适合作为 continuous batching serving 的最终容量
+模型。
+
+目标实现应改成：
+
+```text
+先规划 ACLGraph reserve
+  -> 再划分 NativeKV / BeamKV
+  -> 一次性申请 Pool
+  -> capture 热门 bucket
+  -> 服务期间禁止 grow
+```
+
+### 16.4 BeamGraphKey：不能只复用 num_tokens
+
+vLLM 原生 `CudagraphDispatcher` 主要通过 `num_tokens`、`num_reqs`、是否 uniform decode、
+LoRA 状态等构造 `BatchDescriptor`。Beam decode 还需要显式表达 Beam geometry。
+
+推荐增加平台无关的逻辑 key：
+
+```python
+@dataclass(frozen=True)
+class BeamGraphKey:
+    platform: str                 # cuda / npu
+    runtime_mode: str             # full_forward / full_step / piecewise
+    num_tokens_bucket: int        # padded sessions * beam width
+    num_sessions_bucket: int
+    beam_width: int
+    query_len: int                # 首版固定为 1
+    dtype: str
+    kv_layout: str
+    attention_backend: str
+    postprocess_variant: str      # normal / constrained / final
+    tp_size: int
+```
+
+平台 Provider 可以在此基础上追加私有 key，例如 CUDA kernel tile、NPU task-group variant，
+但不能删除 Common key 中影响语义的字段。
+
+#### 16.4.1 哪些字段通常不应进入 key
+
+- `slot_id`：它是 replay 输入内容；
+- `request_id`：只属于控制面；
+- 当前 token id、score、parent id：都是 Buffer 内容；
+- 精确 `decode_step`：如果 kernel 从固定地址 scalar/vector Buffer 读取，则不进入 key；
+- `max_decode_steps`：通常属于 Pool capacity，而不是一次 launch geometry。
+
+只有当某个平台 kernel 将 step 固化为编译属性，或者不同 step bucket 使用不同 launch 参数时，
+才把 `decode_step_bucket` 纳入 Provider 私有 Graph key。
+
+#### 16.4.2 num_tokens 相同但不能共图的例子
+
+```text
+Case A: 8 个普通 decode request
+Case B: 2 个 Beam session, beam_width = 4
+Case C: 1 个 Beam session, beam_width = 8
+
+三者 num_tokens 都是 8，但：
+  - KV layout 不同；
+  - parent grouping 不同；
+  - Attention metadata 不同；
+  - postprocess 输出 shape 不同；
+  - commit 算法不同。
+```
+
+因此，Beam Graph dispatcher 不能仅根据 `total_num_scheduled_tokens` 命中原生 decode graph。
+
+### 16.5 Graph bucket、物理 slot bucket 与 padding
+
+这里有两套 bucket：
+
+| Bucket | 解决的问题 | 由谁管理 |
+| --- | --- | --- |
+| Beam capacity bucket | 有多少 `(beam_width, max_steps)` 物理 slot | EngineCore + Scheduler |
+| Graph shape bucket | 哪些执行 shape 有已捕获 executable | Worker Graph dispatcher |
+
+请求先通过 capacity admission，再进行 Graph dispatch：
+
+```text
+request
+  -> reserve physical Beam slot
+  -> build actual execution batch
+  -> choose padded Graph bucket
+  -> stage binding and masks
+  -> replay or fallback
+```
+
+如果实际有 5 个 Beam session、`beam_width=4`，Graph bucket 是 8 个 session：
+
+```text
+actual token rows = 5 * 4 = 20
+graph token rows  = 8 * 4 = 32
+```
+
+多出的 12 行不能错误地指向 live slot 0。推荐二选一：
+
+1. kernel 的所有写入、Attention、top-k、commit 都受 `active_mask` 保护；
+2. padding row 绑定专用 scratch slot，且输出被 mask。
+
+推荐同时做两层保护：
+
+- active mask 保证语义；
+- 每个 Graph bucket 配置 scratch arena，防止错误 kernel 写到 live slot。
+
+scratch arena 是 Graph workspace，不占用可调度 slot；但其显存必须进入 CachePlan。
+
+### 16.6 建议分四级推进 Graph 边界
+
+| 等级 | 捕获范围 | BeamKV 行为 | Scheduler 自由度 | 推荐阶段 |
+| --- | --- | --- | --- | --- |
+| G0 Piecewise | Transformer 可图分段 | Beam Attention/commit 可在图外 | 高 | 最低风险 fallback |
+| G1 Full Forward | input 到 hidden/logits，包含 Beam Attention 和 KV append | step 后处理在图外 | 高 | 第一阶段 |
+| G2 Full Step | forward + LM Head + Beam top-k + BeamKV commit | step 边界可重组 batch | 中 | 第二阶段 |
+| G3 Fixed Window | 连续 N 个 decode step | 图内更新 step/finished/lineage | 低 | L2 最终优化 |
+
+#### G0：Piecewise
+
+与 vLLM 的 PIECEWISE 理念一致：把不支持 Graph 或动态性高的 Attention/Beam postprocess 留在图外，
+其余模型分段 replay。它不是最终性能目标，但应长期保留为可靠 fallback。
+
+#### G1：Full Forward
+
+一次 replay 覆盖：
+
+```text
+embedding
+  -> transformer layers
+     -> BeamKV append
+     -> Beam Attention
+  -> LM Head 或 hidden output
+```
+
+Beam transition、parent 选择和 commit 暂时在图外执行。该模式已经消除逐 Layer 的 Host launch，
+并保留 Scheduler 每一步重新组 batch 的能力，是最合理的第一阶段。
+
+#### G2：Full Step
+
+进一步捕获：
+
+```text
+forward
+  -> LM Head
+  -> constrained/unconstrained top-k
+  -> BeamTransition
+  -> lineage commit 或 physical reorder
+  -> generation publish
+```
+
+G2 要求 top-k 和 commit 算子提供固定地址的 `out=` 形式，不能返回新的动态 Tensor 并替换
+BeamContext 内字段。
+
+#### G3：Fixed Window
+
+一次 replay 连续执行固定 N 步。需要：
+
+- Beam loop 在 device 上；
+- finished/EOS 通过 active mask 表达；
+- 每一步的 input token 从上一轮固定 output Buffer 获取；
+- 每一步使用固定 workspace；
+- 不能在 window 内进行 Scheduler 抢占、插入或重组；
+- 图内错误只能在 window 完成或设备事件报错后被发现。
+
+它适合吞吐优先、shape 稳定的离线或专用服务，不一定适合通用 continuous batching。
+
+### 16.7 Common 控制流与 Graph 数据流
+
+```mermaid
+flowchart TB
+    S["Scheduler admission"]
+    B["Beam slot binding"]
+    D["Graph dispatcher"]
+    I["Stable input staging"]
+    C["CUDA Graph replay"]
+    N["ACLGraph replay"]
+    K["BeamKV append / attention"]
+    T["Transition and commit"]
+    E["Completion event"]
+    P["Publish generation"]
+
+    S --> B --> D --> I
+    I --> C
+    I --> N
+    C --> K
+    N --> K
+    K --> T --> E --> P
+```
+
+图外行为：
+
+- 物理 slot reservation/free；
+- Graph key 选择；
+- 请求取消和抢占决策；
+- 把 runtime metadata 写入固定 staging Buffer；
+- 等待 completion event；
+- 向 Scheduler 发布 generation/finished 状态。
+
+图内行为取决于 G0/G1/G2/G3，但必须保持同一事务原则：
+
+```text
+Graph replay 成功并完成所有 Layer 的 KV/transition commit
+    -> completion event
+    -> committed_generation++
+    -> Scheduler 才能观察到新 token 和新 Beam 状态
+```
+
+### 16.8 CUDA Graph + append-only BeamKV
+
+#### 16.8.1 推荐的固定 Buffer
+
+CUDA Provider 至少预分配：
+
+```text
+input_ids_buf          [max_token_bucket]
+positions_buf          [max_token_bucket]
+slot_ids_buf           [max_session_bucket]
+decode_steps_buf       [max_session_bucket]
+active_mask_buf        [max_session_bucket, beam_width]
+parent_ids_buf         [2, max_session_bucket, beam_width]
+beam_scores_buf        [2, max_session_bucket, beam_width]
+transition_buf         [max_session_bucket, beam_width]
+generation_buf         [max_session_bucket]
+beam_kv[layer]         [slot, step, beam, kv_head, head_dim]  # 示例布局
+```
+
+`parent_ids_buf`、score 和其他逐步状态可以使用 ping-pong Buffer，避免读写同一份状态造成
+Graph 内依赖不清。
+
+#### 16.8.2 replay 数据流
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant W as Worker
+    participant G as CUDA Graph
+    participant K as BeamKVPool
+    participant C as Commit
+
+    S->>W: binding + graph key
+    W->>W: copy metadata into stable buffers
+    W->>G: replay
+    G->>K: append current K/V
+    G->>K: attention reads prefix + lineage
+    G->>C: top-k / parent transition
+    C->>K: publish lineage generation
+    G-->>W: completion event
+    W-->>S: committed generation / outputs
+```
+
+#### 16.8.3 为什么 append-only 更适合 CUDA Graph
+
+对于 CUDA：
+
+- 当前 step 的物理写地址只依赖 `slot + step + beam`；
+- parent 变化只更新 lineage Buffer；
+- 历史 KV 不需要因 Beam 重排而复制；
+- Graph 中的 Tensor 地址和 kernel topology 都保持稳定；
+- `decode_step` 可以作为固定地址 device scalar/vector 的内容更新；
+- Beam Attention kernel 根据 lineage 解析逻辑祖先。
+
+需要禁止：
+
+- NVIDIA reference 中逐步 `torch.cat([old_kv, new_kv])`；
+- Python list 中替换每层 `beam_kv_caches[l]`；
+- 根据当前 step 创建新的 parent Tensor；
+- `.item()` 后用 Python 分支决定图内算子；
+- 使用运行时长度改变 kernel launch grid；
+- Graph replay 前后让 allocator 移动或重建 BeamKVPool。
+
+#### 16.8.4 与 vLLM CUDAGraphMode 的对应
+
+| vLLM runtime mode | Beam decode 解释 |
+| --- | --- |
+| `NONE` | 完整 eager，仍必须使用 Scheduler reservation |
+| `PIECEWISE` | 模型片段 replay，Beam Attention 或 postprocess 可在图外 |
+| `FULL` | 至少捕获完整 Beam forward；是否包含 postprocess 由 Beam graph level 决定 |
+| `FULL_DECODE_ONLY` | Beam decode 优先 Full，prefill/mixed batch 不成图 |
+| `FULL_AND_PIECEWISE` | uniform Beam decode 走 Full，mixed/prefill 走 Piecewise |
+
+不能直接把 Beam batch 冒充原生 uniform decode batch。原生 `BatchDescriptor.num_reqs` 表示请求数，
+而 Beam 执行同时存在 `num_sessions` 和 `num_sessions * beam_width` 两个维度，必须由
+`BeamGraphKey` 明确区分。
+
+#### 16.8.5 final step
+
+final step 不需要为下一轮 Attention 更新 lineage。两种选择：
+
+- 单独 capture `postprocess_variant=final` 的 Graph，省掉 next-step commit；
+- 复用 normal Graph，但通过 device predicate 跳过 lineage commit。
+
+如果 final 请求比例高且 shape 稳定，单独 Graph 更高效；否则优先统一 Graph，减少 capture 数量。
+
+### 16.9 ACLGraph + continuous BeamKV
+
+#### 16.9.1 ACS 已验证的有效思路
+
+ACS 当前实现已经说明以下路径可行：
+
+- `BeamSearchBufferPool` 为 K/V、sequence、score、step 等提供持久地址；
+- Beam decode Attention 使用 `cache_unshared_kv + x_attention`；
+- `decode_step_buf` 使用固定地址 NPU Tensor；
+- ACLGraph capture 为每层记录 cache 和 attention task group；
+- replay 前通过 `graph_task_update` 更新 `decode_step` 等动态参数；
+- 非最后一步使用 `select_unshared_kv` 物理重排所有 Layer KV；
+- 最后一步使用 final select，跳过无用 KV reorder。
+
+这些思路应保留在 NPU Provider，而不是泄漏到 Common 层。
+
+#### 16.9.2 当前 ACS 实现不宜直接照搬的部分
+
+| 当前行为 | serving 风险 | 目标修正 |
+| --- | --- | --- |
+| Pool 不够时 lazy grow | 地址变化、删图、瞬时 OOM | 启动期固定容量，运行期 backpressure |
+| Beam Graph 首次请求 lazy capture | 首请求抖动、并发 capture 复杂 | 预捕获热门 bucket，冷门 bucket 受控 fallback |
+| 单一 `_beam_search_context` | 多 session 生命周期耦合 | 每个 slot 独立 SessionState |
+| 新请求前 `reset_buffers()` 整个 Pool | 破坏其他并发 slot，带来大带宽写 | slot generation/active mask，按 slot 清理 |
+| 单一 scalar `decode_step_buf` | 只能安全支持 lock-step batch | 每 slot step vector，或 Scheduler 按 step 分组 |
+| `beam_search_group` 返回新 Tensor | 地址可能变化，不利于 full step graph | `out=` 到持久 Buffer |
+| Graph memory 未进入 KV budget | capture 时可能 OOM | EngineCore CachePlan 预留 ACLGraph memory |
+
+#### 16.9.3 decode_step 的平台差异
+
+CUDA kernel 通常可以直接从固定地址的 device scalar/vector 读取 step；ACLGraph 中某些 NPU op
+可能在 capture 时把标量参数固化到 task。ACS 使用 `graph_task_update_begin/end` 对每层
+`cache_unshared_kv` 和 `x_attention` 更新参数，就是针对这种差异。
+
+Common 层只提供：
+
+```text
+BeamStepCursor
+  slot_ids
+  decode_steps
+  generation
+```
+
+Provider 决定：
+
+- CUDA：更新 device Buffer 内容；
+- NPU：更新 Buffer，并在需要时执行 task-group parameter update；
+- 某些 NPU kernel 只支持一个 scalar step 时，Scheduler 临时把不同 step 的 session 分桶执行；
+- kernel 支持 step vector 后，再允许任意 step 的 session 进入同一 Graph bucket。
+
+不能假设 continuous batching 中所有请求的 decode step 相同。
+
+#### 16.9.4 NPU forward graph 与 full step graph
+
+当前 ACS Beam ACLGraph 重点覆盖逐层：
+
+```text
+cache_unshared_kv
+  -> x_attention
+```
+
+`beam_search_group + select_unshared_kv` 仍属于 forward 后的 Beam commit 路径。目标实现应分两步：
+
+1. 先稳定 G1：Beam forward 进入 ACLGraph，postprocess/reorder 在图外；
+2. 再实现 G2：为 top-k/group/select 提供固定 `out=` Buffer 和稳定 workspace，将它们一起 capture。
+
+NPU 的 G2 事务为：
+
+```text
+all-layer cache_unshared_kv / x_attention
+  -> LM Head
+  -> beam_search_group
+  -> all-layer select_unshared_kv
+  -> completion event
+  -> generation publish
+```
+
+`select_unshared_kv` 是原地 commit。任何 Layer reorder 失败后都无法轻易恢复到旧物理排列，因此：
+
+- generation 只能在所有 Layer reorder 完成后发布；
+- replay/task update 失败时 session 进入 ERROR；
+- slot 在 stream 同步和错误确认前不能复用；
+- 第一版不尝试通用 rollback。
+
+#### 16.9.5 NPU slot 清理
+
+为了 Graph 地址稳定和多 session 并发，不应在每个新请求前清零整个 Pool。推荐：
+
+- `slot_generation[slot]++`；
+- `active_mask[slot]` 标记有效 Beam；
+- `valid_step[slot]` 限制 Attention 可读范围；
+- 只清理该 slot 的 sequence/score metadata；
+- KV 数据不必物理清零，只要新 generation 无法读取旧 step；
+- 有安全或调试要求时再异步按 slot 清零。
+
+### 16.10 CUDA Graph 与 ACLGraph 对比
+
+| 维度 | CUDA Graph 推荐方案 | ACLGraph 推荐方案 |
+| --- | --- | --- |
+| BeamKV 物理策略 | append-only + lineage | continuous slot + physical reorder |
+| step 更新 | 固定 device scalar/vector 内容 | device Buffer + 必要的 task update |
+| parent commit | 写 lineage/ping-pong metadata | `select_unshared_kv` all-layer reorder |
+| 历史 KV 移动 | 不移动 | 每个非 final step 原地重排 |
+| Graph key | token/session/beam/layout/kernel | token/session/beam/layout/task variant |
+| 动态参数 | stable pointer + content update | stable pointer，部分参数需 graph task update |
+| final step | 跳过 lineage-next commit | 跳过 `select_unshared_kv` |
+| Pool 扩容 | 禁止 | 禁止 |
+| 冷门 shape | Piecewise/Eager | Piecewise/Eager 或受控 lazy capture |
+| 失败恢复 | 未 publish 前 session-fatal | 原地 reorder 失败后 session-fatal |
+
+两端共用的是 Graph 生命周期和事务协议，而不是具体的 Graph API：
+
+```python
+class BeamGraphExecutor(Protocol):
+    def supports(self, key: BeamGraphKey) -> bool: ...
+    def stage(self, batch: BeamExecutionBatch) -> None: ...
+    def replay(self, key: BeamGraphKey) -> BeamGraphTicket: ...
+    def poll(self, ticket: BeamGraphTicket) -> BeamGraphResult: ...
+    def invalidate(self, reason: str) -> None: ...
+```
+
+`CUDAStream/CUDAGraph`、`NPUStream/ACLGraph/task handle` 都只出现在 Provider 实现中。
+
+### 16.11 Scheduler 对 Graph 的考量
+
+Scheduler 不管理 executable，但需要感知 Graph bucket，才能减少 padding 和 fallback。
+
+推荐调度优先级：
+
+```text
+先满足容量安全和公平性
+  -> 再优先合并同 BeamGraphKey 请求
+  -> 再选择最小可容纳 Graph bucket
+  -> Graph miss 则 Piecewise/Eager
+```
+
+不能为了命中 Graph 而破坏：
+
+- Beam slot reservation；
+- 等待时间公平性；
+- request deadline；
+- Native KV block 容量；
+- 每步最大 token budget；
+- TP/PP Worker 的一致 binding。
+
+Scheduler 下发的执行描述建议增加：
+
+```python
+@dataclass
+class BeamExecutionPlan:
+    bindings: list[BeamKVBinding]
+    graph_key: BeamGraphKey | None
+    actual_num_sessions: int
+    padded_num_sessions: int
+    actual_num_tokens: int
+    padded_num_tokens: int
+    final_step_mask: DeviceBufferRef
+    fallback_mode: str
+```
+
+#### 正常请求与 Beam 请求混跑
+
+正常 decode 和 Beam decode 可以出现在同一个 Scheduler step，但不应强行塞入同一个 Graph：
+
+```text
+Scheduler output
+  -> normal decode sub-batch -> native Graph
+  -> Beam decode sub-batch   -> Beam Graph
+```
+
+如果底层 ModelRunner 暂时不支持一个 step 多次 sub-batch execution，则第一版应在 Scheduler 中分开
+发射，而不是用错误 metadata 拼成一个 batch。
+
+### 16.12 Graph cache、capture 与 fallback 策略
+
+推荐：
+
+1. 启动时 capture 高频 bucket；
+2. 最大 bucket 优先 capture，以便 Graph memory pool 复用；
+3. 冷门 bucket 默认 Eager/Piecewise；
+4. 只有在平台支持、安全锁和显存 reserve 足够时才允许 lazy capture；
+5. lazy capture 只能新增 executable，不能扩大 BeamKVPool；
+6. Graph cache key 必须包含模型/权重/并行配置和 Beam provider 版本；
+7. Pool 地址或 layout 改变时，整组相关 Graph 全部 invalid；
+8. 单个请求结束不能 invalid Graph。
+
+安全降级关系：
+
+```text
+G3 FIXED WINDOW
+  -> G2 FULL STEP
+  -> G1 FULL FORWARD
+  -> G0 PIECEWISE
   -> EAGER
 ```
 
-回退不能改变 Beam 语义或 KV generation 规则。
+降级只改变执行方式，不改变：
+
+- slot binding；
+- Beam transition 语义；
+- KV commit 顺序；
+- generation；
+- 最终 token/score 结果。
+
+### 16.13 Graph 场景的容量和越界不变量
+
+除了第 10 节的一般容量不变量，还需要增加：
+
+```text
+actual_num_sessions <= graph_key.num_sessions_bucket
+actual_num_tokens   <= graph_key.num_tokens_bucket
+
+for every active lane:
+    slot_id < physical_slot_capacity[bucket]
+    decode_step < slot.max_decode_steps
+    beam_id < slot.beam_width
+
+for every padding lane:
+    active_mask == false
+    slot_id points to scratch or write is masked
+```
+
+Worker replay 前必须做 host-side 快速校验；debug/CI 模式下 kernel 还应做 device-side assert 或写
+error flag。Graph replay 完成后，只有 `error_flag == 0` 才能发布 generation。
+
+### 16.14 对当前三套实现的直接判断
+
+#### vLLM upstream
+
+可以直接继承：
+
+- FULL/PIECEWISE/NONE runtime mode；
+- capture size 和 padded batch dispatch；
+- profile Graph memory 再计算 KV 余量；
+- 最大 shape 优先 capture；
+- attention backend capability 导致自动降级的思路。
+
+必须扩展：
+
+- `BatchDescriptor` 对 Beam geometry 表达不足；
+- 原生 KV config 只规划 Native Paged KV，尚不知道 BeamKVPool；
+- 原生 Scheduler 不做 Beam slot reservation；
+- 原生 graph completion 不等同于 Beam multi-layer commit generation。
+
+#### NVIDIA SID-GR
+
+可以继承 append-only/lineage 语义，但当前逐步 `torch.cat`、Python per-layer list 替换和单次
+generate 生命周期不满足 Graph serving。需要预分配 arena、固定输出 Buffer 和 Graph-friendly
+BeamAttention kernel。
+
+#### ACS_vllm-GR
+
+可以继承 persistent Buffer、`cache_unshared_kv`、`x_attention`、`select_unshared_kv`、
+`graph_task_update` 和 final-step skip。需要去掉运行期 grow、全 Pool reset 和单 Context 假设，
+并把 ACLGraph memory、multi-session slot 和 per-slot step 纳入统一规划。
+
+### 16.15 推荐实施顺序
+
+#### CUDA
+
+1. 固定 BeamKV arena，移除 `torch.cat`；
+2. 实现 `BeamGraphKey` 和 stable input Buffer；
+3. G0 Piecewise correctness；
+4. G1 Full Forward，包含 Beam Attention + KV append；
+5. graph memory profile/reserve 接入 CachePlan；
+6. LM Head/top-k/lineage 使用固定 `out=` Buffer；
+7. G2 Full Step；
+8. 评估 G3 fixed window。
+
+#### NPU
+
+1. 把 ACS lazy Pool 改成启动期固定 BeamKVPool；
+2. 增加 per-slot generation/step/active metadata；
+3. 禁止全 Pool reset；
+4. ACLGraph reserve 接入 CachePlan；
+5. 预捕获热门 G1 Beam forward bucket；
+6. 验证 task update 与多 session step 分桶；
+7. 将 Beam group/select 改为固定 `out=` Buffer；
+8. G2 Full Step；
+9. 最后评估 G3。
+
+### 16.16 Graph 专项测试与指标
+
+必须增加：
+
+- 同一个 Graph bucket 连续 replay 不发生地址变化；
+- 不同 slot、不同 step、不同 parent pattern 的 replay correctness；
+- `parents=[3,1,1,1]` 等重复 parent 场景；
+- actual batch 小于 Graph bucket 时 padding 不污染 live slot；
+- 多 session 不同步 step 的 CUDA correctness；
+- NPU scalar-step 分桶或 vector-step correctness；
+- final Graph 不执行无用 lineage/reorder；
+- 请求取消后，completion event 前 slot 不复用；
+- Graph replay 失败时 generation 不递增；
+- Graph miss 回退结果与 Full Graph bitwise/numerically 对齐；
+- capture 前后实际显存与 CachePlan reserve 的差值；
+- Pool grow 次数必须恒为 0；
+- Graph invalidation 不能由普通请求完成触发。
+
+建议指标：
+
+```text
+beam_graph_replay_total{platform,key}
+beam_graph_fallback_total{reason}
+beam_graph_capture_seconds{key}
+beam_graph_memory_bytes{platform}
+beam_graph_padding_ratio{key}
+beam_graph_invalidation_total{reason}
+beam_graph_task_update_seconds{platform}
+beam_graph_commit_seconds{platform}
+beam_graph_replay_error_total{platform,key}
+```
 
 ---
 
@@ -1661,6 +2357,8 @@ requires_next_forward
 - [KV cache config planning](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/core/kv_cache_utils.py)
 - [GPUWorker memory profiling and initialization](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/worker/gpu_worker.py)
 - [GPUModelRunner KV tensor initialization](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/worker/gpu_model_runner.py)
+- [CompilationConfig and CUDAGraphMode](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/config/compilation.py)
+- [CudagraphDispatcher](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/cudagraph_dispatcher.py)
 
 ### JiusiServe/vllm-gr
 
@@ -1685,3 +2383,5 @@ requires_next_forward
 - [BeamSearchBufferPool and BeamSearchContext](https://github.com/zhanghanleo10/ACS_vllm-GR/blob/main/vllm-ascend/vllm_ascend/beam_search/context.py)
 - [Ascend Beam Attention](https://github.com/zhanghanleo10/ACS_vllm-GR/blob/main/vllm-ascend/vllm_ascend/attention/attention_v1.py)
 - [NPUModelRunner Beam integration](https://github.com/zhanghanleo10/ACS_vllm-GR/blob/main/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)
+- [ACLGraph task update and Beam graph parameters](https://github.com/zhanghanleo10/ACS_vllm-GR/blob/main/vllm-ascend/vllm_ascend/compilation/acl_graph.py)
+- [NPUWorker memory profiling and graph capture order](https://github.com/zhanghanleo10/ACS_vllm-GR/blob/main/vllm-ascend/vllm_ascend/worker/worker_v1.py)
