@@ -245,7 +245,55 @@ flowchart TB
     KVM --> SCH
 ```
 
-### 4.1 最小运行时组件
+### 4.1 对象位置图
+
+下面这张图强调“对象放在哪里、谁拥有它、谁读写它”。
+
+```mermaid
+flowchart LR
+    subgraph CONTROL["控制面：EngineCore / Scheduler"]
+        RS["BeamRequestState"]
+        CM["BeamCapacityManager"]
+        NB["Native KV Admission"]
+        BB["Beam Slot Reservation"]
+        SO["SchedulerOutput / BeamDecodeBatch"]
+    end
+
+    subgraph EXEC["执行面：Worker / ModelRunner"]
+        KM["BeamKVManager"]
+        TX["BeamKVStepTransaction"]
+        ST["BeamExecutionState"]
+    end
+
+    subgraph PLATFORM["平台实现：CUDA / NPU Provider"]
+        PV["BeamKVProvider"]
+        AT["Beam Attention Backend"]
+        CP["Commit Logic<br/>Lineage 或 Reorder"]
+    end
+
+    subgraph MEMORY["设备内存：Device Pools"]
+        NK["NativeKVPool"]
+        BK["BeamKVPool"]
+        WS["BeamDecodeScratch"]
+        CT["ConstraintTableBuffer"]
+    end
+
+    RS --> CM
+    NB --> SO
+    BB --> SO
+    SO --> ST
+    ST --> TX
+    KM --> BK
+    KM --> WS
+    PV --> BK
+    PV --> WS
+    AT --> NK
+    AT --> BK
+    CP --> BK
+    CT --> PV
+```
+
+### 4.2 最小运行时组件
 
 为避免对象过度拆分，正式实现只需要三个有状态核心组件：
 
@@ -268,6 +316,45 @@ Platform:
 - Postprocess：产生 `BeamTransition` 的无状态或轻状态组件。
 
 不再要求独立的 `BeamSessionRegistry + BeamAttentionContext + View + WorkerOrchestrator + ResourceCoordinator` 全部成为有状态类。
+
+### 4.3 使用位置图
+
+这张图强调“哪些对象在哪个阶段被使用”。
+
+```mermaid
+flowchart TB
+    subgraph PREFILL["Prefill 阶段"]
+        P1["BeamDecodeRequestSpec"]
+        P2["BeamCapacityManager"]
+        P3["NativeKVPool"]
+        P4["ConstraintTableBuffer"]
+    end
+
+    subgraph DECODE["Decode Step 阶段"]
+        D1["BeamKVBinding"]
+        D2["BeamStepCursor"]
+        D3["BeamDecodeBatch"]
+        D4["BeamKVStepTransaction"]
+        D5["BeamTransition"]
+    end
+
+    subgraph FINISH["Finish / Release 阶段"]
+        F1["Completion Event"]
+        F2["Slot Generation"]
+        F3["BeamCapacityManager.release"]
+        F4["Native KV Free"]
+    end
+
+    P1 --> P2 --> P3
+    P4 --> D5
+    P2 --> D1
+    D1 --> D3
+    D2 --> D3
+    D3 --> D4
+    D4 --> D5
+    D5 --> F1 --> F2 --> F3
+    F3 --> F4
+```
 
 ---
 
@@ -382,6 +469,57 @@ class BeamKVLayerStepView:
 - NPU K/V Tensor Tuple；
 - 专用 Kernel 的 BeamPath/Index Metadata。
 
+### 5.7 数据对象关系图
+
+```mermaid
+classDiagram
+    class BeamDecodeRequestSpec {
+        +session_id
+        +max_beam_width
+        +max_decode_steps
+        +constraint_table_id
+        +constraint_table_version
+    }
+
+    class BeamKVBinding {
+        +session_id
+        +bucket_id
+        +slot_id
+        +generation
+        +capacity_beam_width
+        +max_decode_steps
+    }
+
+    class BeamStepCursor {
+        +decode_index
+        +materialized_kv_len
+        +selected_token_count
+    }
+
+    class BeamDecodeBatch {
+        +bindings
+        +cursor
+        +active_beam_width
+        +next_beam_width
+        +input_token_ids
+        +active_mask
+    }
+
+    class BeamTransition {
+        +parent_beam_ids
+        +selected_token_ids
+        +selected_scores
+        +next_constraint_state_ids
+        +finished_mask
+        +requires_next_forward
+    }
+
+    BeamDecodeRequestSpec --> BeamKVBinding : reserve/create
+    BeamKVBinding --> BeamDecodeBatch : collected into
+    BeamStepCursor --> BeamDecodeBatch : attached to
+    BeamDecodeBatch --> BeamTransition : produces
+```
+
 ---
 
 ## 6. 物理资源模型
@@ -436,7 +574,30 @@ Worker Profile
     -> 校验实际显存
 ```
 
-### 6.3 Bucket 与 Slot
+### 6.3 CachePlan 数据流图
+
+```mermaid
+flowchart LR
+    subgraph WORKERS["Workers / TP-PP Ranks"]
+        P["profile model"]
+        E["estimate BeamKV / Graph / Workspace"]
+        R["local capacity report"]
+        P --> R
+        E --> R
+    end
+
+    R --> EC["EngineCore Cache Planner"]
+    EC --> CP["GRCachePlan"]
+    CP --> NCFG["NativeKV Config"]
+    CP --> BCFG["BeamKV Config"]
+    CP --> WCFG["Scratch / Workspace Config"]
+
+    NCFG --> WINIT["Worker initialize pools"]
+    BCFG --> WINIT
+    WCFG --> WINIT
+```
+
+### 6.4 Bucket 与 Slot
 
 按执行容量建立固定 Bucket：
 
@@ -464,7 +625,27 @@ request W=24,T=48 -> w32_t64
 request W=80,T=12 -> w128_t16
 ```
 
-### 6.4 跨 Worker 容量
+### 6.5 Bucket/Slot 结构图
+
+```mermaid
+flowchart TB
+    BP["BeamKVPool"] --> B1["Bucket w32_t64"]
+    BP --> B2["Bucket w128_t16"]
+
+    B1 --> S10["slot 0"]
+    B1 --> S11["slot 1"]
+    B1 --> S1N["..."]
+
+    B2 --> S20["slot 0"]
+    B2 --> S21["slot 1"]
+    B2 --> S2N["..."]
+
+    S10 --> G10["generation"]
+    S10 --> A10["BeamKV arena slice"]
+    S10 --> W10["scratch slice"]
+```
+
+### 6.6 跨 Worker 容量
 
 每个 Bucket 的全局 Slot 数是所有相关 Worker 可支持容量的最小值：
 
@@ -475,7 +656,7 @@ C_global(bucket)
 
 相同逻辑 `slot_id` 在所有相关 TP/PP Worker 上都必须合法，但不要求映射到相同物理地址。
 
-### 6.5 禁止在线 Regrow
+### 6.7 禁止在线 Regrow
 
 服务期间不允许：
 
@@ -537,7 +718,38 @@ scheduler_output.beam_kv_bindings[request.session_id] = binding
 
 任何一步失败都不能留下半分配资源。
 
-### 7.3 Reservation 时机
+### 7.3 Admission 时序图
+
+```mermaid
+sequenceDiagram
+    participant Q as Request Queue
+    participant S as Scheduler
+    participant B as BeamCapacityManager
+    participant N as NativeKVManager
+    participant O as SchedulerOutput
+
+    Q->>S: beam request
+    S->>B: try_reserve Beam slot
+    alt Beam slot unavailable
+        B-->>S: None
+        S-->>Q: WAITING_FOR_BEAM_KV
+    else Beam slot reserved
+        B-->>S: reservation
+        S->>N: allocate native KV
+        alt Native KV failed
+            N-->>S: None
+            S->>B: rollback reservation
+            S-->>Q: wait / retry
+        else Success
+            N-->>S: native blocks
+            S->>B: commit reservation
+            B-->>S: BeamKVBinding
+            S->>O: emit BeamDecodeBatch
+        end
+    end
+```
+
+### 7.4 Reservation 时机
 
 第一版在进入 Prefill 前预留完整 Beam Window：
 
@@ -548,7 +760,7 @@ Native KV + BeamKV + Scratch
 
 这样不会出现 Prompt 已经占用大量 Native KV，但 Prefill 完成后长期等待 Beam Slot 的资源僵局。
 
-### 7.4 Slot 状态
+### 7.5 Slot 状态
 
 稳定状态机：
 
@@ -561,7 +773,17 @@ FREE
 
 `RESERVED` 可以仅作为一次 Scheduler Transaction 内的临时状态。如果未来存在跨 Worker 动态 Bind 或请求级 Workspace 申请，再扩展为长期 `RESERVED -> ACTIVE` ACK 流程。
 
-### 7.5 Worker 安全检查
+### 7.6 Slot 生命周期图
+
+```mermaid
+stateDiagram-v2
+    [*] --> FREE
+    FREE --> ACTIVE : admission commit
+    ACTIVE --> RELEASING : finish / cancel / fatal error
+    RELEASING --> FREE : device completion + generation++
+```
+
+### 7.7 Worker 安全检查
 
 Worker 仍需验证：
 
@@ -600,7 +822,33 @@ KV(y0) 尚未写入 BeamKV
 
 第一次 Decode Forward 负责生成 `KV(y0)`。
 
-### 8.2 Decode Step
+### 8.2 完整生命周期图
+
+```mermaid
+flowchart TB
+    A["Beam request arrives"]
+    B["Atomic admission<br/>NativeKV + BeamKV + Scratch"]
+    C["Prefill on Native Paged KV"]
+    D["Constraint step 0 / initial beam tokens"]
+    E["Build BeamDecodeBatch"]
+    F["begin_step(binding, cursor)"]
+    G["Layer forward<br/>append current KV + beam attention"]
+    H["LM Head + Constraint + Beam Select"]
+    I["BeamTransition"]
+    J["Provider commit"]
+    K["Completion event"]
+    L{"requires_next_forward?"}
+    M["publish next generation"]
+    N["final step skip unnecessary reorder"]
+    O["release binding / native kv"]
+    P["slot reusable, pool retained"]
+
+    A --> B --> C --> D --> E --> F --> G --> H --> I --> J --> K --> L
+    L -->|yes| M --> E
+    L -->|no| N --> O --> P
+```
+
+### 8.3 Decode Step
 
 ```mermaid
 sequenceDiagram
@@ -630,7 +878,7 @@ sequenceDiagram
     W-->>S: next Beam state / finish
 ```
 
-### 8.3 每层严格执行顺序
+### 8.4 每层严格执行顺序
 
 ```text
 1. Q/K/V Projection
@@ -650,7 +898,19 @@ sequenceDiagram
 - 对本层当前 Attention 可见；
 - 在整个 Step Commit 前，不对下一 Generation 的逻辑 Beam 状态可见。
 
-### 8.4 Step Commit
+### 8.5 Layer 内部数据流图
+
+```mermaid
+flowchart LR
+    QKV["Q/K/V projection"] --> APP["append current K/V"]
+    APP --> PREF["prefix attention<br/>NativeKVPool"]
+    APP --> SUF["suffix / beam attention<br/>BeamKVPool"]
+    PREF --> MERGE["merge / fused attention output"]
+    SUF --> MERGE
+    MERGE --> O["output projection"]
+```
+
+### 8.6 Step Commit
 
 ```python
 txn = beam_kv_manager.begin_step(binding, cursor)
@@ -673,7 +933,7 @@ beam_execution_state.publish(
 )
 ```
 
-### 8.5 Finish 与释放
+### 8.7 Finish 与释放
 
 ```text
 最后一次 Forward
@@ -711,7 +971,34 @@ Selected Scores
 
 并在发布新 Beam 状态前完成对应 KV Commit。
 
-### 9.2 两类 Commit 模式
+### 9.2 Beam 语义变化图
+
+```mermaid
+flowchart TB
+    subgraph OLD["旧一代 Beam"]
+        O0["beam 0"]
+        O1["beam 1"]
+        O2["beam 2"]
+        O3["beam 3"]
+    end
+
+    P["parent_beam_ids = [3,1,1,1]"]
+
+    subgraph NEW["新一代 Beam"]
+        N0["new beam 0 <- old 3"]
+        N1["new beam 1 <- old 1"]
+        N2["new beam 2 <- old 1"]
+        N3["new beam 3 <- old 1"]
+    end
+
+    O3 --> N0
+    O1 --> N1
+    O1 --> N2
+    O1 --> N3
+    OLD --> P --> NEW
+```
+
+### 9.3 两类 Commit 模式
 
 #### Lineage Commit
 
@@ -743,7 +1030,22 @@ Parent IDs 写入 BeamPath/Lineage
 
 Common 层不感知使用哪一种模式。
 
-### 9.3 Commit 可见性
+### 9.4 Commit 数据流图
+
+```mermaid
+flowchart LR
+    L["logits"] --> C["Constraint / TopK"]
+    C --> S["Beam Selector"]
+    S --> T["BeamTransition"]
+    T --> CM{"Commit mode"}
+    CM -->|lineage| LG["update BeamPath / lineage"]
+    CM -->|reorder| RO["reorder all-layer BeamKV"]
+    LG --> EV["completion event"]
+    RO --> EV
+    EV --> PB["publish generation + next beam state"]
+```
+
+### 9.5 Commit 可见性
 
 ```text
 所有 Layer 的 KV Append/Commit 完成
@@ -759,7 +1061,7 @@ Common 层不感知使用哪一种模式。
     -> 后续才异步完成部分 Layer KV Reorder
 ```
 
-### 9.4 Failure 语义
+### 9.6 Failure 语义
 
 - Commit 前失败：新 Generation 不发布，Provisional 区域可忽略；
 - CUDA Lineage Commit 失败：旧 Generation 仍是唯一已发布状态；
@@ -801,7 +1103,20 @@ Step s+1 Attention:
 
 这与 NVIDIA 的 `BeamKV + BeamPath/topk_indices + GR Decode Attention` 对齐。
 
-### 10.3 Dense Reorder 模式
+### 10.3 CUDA 数据流图
+
+```mermaid
+flowchart TB
+    IN["input token ids"] --> QKV["Q/K/V projection"]
+    QKV --> APP["append BeamKV[slot, step]"]
+    APP --> ATT["beam attention<br/>prefix + lineage history"]
+    ATT --> LM["LM Head"]
+    LM --> SEL["beam select"]
+    SEL --> LIN["update lineage metadata"]
+    LIN --> PUB["publish generation"]
+```
+
+### 10.4 Dense Reorder 模式
 
 在专用 Lineage Attention 尚未完成时，可以使用：
 
@@ -815,7 +1130,7 @@ Dense BeamKV
 
 它与旧 Incremental Decode 原型更接近，但仍必须使用本文统一的 Binding、Admission、Cursor 和 Transition。
 
-### 10.4 CUDA Provider 接口
+### 10.5 CUDA Provider 接口
 
 ```python
 class CudaBeamKVProvider(BeamKVProvider):
@@ -851,7 +1166,21 @@ x_attention
     -> 输出 Attention Result
 ```
 
-### 11.3 Step Commit
+### 11.3 NPU 数据流图
+
+```mermaid
+flowchart TB
+    IN["input token ids"] --> QKV["Q/K/V projection"]
+    QKV --> CUK["cache_unshared_kv"]
+    CUK --> XA["x_attention<br/>shared prefix + unshared beam history"]
+    XA --> LM["LM Head"]
+    LM --> SEL["beam select"]
+    SEL --> GP["group parent canonicalization"]
+    GP --> SUK["select_unshared_kv all layers"]
+    SUK --> PUB["publish generation"]
+```
+
+### 11.4 Step Commit
 
 ```text
 Beam Selection
@@ -865,7 +1194,7 @@ Beam Selection
 
 公共 `BeamTransition` 保持语义顺序，不暴露 NPU 私有 grouped 顺序。
 
-### 11.4 Final Step
+### 11.5 Final Step
 
 如果：
 
@@ -875,7 +1204,7 @@ requires_next_forward = false
 
 则无需为了下一轮 Attention 重排全部历史 KV。可以直接执行 Final Beam Select 并完成请求。
 
-### 11.5 NPU Step 转换
+### 11.6 NPU Step 转换
 
 Common Cursor 使用 0-based：
 
@@ -932,7 +1261,19 @@ beam_kv_pool.value[layer_idx]
 
 不使用 `id(kv_cache)` 作为跨模块正式接口。
 
-### 12.3 无 Forward 动态分配
+### 12.3 Attention 输入图
+
+```mermaid
+flowchart LR
+    Q["query / hidden states"] --> BA["beam_attention"]
+    PK["prefix_kv_ref"] --> BA
+    LV["beam_layer_step_view"] --> BA
+    BW["active_beam_width"] --> BA
+    CS["BeamStepCursor"] --> BA
+    BA --> OUT["attention output"]
+```
+
+### 12.4 无 Forward 动态分配
 
 在 Forward 热路径中禁止：
 
@@ -1011,7 +1352,20 @@ class BeamGraphKey:
 - Active Mask；
 - Block Table 内容。
 
-### 13.4 Capture 边界
+### 13.4 Graph Dispatch 数据流图
+
+```mermaid
+flowchart LR
+    AD["admitted BeamDecodeBatch"] --> GK["build BeamGraphKey"]
+    GK --> GD{"graph hit?"}
+    GD -->|yes| STG["stage runtime metadata into fixed buffers"]
+    GD -->|no| EG["eager / piecewise fallback"]
+    STG --> RP["graph replay"]
+    RP --> CM["commit / completion event"]
+    EG --> CM
+```
+
+### 13.5 Capture 边界
 
 架构支持：
 
@@ -1046,7 +1400,21 @@ Graph 只是执行优化，不改变事务语义和资源所有权。
 | Graph | Direct Pool View CUDA Graph | ACLGraph | Provider Graph，统一固定地址原则 |
 | Step | Runtime Generation State | BeamSearchContext current_step | 显式 BeamStepCursor |
 
-### 14.1 NVIDIA 兼容
+### 14.1 兼容关系图
+
+```mermaid
+flowchart LR
+    NV["NVIDIA SID-GR"] --> U["统一语义层"]
+    ACS["ACS_vllm-GR"] --> U
+    VGR["JiusiServe/vllm-gr"] --> U
+
+    U --> C1["BeamKVBinding / Cursor / Transition"]
+    U --> C2["Capacity Admission"]
+    U --> C3["Worker Step Transaction"]
+    U --> C4["Provider-specific KV Commit"]
+```
+
+### 14.2 NVIDIA 兼容
 
 统一方案能够直接承载：
 
@@ -1058,7 +1426,7 @@ Graph 只是执行优化，不改变事务语义和资源所有权。
 
 不要求 vLLM-GR 把 Paged Prefix 转换为 Dense ContextKV。
 
-### 14.2 ACS 兼容
+### 14.3 ACS 兼容
 
 统一方案能够直接承载：
 
@@ -1072,7 +1440,7 @@ Graph 只是执行优化，不改变事务语义和资源所有权。
 
 需要移除 ACS 运行时 Lazy Grow，并把 Slot 分配移到 Scheduler Admission。
 
-### 14.3 vLLM-GR 兼容
+### 14.4 vLLM-GR 兼容
 
 vLLM-GR 保留：
 
@@ -1177,6 +1545,27 @@ ModelRunner
     -> Provider LayerStepView
     -> Postprocess
     -> Provider Commit
+```
+
+### 16.1 代码位置图
+
+```mermaid
+flowchart TB
+    ROOT["vllm_gr/beam"]
+    ROOT --> T["types.py"]
+    ROOT --> C["capacity.py"]
+    ROOT --> M["manager.py"]
+    ROOT --> P["provider/"]
+    ROOT --> A["attention/"]
+    ROOT --> PP["postprocess/"]
+    ROOT --> G["graph/"]
+
+    P --> PC["cuda.py"]
+    P --> PN["npu.py"]
+    A --> AC["cuda_backend.py"]
+    A --> AN["npu_backend.py"]
+    G --> GC["cuda_runner.py"]
+    G --> GN["npu_runner.py"]
 ```
 
 ---
