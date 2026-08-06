@@ -3,8 +3,8 @@
 > 状态：Design Draft  
 > 日期：2026-08-06  
 > 主架构基线：vLLM `releases/v0.22.1` + JiusiServe/vllm-gr  
-> 平台参考：ACS_vllm-GR（NPU）；NVIDIA/recsys-examples SID-GR（仅 CUDA 算子、BeamKV 布局、调度分组与 CUDA Graph）  
-> 范围：基于 vLLM V1 Engine 的 Beam Incremental Decode 扩展，包括 KV 资源管理、Scheduler Admission、Worker/ModelRunner 执行、GPU/NPU Backend 和 Graph 边界  
+> 平台参考：ACS_vllm-GR（NPU 已实现能力）；NVIDIA/recsys-examples SID-GR（仅 CUDA 算子、BeamKV 布局、调度分组与 CUDA Graph）  
+> 范围：基于 vLLM V1 Engine 的 Beam Incremental Decode 扩展，包括 KV 资源管理、Scheduler Admission、Prefill 尾块、Worker/ModelRunner 执行、GPU/NPU Backend、Full-Step Graph 和状态提交边界  
 > 非目标：不引入独立于 vLLM 的 Serving Runtime；不照搬 NVIDIA 的请求、HTTP、模型加载和状态机；不要求 GPU/NPU 使用相同物理 KV 布局；不在本文中重新定义 Catalog、EOS、Beam Ranking 和对外返回格式
 
 ---
@@ -18,33 +18,36 @@ vLLM EngineCore / Scheduler
     -> SchedulerOutput Beam Extension
     -> vLLM Worker / ModelRunner
     -> Native Paged Prefix KV + Beam Decode KV
-    -> GPU/NPU Beam Attention Backend
+    -> GPU/NPU Beam Backend
+    -> Graph Completion / Beam Transition
     -> vLLM Request State / Output Processor
 ```
 
 其中：
 
-- **vLLM/vllm-gr** 决定请求生命周期、调度、资源所有权、ModelRunner 接入和输出流程；
-- **ACS** 提供 NPU 连续 BeamKV、Attention/Cache 算子和物理重排实现参考；
+- **vLLM/vllm-gr** 决定请求生命周期、调度、资源所有权、Native Paged KV、ModelRunner 接入和输出流程；
+- **ACS** 提供已经实现的 NPU Beam ACLGraph、连续 Unshared BeamKV、Attention/Cache 算子、约束 TopK、Beam Select 和物理重排能力；
 - **NVIDIA SID-GR** 只为 CUDA Backend 提供算子接口、BeamKV 布局、Decode Batch 分组和 CUDA Graph 参考，不定义系统上层架构。
 
 最终设计决策：
 
 1. Prompt 和共享 Prefix 始终使用 vLLM Native Paged KV；
-2. Beam Decode Suffix 使用独立的 `BeamKVPool`；
-3. `BeamKVPool` 在 Worker 初始化阶段按统一 CachePlan 一次性申请，服务期间禁止 Grow；
-4. Scheduler 将 Beam Slot 作为一等资源，在请求下发前完成 Admission；
-5. Worker 不自行分配 Slot，只消费 SchedulerOutput 中的 `BeamKVBinding`；
-6. Beam Decode 仍走 vLLM `Scheduler -> Worker -> ModelRunner -> Attention` 主链；
-7. CUDA/NPU 共享请求语义和资源生命周期，但不共享物理布局和 Kernel ABI；
-8. CUDA 只在算子、KVC 布局、调度分组和成图方面参考 NVIDIA；
-9. NPU 参考 ACS 的连续 Unshared KV、`cache_unshared_kv`、`x_attention` 和 `select_unshared_kv`；
-10. 当前 Token K/V 必须先写入，再参与当前层 Attention；
-11. Beam Parent 关系必须进入每一步核心路径；
-12. 所有 Layer 的 KV Commit 完成后，才能发布下一代 Beam 状态；
-13. Session 结束只释放 Slot 所有权，物理 Pool 保留复用；
-14. 最后一步没有下一次 Forward 时，跳过无意义的 KV Reorder；
-15. Graph Dispatch 与 Capacity Admission 相互独立：没有 Slot 必须等待，没有 Graph 可以 Eager 回退。
+2. Prefix Cache 只命中完整 Block，未缓存尾部由本轮 Prefill 写入 Native Paged KV；
+3. Prompt 最后一个未满 Block 的剩余 Slot 不用于存放 Beam Token；
+4. Beam Decode Suffix 从首个生成 Token 开始写入独立 `BeamKVPool`；
+5. `BeamKVPool`、Beam Scratch 和 Graph Workspace 在 Worker 初始化阶段按统一 CachePlan 一次性申请，服务期间禁止 Grow；
+6. Scheduler 将 Beam Slot 作为一等资源，在请求下发前完成 Admission；
+7. Worker 不自行分配 Slot，只消费 SchedulerOutput 中的 `BeamKVBinding`；
+8. Beam Decode 仍走 vLLM `Scheduler -> Worker -> ModelRunner -> Backend` 主链；
+9. CUDA/NPU 共享请求语义、Graph Contract 和资源生命周期，但不共享物理布局和 Kernel ABI；
+10. CUDA 只在算子、KVC 布局、调度分组和成图方面参考 NVIDIA；
+11. NPU 将 ACS 已实现的 ACLGraph 能力封装为 `NpuBeamGraphProvider`；
+12. 当前 Token K/V 必须先写入，再参与当前层 Attention；
+13. Beam Parent 关系必须进入每一步核心路径；
+14. Full-Step Graph 或 Backend Commit 完成后，才能发布下一代 Beam 状态；
+15. Session 结束只释放 Slot 所有权，物理 Pool 和 Graph Executable 保留复用；
+16. 最后一步没有下一次 Forward 时，跳过无意义的 KV Reorder；
+17. Graph Dispatch 与 Capacity Admission 相互独立：没有 Slot 必须等待，没有 Graph 可以 Eager 回退。
 
 ---
 
@@ -60,7 +63,7 @@ API / Offline Entry
     -> Scheduler
     -> SchedulerOutput
     -> Worker / ModelRunner
-    -> Attention Backend
+    -> Attention / Beam Backend
     -> Output Processor
 ```
 
@@ -70,25 +73,43 @@ vLLM/vllm-gr 负责：
 - Native Paged KV 的容量规划、Block 分配和 Prefix Cache；
 - Scheduler Admission 和 Continuous Batching；
 - SchedulerOutput 到 Worker 的数据下发；
-- ModelRunner 输入准备、Forward 和结果回传；
+- ModelRunner 输入准备、Forward、Graph Dispatch 和结果回传；
 - 普通请求与 Beam 请求混部；
 - Cancel、Finish、Timeout、Failure 和资源释放。
 
-### 2.2 ACS_vllm-GR：NPU 参考
+### 2.2 ACS_vllm-GR：NPU 已实现能力
 
-ACS 主要提供：
+ACS 提供的能力包括：
 
 ```text
 Paged Shared Prefix KV
 Dense Unshared BeamKV
+BeamSearchBufferPool
+ACLGraphWrapper
+Graph Task Group Update
 cache_unshared_kv
 x_attention
+rec_constrained_topk
 beam_search_group
 select_unshared_kv
-ACLGraph 固定 Buffer
+final beam select
 ```
 
-NPU 的 Beam 状态更新、Parent Grouping、Physical Reorder 和 Final-step Skip 优先参考 ACS，但仍接入 vLLM Scheduler/Worker 生命周期。
+统一架构不复制 ACS 的 Worker 资源所有权和上层状态机，而是把这些能力封装到 NPU Provider：
+
+```text
+ACS BeamSearchBufferPool
+    -> NpuBeamKVProvider physical arena
+
+ACS BeamSearchContext
+    -> Worker-side Beam execution state
+
+ACLGraphWrapper / GraphParams
+    -> NpuBeamGraphProvider executable runtime
+
+select_unshared_kv
+    -> NpuBeamKVProvider.commit_transition
+```
 
 ### 2.3 NVIDIA SID-GR：限定范围的 CUDA 技术参考
 
@@ -96,7 +117,7 @@ NPU 的 Beam 状态更新、Parent Grouping、Physical Reorder 和 Final-step Sk
 
 1. **算子**：GR Decode Attention、BeamKV Append、Lineage/TopK Index 输入形式；
 2. **KVC 布局**：Context/Beam 分离、Step-major BeamKV、固定 Pool View；
-3. **调度**：按 `(decode_step, active_beam_width, next_beam_width, context_shape)` 分组 Decode Batch；
+3. **调度**：按 Decode Step、Beam Width、Context/Graph Shape 分组；
 4. **成图**：固定地址 Pool、Pointer Guard、Graph Shape Key、Direct Pool-view Replay、Graph Miss 回退。
 
 明确不采用 NVIDIA 的：
@@ -114,14 +135,13 @@ NPU 的 Beam 状态更新、Parent Grouping、Physical Reorder 和 Final-step Sk
 | EngineCore / Scheduler 主流程 | vLLM | 不建立独立 Scheduler Runtime |
 | Request / Finish / Cancel 生命周期 | vLLM + vllm-gr | Beam 状态作为 vLLM Request 扩展 |
 | Native Prefix KV | vLLM | 保留 Paged KV、BlockTable、SlotMapping |
-| Beam Capacity Admission | vLLM Scheduler 扩展 | 继承 Native KV 的控制面/执行面分离 |
-| Worker / ModelRunner 接入 | vllm-gr | 在 ModelRunner 中组织 Beam Batch 和 Backend 输入 |
-| Constraint / Beam Select | vllm-gr + ACS | 产生公共 `BeamTransition` |
-| NPU BeamKV 和算子 | ACS | 连续 Unshared KV、x_attention、select_unshared_kv |
+| Prefill 未缓存尾部 | vLLM | 写入 Native Paged KV 的最后一个物理 Block |
+| Beam Capacity Admission | vLLM Scheduler 扩展 | 控制面拥有 Slot，Worker 消费 Binding |
+| Worker / ModelRunner 接入 | vllm-gr | 组织 Beam Batch、Graph Runtime 和 Backend 输入 |
+| NPU BeamKV / ACLGraph / 后处理 | ACS | 作为 NPU Provider 已实现能力接入 |
 | CUDA Attention 算子 | NVIDIA 参考 | GR Decode Attention/Lineage 输入形式 |
 | CUDA BeamKV 布局 | NVIDIA 参考 | Step-major、Append-only、固定 Pool View |
 | CUDA Decode Batch 分组 | NVIDIA 参考，vLLM 实现 | 分组逻辑落在 vLLM Scheduler |
-| CUDA Graph | NVIDIA 参考，vLLM 实现 | Graph Runner 落在 GPUModelRunner 扩展 |
 | Serving API / 模型加载 / 输出 | vLLM | 不采用 NVIDIA 独立实现 |
 
 ---
@@ -135,12 +155,12 @@ flowchart TB
     SCH["vLLM Scheduler<br/>+ BeamCapacityManager"]
     SO["SchedulerOutput<br/>+ BeamKVBinding / BeamDecodeBatch"]
     WRK["vLLM Worker / ModelRunner<br/>+ BeamKVManager"]
-    MODEL["vLLM Model Forward"]
+    MODEL["vLLM Model / Step Executor"]
     NKV["Native Paged KV<br/>Prompt / Shared Prefix"]
     BKV["BeamKVPool<br/>Decode Suffix"]
-    GPU["CUDA Beam Backend<br/>NV operator/layout/scheduling/graph reference"]
-    NPU["NPU Beam Backend<br/>ACS operator/reorder reference"]
-    POST["vllm-gr Beam Postprocess<br/>Constraint / Select / Transition"]
+    GPU["CUDA Beam Provider<br/>NV execution reference"]
+    NPU["NPU Beam Graph Provider<br/>ACS implemented capability"]
+    POST["Beam Transition / Completion"]
     OUT["vLLM Request State / Output Processor"]
 
     API --> EC --> SCH --> SO --> WRK --> MODEL
@@ -158,7 +178,7 @@ flowchart TB
     OUT --> SCH
 ```
 
-架构中不存在独立的 NVIDIA Runtime 或 ACS Runtime。两者只作为 GPU/NPU Backend 的技术参考。
+架构中不存在独立的 NVIDIA Runtime 或 ACS Runtime。NVIDIA 和 ACS 均通过 vLLM Platform/ModelRunner 扩展接入。
 
 ### 3.1 对象位置图
 
@@ -168,21 +188,25 @@ flowchart LR
         REQ["Beam Request State"]
         SCH["Scheduler"]
         BCM["BeamCapacityManager"]
+        SIG["BeamExecutionSignature"]
         SO["SchedulerOutput Extension"]
-        REQ --> SCH --> BCM --> SO
+        REQ --> SCH --> BCM --> SIG --> SO
     end
 
     subgraph WORKER["vLLM Worker / ModelRunner Process"]
-        MR["ModelRunner"]
+        MR["GPU/NPU ModelRunner"]
         BKM["BeamKVManager"]
         TX["BeamKVStepTransaction"]
-        MR --> BKM --> TX
+        EXE["BeamStepExecutor"]
+        MR --> BKM --> TX --> EXE
     end
 
-    subgraph BACKEND["vLLM Attention / Platform Backend"]
-        CUD["CUDA Beam Backend"]
-        NPU["NPU Beam Backend"]
-        COM["Backend-private Commit"]
+    subgraph NPU_PROVIDER["NPU Provider / ACS Mapping"]
+        NGP["NpuBeamGraphProvider"]
+        AGE["ACLGraph Executable"]
+        TG["Task Handles / Events / Workspace"]
+        NGP --> AGE
+        NGP --> TG
     end
 
     subgraph DEVICE["Device Memory"]
@@ -193,21 +217,16 @@ flowchart LR
     end
 
     SO --> MR
-    TX --> CUD
-    TX --> NPU
-    CUD --> NKV
-    CUD --> BKV
-    NPU --> NKV
-    NPU --> BKV
-    CUD --> COM
-    NPU --> COM
-    BKM --> WS
-    CT --> MR
+    EXE --> NGP
+    NGP --> NKV
+    NGP --> BKV
+    NGP --> WS
+    CT --> NGP
 ```
 
 ### 3.2 最小扩展组件
 
-不在 vLLM 外部再造 Runtime，只增加三个 vLLM 扩展点：
+不在 vLLM 外部再造 Runtime，只增加：
 
 ```text
 vLLM Scheduler extension:
@@ -215,9 +234,11 @@ vLLM Scheduler extension:
 
 vLLM Worker / ModelRunner extension:
     BeamKVManager
+    BeamStepExecutor
 
 vLLM platform backend extension:
-    CudaBeamBackend / NpuBeamBackend
+    CudaBeamProvider
+    NpuBeamGraphProvider
 ```
 
 ---
@@ -236,11 +257,7 @@ class BeamDecodeRequestSpec:
     constraint_table_version: int | None
 ```
 
-用于 Scheduler Admission 和 Bucket 选择。
-
 ### 4.2 BeamKVBinding
-
-一个独立 Beam Session 对应一个固定 Slot：
 
 ```python
 @dataclass(frozen=True)
@@ -253,8 +270,6 @@ class BeamKVBinding:
     max_decode_steps: int
 ```
 
-多个 Session 的 Binding 由 `BeamDecodeBatch` 聚合。
-
 ### 4.3 BeamStepCursor
 
 ```python
@@ -265,27 +280,31 @@ class BeamStepCursor:
     selected_token_count: int
 ```
 
-公共层统一使用 0-based：
-
-```text
-第一次 Decode Forward:
-    decode_index = 0
-    materialized_kv_len = 0
-    selected_token_count = 1
-```
-
-NPU 算子的 1-based `decode_step` 只在 NPU Backend 内转换：
+公共层使用 0-based；NPU 的 1-based `decode_step` 只在 Provider 内转换：
 
 ```text
 npu_decode_step = decode_index + 1
 ```
 
-### 4.4 BeamDecodeBatch
+### 4.4 SharedPrefixBinding
+
+```python
+@dataclass(frozen=True)
+class SharedPrefixBinding:
+    block_table_slot: int
+    actual_prefix_len: int
+    num_prefix_blocks: int
+```
+
+它表示 Prefill 完成后的整个 Prompt，包括未满尾块中的有效 Token。
+
+### 4.5 BeamDecodeBatch
 
 ```python
 @dataclass(frozen=True)
 class BeamDecodeBatch:
     bindings: tuple[BeamKVBinding, ...]
+    prefix_bindings: tuple[SharedPrefixBinding, ...]
     cursor: BeamStepCursor
     active_beam_width: int
     next_beam_width: int
@@ -293,15 +312,7 @@ class BeamDecodeBatch:
     active_mask: DeviceTensor | None
 ```
 
-必须区分：
-
-```text
-capacity_beam_width
-active_beam_width
-next_beam_width
-```
-
-### 4.5 BeamTransition
+### 4.6 BeamTransition 与 Completion
 
 ```python
 @dataclass(frozen=True)
@@ -312,32 +323,21 @@ class BeamTransition:
     next_constraint_state_ids: DeviceTensor | None
     finished_mask: DeviceTensor | None
     requires_next_forward: bool
+
+@dataclass
+class BeamStepCompletion:
+    transition: BeamTransition
+    completion_event: DeviceEvent
+    committed_generation: int
 ```
 
-公共顺序是语义 Beam 顺序。NPU 的 grouped parent、permutation、prefix sum 属于 Backend 私有数据。
-
-### 4.6 对象关系图
-
-```mermaid
-classDiagram
-    class BeamDecodeRequestSpec
-    class BeamKVBinding
-    class BeamStepCursor
-    class BeamDecodeBatch
-    class BeamTransition
-
-    BeamDecodeRequestSpec --> BeamKVBinding : Scheduler reserve
-    BeamKVBinding --> BeamDecodeBatch : Scheduler groups
-    BeamStepCursor --> BeamDecodeBatch : execution cursor
-    BeamDecodeBatch --> BeamTransition : ModelRunner produces
-    BeamTransition --> BeamKVBinding : backend commit
-```
+Scheduler/Worker 只有在 `completion_event` 完成后才能发布新状态。
 
 ---
 
 ## 5. 物理资源与 CachePlan
 
-### 5.1 四类设备资源
+### 5.1 设备资源
 
 ```text
 NativeKVPool
@@ -347,15 +347,16 @@ BeamKVPool
     Beam Decode Suffix
 
 BeamDecodeScratch
-    Token、Score、Parent、TopK、Constraint State、Mask、Graph Buffer
+    Token、Score、Parent、TopK、Sequence、Mask、Graph Buffer
+
+GraphWorkspace
+    CUDA Graph / ACLGraph Workspace、Task Metadata 和固定输出
 
 ConstraintTableBuffer
     模型/Catalog 级只读合法生成表
 ```
 
 ### 5.2 统一显存规划
-
-BeamKV 不能在 Native Paged KV 已经消耗全部可用缓存预算后再临时申请。
 
 ```text
 M_device_budget
@@ -372,63 +373,16 @@ M_native_kv + M_beam_kv + M_beam_scratch
     <= M_device_budget
 ```
 
-### 5.3 CachePlan 数据流
-
-```mermaid
-flowchart LR
-    subgraph WORKERS["Workers / TP-PP Ranks"]
-        P["profile model"]
-        E["estimate BeamKV / Graph / Workspace"]
-        R["local capacity report"]
-        P --> R
-        E --> R
-    end
-
-    R --> EC["vLLM EngineCore Cache Planner"]
-    EC --> CP["GRCachePlan"]
-    CP --> NCFG["NativeKV Config"]
-    CP --> BCFG["BeamKV Config"]
-    CP --> WCFG["Scratch / Workspace Config"]
-
-    NCFG --> WINIT["Worker initialize pools"]
-    BCFG --> WINIT
-    WCFG --> WINIT
-```
-
-### 5.4 Bucket 与 Slot
+Provider 在初始化前报告：
 
 ```python
-BeamKVPoolConfig(
-    buckets={
-        "w32_t64": BeamKVBucket(
-            capacity_beam_width=32,
-            max_decode_steps=64,
-            num_slots=8,
-        ),
-        "w128_t16": BeamKVBucket(
-            capacity_beam_width=128,
-            max_decode_steps=16,
-            num_slots=4,
-        ),
-    }
-)
+class BeamProvider:
+    def estimate_memory(self, profiles) -> BeamGraphMemoryPlan: ...
 ```
 
-请求选择最小兼容 Bucket：
+EngineCore 汇总所有 Rank 后下发统一 CachePlan，Worker 再申请 Pool、Scratch、Workspace 和 Executable Cache。
 
-```text
-W=24,T=48 -> w32_t64
-W=80,T=12 -> w128_t16
-```
-
-每个 Bucket 的全局容量：
-
-```text
-C_global(bucket)
-    = min(C_worker_0, C_worker_1, ..., C_worker_n)
-```
-
-### 5.5 禁止在线 Grow
+### 5.3 禁止在线 Grow
 
 服务期间禁止：
 
@@ -443,7 +397,7 @@ Pool 不足
 
 ---
 
-## 6. Scheduler Admission
+## 6. Scheduler Admission 与执行分组
 
 ### 6.1 Beam Slot 是一等资源
 
@@ -476,35 +430,35 @@ binding = beam_capacity_manager.commit(beam_reservation)
 scheduler_output.beam_kv_bindings[request.session_id] = binding
 ```
 
-### 6.3 Admission 时序
+### 6.3 BeamExecutionSignature
+
+Scheduler 不能只按 `batch * beam` 分组。统一签名为：
+
+```python
+@dataclass(frozen=True)
+class BeamExecutionSignature:
+    platform: str
+    graph_scope: str
+    num_sessions_bucket: int
+    active_beam_width: int
+    next_beam_width: int
+    query_len: int
+    max_prefix_blocks_bucket: int
+    kv_layout: str
+    attention_backend: str
+    postprocess_variant: str
+    result_width: int
+```
+
+例如 `batch=1, beam=8` 和 `batch=2, beam=4` 虽然总 Token 都是 8，但 Shared BlockTable 行数、Beam Grouping 和 Result Shape 不同，不应仅凭 `num_tokens=8` 复用同一个 Graph。
 
 ```mermaid
-sequenceDiagram
-    participant Q as Request Queue
-    participant S as vLLM Scheduler
-    participant B as BeamCapacityManager
-    participant N as NativeKVManager
-    participant O as SchedulerOutput
-
-    Q->>S: beam request
-    S->>B: try_reserve Beam slot
-    alt Beam slot unavailable
-        B-->>S: None
-        S-->>Q: WAITING_FOR_BEAM_KV
-    else Beam slot reserved
-        B-->>S: reservation
-        S->>N: allocate native KV
-        alt Native KV failed
-            N-->>S: None
-            S->>B: rollback
-            S-->>Q: wait / retry
-        else Success
-            N-->>S: native blocks
-            S->>B: commit reservation
-            B-->>S: BeamKVBinding
-            S->>O: BeamDecodeBatch
-        end
-    end
+flowchart LR
+    R["Runnable Beam Sessions"] --> S["Build BeamExecutionSignature"]
+    S --> G["Group Compatible Sessions"]
+    G --> B["BeamDecodeBatch"]
+    B --> O["SchedulerOutput"]
+    O --> M["GPU/NPU ModelRunner"]
 ```
 
 ### 6.4 Slot 状态
@@ -517,298 +471,331 @@ stateDiagram-v2
     RELEASING --> FREE : device completion + generation++
 ```
 
-Slot 只有在最后设备事件完成后才允许复用。
+---
+
+## 7. Prefill 尾块与 Shared Prefix 边界
+
+### 7.1 vLLM Prefix Cache 语义
+
+Prefix Cache 只复用完整 Block。假设：
+
+```text
+block_size = 16
+prompt_len = 37
+```
+
+物理组织为：
+
+```text
+Block 0: token  0 ~ 15  full/cached
+Block 1: token 16 ~ 31  full/cached
+Block 2: token 32 ~ 36  partial tail
+         offset 5 ~ 15  unused
+```
+
+未缓存尾部 `token 32~36` 在本轮 Prefill 中通过 Native `slot_mapping` 写入 Block 2。Prefill 完成后，Shared Prefix 的真实长度是 37，而不是物理容量 48。
+
+### 7.2 Beam 边界
+
+```text
+Native Paged KV:
+    Prompt 的全部 Token
+    包括未满尾块中的有效 Token
+
+BeamKVPool:
+    从首个生成 Token y0 开始
+```
+
+禁止利用 Native 尾块的剩余 Slot 存放 Beam Token。原因是尾块属于所有 Beam 共享的 Prefix，而 Beam Token 从第一步就发生分叉。
+
+### 7.3 Prefill Tail Metadata
+
+```python
+@dataclass
+class PrefillTailMetadata:
+    cached_prefix_len: int
+    uncached_token_count: int
+    slot_mapping: DeviceTensor
+    query_start_loc: DeviceTensor
+    logits_indices: DeviceTensor
+```
+
+`PrefillTailMetadata` 只在 Prefill 使用；Decode 只消费：
+
+```text
+shared_block_table_buf
+actual_shared_kvlen_buf
+num_prefix_blocks_buf
+```
+
+### 7.4 对 Graph 的影响
+
+Prefill 未缓存尾部改变本轮 Query Token 数，因此会改变 Prefill Graph Shape。可采用：
+
+```text
+Eager / Piecewise Tail
+或
+num_uncached_tokens Bucket + Padding Mask
+```
+
+Decode 阶段尾块只表现为固定地址 Buffer 中的动态内容，不应把精确 Tail Length 放入 Decode Graph Key。
+
+```mermaid
+flowchart LR
+    HIT["Full-block Prefix Cache Hit"] --> TAIL["Prefill uncached tail"]
+    TAIL --> NKV["Native Paged KV tail block"]
+    NKV --> BIND["SharedPrefixBinding"]
+    BIND --> STAGE["copy block table / actual length"]
+    STAGE --> GRAPH["Beam Decode Graph Replay"]
+```
 
 ---
 
-## 7. 请求与数据流
+## 8. 请求与数据流
 
-### 7.1 完整生命周期
+### 8.1 完整生命周期
 
 ```mermaid
 flowchart TB
     A["Beam request arrives"]
     B["vLLM Scheduler admission<br/>NativeKV + BeamKV + Scratch"]
-    C["vLLM Prefill<br/>Native Paged KV"]
-    D["Constraint step 0<br/>initial beam tokens"]
-    E["Scheduler builds BeamDecodeBatch"]
-    F["ModelRunner begin_step"]
-    G["Layer forward<br/>append current KV + beam attention"]
-    H["LM Head + Constraint + Beam Select"]
-    I["BeamTransition"]
-    J["GPU/NPU Backend commit"]
-    K["Completion event"]
-    L{"requires_next_forward?"}
-    M["vLLM publishes next request state"]
-    N["final step skip unnecessary reorder"]
-    O["release Beam slot / Native KV"]
-    P["slot reusable, physical pools retained"]
+    C["Prefix Cache full-block hit"]
+    D["Prefill uncached tail<br/>Native Paged KV"]
+    E["Constraint step 0<br/>initial beam tokens"]
+    F["Scheduler groups BeamDecodeBatch"]
+    G["Stage persistent graph buffers"]
+    H["Graph update / replay or eager execute"]
+    I["BeamTransition + CompletionEvent"]
+    J{"requires_next_forward?"}
+    K["publish next vLLM request state"]
+    L["release Beam slot / Native KV"]
 
-    A --> B --> C --> D --> E --> F --> G --> H --> I --> J --> K --> L
-    L -->|yes| M --> E
-    L -->|no| N --> O --> P
+    A --> B --> C --> D --> E --> F --> G --> H --> I --> J
+    J -->|yes| K --> F
+    J -->|no| L
 ```
 
-### 7.2 每层严格顺序
+### 8.2 每层严格顺序
 
 ```text
 1. Q/K/V Projection
 2. 将当前 Token K/V 写入 current_write_target[decode_index]
-3. 当前 Attention 读取：
-   - vLLM Native Shared Prefix KV
-   - 已提交的 Beam 历史 KV
-   - 当前层刚写入的当前 Token K/V
-4. Prefix Attention
-5. Suffix/Beam Attention
-6. LSE Merge 或专用融合 Attention
-7. Output Projection / 下一层
+3. Attention 读取 Native Shared Prefix、已提交 Beam 历史和当前 K/V
+4. Prefix/Beam Attention 或融合 x_attention
+5. Output Projection / 下一层
 ```
-
-### 7.3 Layer 数据流
-
-```mermaid
-flowchart LR
-    QKV["Q/K/V projection"] --> APP["append current K/V"]
-    NKV["vLLM Native Paged Prefix"] --> PREF["prefix attention"]
-    APP --> SUF["suffix / beam attention"]
-    APP --> PREF
-    PREF --> MERGE["merge / fused attention output"]
-    SUF --> MERGE
-    MERGE --> O["output projection"]
-```
-
-当前 K/V 对本层 Attention 立即可见，但在整个 Step Commit 前不发布为下一代 Beam 状态。
 
 ---
 
-## 8. Beam Parent 与 Commit
-
-### 8.1 Parent 是核心语义
+## 9. Beam Parent 与 Commit
 
 ```text
 parent_beam_ids = [3, 1, 1, 1]
 ```
 
-表示下一代 Beam 历史分别来自旧 Beam 3、1、1、1。
-
-```mermaid
-flowchart LR
-    O3["old beam 3"] --> N0["new beam 0"]
-    O1["old beam 1"] --> N1["new beam 1"]
-    O1 --> N2["new beam 2"]
-    O1 --> N3["new beam 3"]
-```
-
-### 8.2 公共 Commit 流程
+下一代 Beam 历史分别来自旧 Beam 3、1、1、1。
 
 ```mermaid
 flowchart LR
     L["logits"] --> C["Constraint / TopK"]
     C --> S["Beam Selector"]
     S --> T["BeamTransition"]
-    T --> CM{"Backend commit mode"}
+    T --> CM{"Backend commit"}
     CM -->|CUDA lineage| LG["update BeamPath / indices"]
-    CM -->|physical reorder| RO["reorder all-layer BeamKV"]
+    CM -->|NPU reorder| RO["select_unshared_kv"]
     LG --> EV["completion event"]
     RO --> EV
     EV --> PB["publish vLLM request state"]
 ```
 
-### 8.3 可见性不变量
+可见性不变量：
 
 ```text
-所有 Layer 的 KV Append/Commit 完成
-    -> Device Completion Event
+Graph / Backend Commit 完成
+    -> Completion Event
     -> committed_generation++
-    -> vLLM Request State 发布 Parent/Token/Score
+    -> Parent/Token/Score 对 vLLM Request State 可见
 ```
-
-NPU 原地 Reorder 中途失败时，不承诺通用 Rollback；Session 标记 Fatal，Slot 进入 `RELEASING`。
 
 ---
 
-## 9. CUDA Backend：基于 vLLM，参考 NVIDIA 执行层
+## 10. CUDA Backend：基于 vLLM，参考 NVIDIA 执行层
 
 CUDA 路径仍由 vLLM `GPUModelRunner -> Model Forward -> Attention Backend` 驱动。
 
-### 9.1 NVIDIA 可借鉴内容
+可借鉴：
 
-| NVIDIA 参考项 | vLLM-GR 落点 |
-| --- | --- |
-| Step-major BeamKV | `BeamKVManager` 管理的 CUDA BeamKVPool |
-| BeamPath / topk indices | CUDA Backend 私有 Lineage Metadata |
-| GR Decode Attention | vLLM Attention Backend 或自定义 CUDA Op |
-| BeamKV Writer | Layer Forward 内当前 K/V Append |
-| Decode Batch 分组 | vLLM Scheduler 的 Beam Decode Group Key |
-| Direct Pool-view Graph | GPUModelRunner 内 Beam Graph Runner |
-| Pointer Guard | Graph Replay 前验证 Pool View 地址 |
+- Step-major Append-only BeamKV；
+- BeamPath / Lineage Metadata；
+- GR Decode Attention；
+- Decode Batch 分组；
+- Direct Pool-view Graph；
+- Pointer Guard。
 
-NVIDIA Dense `ContextKV` 不进入公共 Prefix ABI。vLLM Prefix 始终使用 Native Paged KV。
-
-### 9.2 推荐 CUDA BeamKV 布局
+推荐布局：
 
 ```text
 BeamKV[layer]
     [slot, step, beam, kv_head, head_dim]
 ```
 
-要求：
-
-- 当前 Step Append 地址稳定；
-- Pool Base 和 Slot Stride 固定；
-- Lineage Metadata 使用固定 Buffer；
-- Attention 能组合 Paged Prefix 与 Beam Suffix；
-- 布局属于 CUDA Backend 私有实现。
-
-### 9.3 CUDA Decode Batch 分组
-
-参考 NVIDIA 分组维度，但实现位置在 vLLM Scheduler：
-
-```text
-BeamDecodeGroupKey = (
-    decode_index,
-    active_beam_width,
-    next_beam_width,
-    context_shape_bucket,
-    graph_shape_bucket,
-)
-```
-
-分组结果通过 `SchedulerOutput.beam_decode_batches` 下发到 GPUModelRunner，不建立独立 Continuous Scheduler。
-
-### 9.4 CUDA 内部 Commit 模式
-
-#### Lineage 模式
-
-```text
-Append BeamKV[:, step, :]
-    -> Beam Select
-    -> 更新 BeamPath / Lineage
-    -> 下一步 GR Decode Attention 按祖先索引读取
-```
-
-#### Dense Reorder 模式
-
-```text
-Dense BeamKV
-    -> Prefix Attention
-    -> Suffix Attention
-    -> LSE Merge
-    -> Physical Reorder
-```
-
-Dense Reorder 便于先基于当前 vllm-gr 机制落地；Lineage 模式用于后续对接 NVIDIA 风格专用算子。
-
-### 9.5 CUDA 数据流
-
-```mermaid
-flowchart TB
-    SCH["vLLM Scheduler<br/>group BeamDecodeBatch"] --> MR["GPUModelRunner"]
-    MR --> QKV["Model Q/K/V Projection"]
-    QKV --> APP["CUDA BeamKV Append"]
-    NKV["vLLM Native Paged Prefix"] --> ATT["CUDA Beam Attention"]
-    APP --> ATT
-    ATT --> LM["vLLM LM Head"]
-    LM --> SEL["vllm-gr Beam Select"]
-    SEL --> COM{"CUDA commit mode"}
-    COM -->|lineage| LIN["update BeamPath / indices"]
-    COM -->|reorder| REO["reorder BeamKV"]
-    LIN --> OUT["vLLM Request State / Output"]
-    REO --> OUT
-```
+NVIDIA Dense ContextKV 不进入公共 Prefix ABI，Prefix 始终使用 vLLM Native Paged KV。
 
 ---
 
-## 10. NPU Backend：参考 ACS
+## 11. NPU Backend：ACS ACLGraph 接入架构
 
-### 10.1 推荐布局
-
-```text
-BeamKV[layer]
-    [slot, beam, kv_head, max_decode_steps, head_dim]
-```
-
-### 10.2 每层路径
-
-```text
-Q/K/V Projection
-    -> cache_unshared_kv
-    -> x_attention(shared prefix + unshared beam history)
-    -> output projection
-```
-
-### 10.3 Step Commit
-
-```text
-Beam Selection
-    -> 原始 parent_beam_ids
-    -> NPU Parent Canonicalization
-    -> grouped parent / permutation / prefix sums
-    -> all-layer select_unshared_kv
-    -> Completion Event
-    -> vLLM Request State Publish
-```
-
-### 10.4 NPU 数据流
+### 11.1 Provider 映射
 
 ```mermaid
 flowchart TB
-    SCH["vLLM Scheduler"] --> MR["NPUModelRunner"]
-    MR --> QKV["Q/K/V Projection"]
-    QKV --> CUK["cache_unshared_kv"]
-    NKV["vLLM Native Paged Prefix"] --> XA["x_attention"]
-    CUK --> XA
-    XA --> LM["LM Head"]
-    LM --> SEL["Beam Select"]
-    SEL --> GP["group parent"]
-    GP --> SUK["select_unshared_kv all layers"]
-    SUK --> OUT["vLLM Request State / Output"]
+    SCH["vLLM Scheduler"] --> SO["BeamDecodeBatch"]
+    SO --> MR["NPUModelRunner"]
+    MR --> BKM["BeamKVManager"]
+    BKM --> NGP["NpuBeamGraphProvider"]
+    NGP --> BP["Persistent BeamSearchBufferPool"]
+    NGP --> EXE["ACLGraph Executable"]
+    EXE --> OPS["cache_unshared_kv / x_attention / topk / select"]
+    OPS --> CMP["BeamStepCompletion"]
+    CMP --> OUT["vLLM Request State"]
 ```
 
-Final Step 的 `requires_next_forward=false` 时跳过 KV Reorder。
+ACS 对象映射：
 
----
+| ACS 对象 | 统一架构位置 |
+| --- | --- |
+| `BeamSearchBufferPool` | NPU Provider 物理 Arena |
+| `BeamSearchContext` | Worker Beam Session 状态 |
+| `ACLGraphWrapper` | NPU ModelRunner Graph Executor |
+| `GraphParams` | Provider 私有 Executable Metadata |
+| `decode_step_buf` | `BeamStepCursor` 设备镜像 |
+| `actual_shared_kvlen` | `SharedPrefixBinding` 设备镜像 |
+| `unshared_block_tables` | NPU Beam Slot Device Binding |
+| `sequence/beam_scores` | Beam Postprocess 持久化 Scratch |
+| `select_unshared_kv` | `commit_transition()` |
 
-## 11. Attention Backend Contract
+### 11.2 持久化 Buffer Contract
 
-公共输入基于 vLLM Paged Prefix：
-
-```python
-beam_attention(
-    query,
-    paged_prefix_ref,
-    beam_layer_step_view,
-    active_beam_width,
-    cursor,
-)
-```
-
-`paged_prefix_ref` 包含：
+初始化期一次性创建：
 
 ```text
-block_table
-seq_lens
-slot_mapping
-native kv cache tensor reference
+decode_step_buf
+actual_shared_kvlen
+unshared_block_tables
+unshared K/V per layer
+sequence
+beam_scores
+group_token_num
+last_out_token_ids
+constraint tables
+temperatures
+workspace
+fixed outputs
 ```
 
-NVIDIA Dense `ContextKV` 仅用于理解其 CUDA 算子，不进入公共 ABI。
-
-Layer 使用明确 `layer_idx`：
+Runtime 只允许：
 
 ```python
-beam_kv_pool.key[layer_idx]
-beam_kv_pool.value[layer_idx]
+persistent_buffer.copy_(runtime_value)
+persistent_scalar.fill_(runtime_value)
 ```
 
-不使用 `id(kv_cache)` 作为正式跨模块接口。
+不允许重新创建或替换 Tensor。
 
-Forward 热路径禁止：
+### 11.3 Graph Capability
 
-- 新建或 Grow Beam Pool；
-- 替换 Metadata Tensor；
-- 每层构造 Python Pool 字典；
-- 动态创建 Graph 输入 Buffer。
+```python
+@dataclass(frozen=True)
+class BeamGraphCapabilities:
+    supports_full_forward: bool
+    supports_full_step: bool
+    supports_dynamic_decode_step: bool
+    supports_dynamic_prefix_length: bool
+    supports_dynamic_block_table: bool
+    requires_task_group_update: bool
+    requires_fixed_beam_width: bool
+```
+
+ACS NPU Provider 作为已实现能力对外声明 Full-Step Graph 支持；Common 层不依赖其内部 Task Handle 或算子 ABI。
+
+### 11.4 Runtime Staging 与 Replay
+
+```python
+runtime = npu_beam_provider.prepare_runtime(
+    batch=beam_decode_batch,
+    prefix_bindings=shared_prefix_bindings,
+)
+
+executable = npu_beam_provider.get_or_capture_graph(
+    runtime.graph_key,
+)
+
+npu_beam_provider.update_runtime_params(
+    executable,
+    runtime,
+)
+
+completion = executable.replay()
+```
+
+### 11.5 Task Group Update
+
+ACS 的 Task Group、Handle、Event 和 Workspace 应封装在 Provider：
+
+```python
+class NpuBeamGraphProvider:
+    def update_runtime_params(self, executable, runtime):
+        self._update_cache_tasks(executable, runtime)
+        self._update_attention_tasks(executable, runtime)
+        self._update_postprocess_tasks(executable, runtime)
+        self.replay_stream.wait_stream(self.update_stream)
+```
+
+Provider 私有维护：
+
+```text
+cache task handles
+attention task handles
+postprocess task handles
+external events
+workspace
+fixed output buffers
+```
+
+Common 层只看到：
+
+```text
+stage_runtime()
+update_runtime_params()
+replay()
+completion_event
+```
+
+### 11.6 Full-Step Graph 范围
+
+统一架构支持：
+
+```text
+G0 Eager
+G1 Full Forward
+G2 Full Beam Step
+G3 Fixed Decode Window
+```
+
+ACS 作为已实现的 NPU G2 Provider 接入。G2 的逻辑边界为：
+
+```text
+Model Forward
+    -> LM Head
+    -> Constrained TopK
+    -> Beam Global Select
+    -> select_unshared_kv / Final Select
+    -> BeamStepCompletion
+```
+
+### 11.7 Final Step
+
+`requires_next_forward=false` 时，使用 Final Beam Select，跳过只服务下一轮 Attention 的 `select_unshared_kv`。
 
 ---
 
@@ -821,12 +808,8 @@ Capacity Admission:
     请求是否拥有合法 Beam Slot？
 
 Graph Dispatch:
-    已获准执行的 Batch 是否有匹配 Graph？
+    已获准执行的 Batch 是否有匹配 Executable？
 ```
-
-- Capacity 失败：请求等待；
-- Graph Miss：Eager/Piecewise 回退；
-- Graph Miss 不能绕过 Capacity。
 
 ### 12.2 BeamGraphKey
 
@@ -834,36 +817,62 @@ Graph Dispatch:
 @dataclass(frozen=True)
 class BeamGraphKey:
     platform: str
-    runtime_mode: str
+    graph_scope: str
     num_sessions_bucket: int
-    beam_width: int
+    active_beam_width: int
+    next_beam_width: int
     query_len: int
+    max_prefix_blocks_bucket: int
     dtype: str
     kv_layout: str
     attention_backend: str
     postprocess_variant: str
+    result_width: int
     tp_size: int
 ```
 
-通常不进入 Key：Request ID、Slot ID、Token ID、Parent ID、Score 和精确 Decode Step。
+通常不进入 Key：Request ID、Slot ID、Block ID、Token ID、Parent ID、Score、精确 Prefix Length、尾块长度和精确 Decode Step。
 
-### 12.3 Graph Runner 位置
+### 12.3 ModelRunner Graph Dispatch
 
 ```mermaid
 flowchart LR
-    AD["vLLM Scheduler admitted BeamDecodeBatch"] --> GK["build BeamGraphKey"]
+    AD["Scheduler admitted BeamDecodeBatch"] --> GK["BeamGraphKey"]
     GK --> GD{"graph hit?"}
-    GD -->|yes| STG["stage fixed buffers"]
-    GD -->|no| EG["vLLM eager / piecewise"]
-    STG --> RP["GPUModelRunner / NPUModelRunner graph replay"]
-    RP --> CM["Backend commit / completion"]
-    EG --> CM
-    CM --> OUT["vLLM output lifecycle"]
+    GD -->|yes| STG["stage persistent buffers"]
+    GD -->|no| CAP["lazy capture or eager fallback"]
+    STG --> UPD["task parameter update"]
+    CAP --> EXE["graph executable"]
+    UPD --> RP["graph replay"]
+    RP --> EV["completion event"]
+    EXE --> EV
+    EV --> OUT["publish vLLM state"]
 ```
 
-CUDA Graph 的 Direct Pool-view、Pointer Guard 和固定输出 Buffer 可以参考 NVIDIA，但 Runner 必须位于 vLLM ModelRunner 扩展中。
+### 12.4 Prefill 与 Decode Graph Key
 
-ACLGraph 参考 ACS 的固定 Buffer 和 Task Update 机制。
+Prefill Graph Key 可以包含：
+
+```text
+num_reqs_bucket
+num_uncached_tokens_bucket
+max_query_len_bucket
+prefix_hit_mode
+attention_backend
+```
+
+Decode Graph Key 不包含精确尾块长度；只在算子 Launch Geometry 确实依赖时包含 `max_prefix_blocks_bucket`。
+
+### 12.5 地址稳定性
+
+必须验证：
+
+- Pool Base 地址稳定；
+- Slot View 地址与 Graph 捕获一致；
+- Runtime Metadata 使用固定 Tensor；
+- Output Buffer 固定；
+- Provider 禁止服务期 Grow；
+- Slot 复用前等待最后 Completion Event。
 
 ---
 
@@ -874,40 +883,26 @@ vllm_gr/
   v1/
     beam/
       types.py
-        BeamDecodeRequestSpec
-        BeamKVBinding
-        BeamStepCursor
-        BeamDecodeBatch
-        BeamTransition
-
       capacity.py
-        BeamCapacityManager
-        BeamKVPoolConfig
-        BeamKVBucketConfig
-
       manager.py
-        BeamKVManager
-        BeamKVStepTransaction
-        SlotGenerationState
+      execution_signature.py
 
       backend/
         base.py
         cuda.py
         npu.py
 
-      attention/
-        contract.py
-        cuda_backend.py
-        npu_backend.py
+      graph/
+        capabilities.py
+        key.py
+        executor.py
+        cuda_runner.py
+        npu_runner.py
+        npu_task_update.py
 
       postprocess/
         constraint_backend.py
         beam_selector.py
-
-      graph/
-        key.py
-        cuda_runner.py
-        npu_runner.py
 ```
 
 集成点：
@@ -915,14 +910,14 @@ vllm_gr/
 ```text
 vLLM Scheduler
     -> BeamCapacityManager
-    -> SchedulerOutput.beam_kv_bindings
+    -> BeamExecutionSignature
+    -> SchedulerOutput.beam_decode_batches
 
 GPU/NPU ModelRunner
     -> BeamKVManager.begin_step
-    -> Backend LayerStepView
-    -> Model Forward
-    -> Postprocess
-    -> Backend Commit
+    -> Provider stage runtime
+    -> Graph update / replay
+    -> BeamStepCompletion
     -> vLLM Output Processor
 ```
 
@@ -937,18 +932,17 @@ GPU/NPU ModelRunner
     <= CachePlan 公布的全局物理 Slot 容量
 ```
 
+### Prefix
+
+```text
+actual_prefix_len <= num_prefix_blocks * block_size
+Beam Token 不写入 Native Prefix 尾块剩余空间
+```
+
 ### Binding
 
 ```text
 binding.generation == local_slot.generation
-```
-
-### Step
-
-```text
-decode_index < max_decode_steps
-materialized_kv_len == decode_index
-selected_token_count == decode_index + 1
 ```
 
 ### Attention
@@ -958,86 +952,76 @@ selected_token_count == decode_index + 1
     当前 Token K/V 已写入 current_write_target
 ```
 
+### Graph
+
+```text
+同一 BeamGraphKey 的所有固定 Tensor 地址一致
+Runtime 只更新 Buffer 内容或 Task 参数
+```
+
 ### 发布
 
 ```text
-所有 Layer KV Commit 完成
+Full-Step Graph / Backend Commit 完成
     -> Completion Event
     -> committed_generation++
     -> vLLM Request State 可见 Parent/Token/Score
-```
-
-### 释放
-
-```text
-Slot 只有在最后 Device Event 完成后
-    才能 Generation 失效并重新分配
 ```
 
 ---
 
 ## 15. 测试与验收
 
-### 15.1 vLLM 主流程
+### 15.1 Prefill 尾块
 
-- 普通请求不受 Beam 扩展影响；
-- Beam 请求仍由 vLLM Scheduler 驱动；
-- Cancel、Finish、Timeout、Failure 正确释放 Native KV 和 Beam Slot；
-- SchedulerOutput 到 GPU/NPU ModelRunner 的 Binding 一致。
+- Prefix Cache 只命中完整 Block；
+- 未缓存尾部正确写入 Native KV；
+- Decode 只读取尾块有效 Token；
+- Beam Token 不复用尾块空槽；
+- Prefix Length 变化不要求重建 Decode Graph。
 
-### 15.2 Beam 语义
+### 15.2 Graph Signature
 
-- Parent Beam IDs；
-- Selected Token IDs；
-- Accumulated Scores；
-- Final Item List；
-- EOS/Finished Mask；
-- Constraint State。
+- `batch=1, beam=8` 与 `batch=2, beam=4` 不得因相同 `num_tokens` 误复用；
+- 不同 Beam Width、Result Width 和 Postprocess Variant 使用正确 Executable；
+- Graph Miss 不绕过 Capacity。
 
-### 15.3 KV 正确性
+### 15.3 ACS ACLGraph
 
-- 当前 K/V 写入位置；
-- `[3,1,1,1]` 等 Parent 复制场景；
-- CUDA Lineage 与 Dense Reorder 结果等价；
-- NPU Physical Reorder 正确；
-- Final-step Skip 不影响输出；
-- Slot 复用无旧数据污染。
+- `decode_step` 更新后 Replay 正确；
+- `actual_shared_kvlen` 和 BlockTable 更新后 Replay 正确；
+- Task Update Stream 与 Replay Stream 同步正确；
+- Full-Step Graph 输出与 Eager 输出一致；
+- Final Step Skip 不影响输出；
+- Slot 复用无旧 KV、Sequence 和 Score 污染。
 
-### 15.4 调度与容量
+### 15.4 生命周期
 
-- Beam Slot 满时请求不下发；
-- Native KV 失败时 Beam Reservation 回滚；
-- Grouped Request 按独立 Session 数计 Slot；
-- 多 Worker 使用全局最小容量；
-- Releasing Slot 不提前复用。
-
-### 15.5 Graph
-
-- Pool 和 Graph Buffer 地址稳定；
-- Graph Replay 与 Eager 输出一致；
-- Graph Miss 不绕过 Capacity；
-- Pointer Guard 拒绝错误 Pool View；
-- Padding Row 不写入 Live Slot。
+- Graph 完成前不发布 Beam State；
+- Cancel/Failure 等待迟到 Device Task 后释放 Slot；
+- Worker 不在 Runtime 重建 Beam Pool；
+- 多 Worker 使用统一全局容量和一致的 Binding Generation。
 
 ---
 
 ## 16. 最终设计决策
 
-1. 主架构保持 vLLM V1 `EngineCore -> Scheduler -> SchedulerOutput -> Worker/ModelRunner -> Attention -> Output`；
+1. 主架构保持 vLLM V1 `EngineCore -> Scheduler -> SchedulerOutput -> Worker/ModelRunner -> Backend -> Output`；
 2. Beam Incremental Decode 作为 vllm-gr 扩展接入，不建立独立 Runtime；
 3. Native Prefix KV 始终使用 vLLM Paged KV；
-4. BeamKV 是与 Native KV 并列规划的固定物理 Pool；
-5. Beam Slot 由 vLLM Scheduler 扩展分配，Worker 只消费 Binding；
-6. 当前 Token K/V 必须先写后读；
-7. Beam Parent 通过 `BeamTransition` 进入每一步 Commit；
-8. CUDA 只在算子、BeamKV 布局、Decode Batch 分组和 CUDA Graph 上参考 NVIDIA；
-9. NPU 参考 ACS 的连续 BeamKV、x_attention 和 Physical Reorder；
-10. NVIDIA Dense ContextKV、独立 Scheduler、Serving API 和状态机不进入系统设计；
-11. CUDA/NPU Graph Runner 均位于 vLLM ModelRunner 扩展内；
-12. Backend Commit 完成前禁止发布下一代 vLLM Request State；
-13. Slot 释放晚于最后 Device Event；
-14. 服务期间禁止 BeamKVPool Grow；
-15. 普通 vLLM 请求路径保持不变。
+4. Prefix Cache 只复用完整 Block，未缓存尾部由 Prefill 写入 Native KV；
+5. Beam Token 不复用 Native 尾块剩余 Slot；
+6. BeamKV、Scratch、Graph Workspace 由 EngineCore 统一规划并在初始化期申请；
+7. Beam Slot 由 Scheduler 扩展分配，Worker 只消费 Binding；
+8. Scheduler 使用完整 `BeamExecutionSignature` 分组，不能只使用总 Token 数；
+9. CUDA 只在算子、BeamKV 布局、Decode Batch 分组和 CUDA Graph 上参考 NVIDIA；
+10. ACS 已实现的 NPU ACLGraph 能力封装为 `NpuBeamGraphProvider`；
+11. ACS BufferPool、Task Handle、Event 和 Workspace 均属于 Provider 私有实现；
+12. Common 层通过 Capability、GraphKey、CompletionEvent 接入不同成图范围；
+13. Full-Step Graph 或 Backend Commit 完成前禁止发布下一代 Request State；
+14. Slot 释放晚于最后 Device Event；
+15. 服务期间禁止 BeamKVPool 和 Graph Buffer Grow；
+16. 普通 vLLM 请求路径保持不变。
 
 ---
 
@@ -1052,9 +1036,8 @@ Slot 只有在最后 Device Event 完成后
 
 - `examples/sid-gr-inference/src/gr_inference/gr_kv/beam_kv.py`
 - `examples/sid-gr-inference/src/gr_inference/gr_kv/beam_path.py`
-- `examples/sid-gr-inference/src/gr_inference/gr_runtime/decode_kv.py`
 - `examples/sid-gr-inference/src/gr_inference/gr_kernels/attention/gr_decode_attention.py`
-- `examples/sid-gr-inference/src/gr_inference/gr_serving/continuous.py`（仅 Decode Batch 分组）
+- `examples/sid-gr-inference/src/gr_inference/gr_serving/continuous.py`
 - `examples/sid-gr-inference/src/gr_inference/gr_serving/decode_cuda_graph.py`
 
 ### ACS_vllm-GR
@@ -1062,6 +1045,9 @@ Slot 只有在最后 Device Event 完成后
 - `vllm-ascend/vllm_ascend/beam_search/context.py`
 - `vllm-ascend/vllm_ascend/attention/attention_v1.py`
 - `vllm-ascend/vllm_ascend/ops/xllm_ops.py`
+- `vllm-ascend/vllm_ascend/compilation/acl_graph.py`
+- `vllm-ascend/vllm_ascend/worker/model_runner_v1.py`
+- `vllm-ascend/vllm_ascend/ascend_forward_context.py`
 
 ### JiusiServe/vllm-gr
 
