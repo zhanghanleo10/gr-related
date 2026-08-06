@@ -2,8 +2,8 @@
 
 > 状态：Design Draft  
 > 基线：vLLM `releases/v0.22.1`、`JiusiServe/vllm-gr`、`NVIDIA/recsys-examples`、`ACS_vllm-GR`  
-> 范围：Decode 阶段 Beam KV Cache 的内存规划、生命周期、GPU/NPU 平台实现、数据流和 Scheduler admission  
-> 非目标：本文不改变 Beam ranking、Catalog constraint、EOS、返回格式等上层语义。
+> 范围：Decode 阶段 Beam KV Cache、受限生成表 Buffer 的内存规划、生命周期、GPU/NPU 平台实现、数据流和 Scheduler admission  
+> 非目标：本文不重新定义合法 SID Catalog、Beam ranking、EOS、返回格式等上层语义。
 
 ## 目录
 
@@ -27,8 +27,9 @@
 - [18. 对当前 vLLM-GR 代码的改造点](#18-对当前-vllm-gr-代码的改造点)
 - [19. 可观测性、测试与验收标准](#19-可观测性测试与验收标准)
 - [20. 分阶段实施建议](#20-分阶段实施建议)
-- [21. 最终设计决策](#21-最终设计决策)
-- [22. 代码与资料索引](#22-代码与资料索引)
+- [21. 受限生成表 Buffer 与 BeamDecodeKV 联动生命周期](#21-受限生成表-buffer-与-beamdecodekv-联动生命周期)
+- [22. 最终设计决策](#22-最终设计决策)
+- [23. 代码与资料索引](#23-代码与资料索引)
 
 ---
 
@@ -3159,7 +3160,624 @@ requires_next_forward
 
 ---
 
-## 21. 最终设计决策
+## 21. 受限生成表 Buffer 与 BeamDecodeKV 联动生命周期
+
+### 21.1 先澄清两种“受限”
+
+在 GR Decode 中，“受限”同时包含两个不同维度：
+
+1. **语义受限**：Catalog/Constraint Table 决定当前 SID 前缀之后允许生成哪些 Token；
+2. **物理受限**：BeamDecodeKV 的 HBM 容量有限，Scheduler 必须先预留物理 slot，才能下发请求。
+
+这两类资源需要协同，但不能混成一个 `BeamSearchBufferPool`：
+
+| 资源 | 所有权 | 可写性 | 生命周期 | 典型内容 |
+| --- | --- | --- | --- | --- |
+| `ConstraintTableBuffer` | 模型/Catalog 级 | 只读 | Catalog version / 模型生命周期 | `first_token_ids`、CSR offsets/values、FSM transition |
+| `BeamDecodeKVBuffer` | Worker 物理 Pool + request lease | 可写 | Pool 常驻；lease 随请求 | Decode suffix K/V、lineage 或 reorder 后的 K/V |
+| `BeamDecodeScratch` | Worker Pool + request workspace | 可写 | 请求或 Graph bucket | sequence、score、state、TopK、step、finished mask |
+
+三者最终只通过公共 `BeamTransition` 汇合：
+
+```text
+ConstraintTableBuffer
+    -> 合法候选 Token
+    -> BeamTransition(parent, token, score, next_state)
+    -> BeamDecodeKV commit
+```
+
+Constraint Backend 不应直接操作 KV；BeamKV Backend 也不应理解 Catalog 表的内部格式。
+
+### 21.2 总体初始化、使用与释放数据流
+
+```mermaid
+flowchart TD
+    subgraph INIT["Engine / Worker 初始化"]
+        CAT["合法 SID Catalog"] --> BUILD["CPU 构建 Constraint Table"]
+        BUILD --> CHECK["校验 offsets / token 范围 / degree"]
+        CHECK --> CTREG["ConstraintTableRegistry<br/>设备只读常驻"]
+
+        MEM["DeviceMemoryPlanner"] --> KVP["Paged KV Pool<br/>Prompt Shared KV"]
+        MEM --> BKVP["BeamDecodeKVPool<br/>Decode Unshared KV"]
+        MEM --> SCRATCH["Beam Scratch Pool<br/>sequence / score / state"]
+    end
+
+    REQ["新请求"] --> ADMIT["Scheduler Atomic Admission"]
+    CTREG --> ADMIT
+    KVP --> ADMIT
+    BKVP --> ADMIT
+    SCRATCH --> ADMIT
+
+    ADMIT -->|资源不足| WAIT["排队 / 降级 / 拒绝"]
+    ADMIT -->|预留成功| SESSION["BeamDecodeSession"]
+
+    SESSION --> PREFILL["Prefill"]
+    PREFILL --> SHARED["写入 Shared Paged KV"]
+    PREFILL --> FIRST["Constraint Step 0<br/>合法首 Token"]
+    FIRST --> TRANS0["Initial BeamTransition"]
+    TRANS0 --> LOOP["Decode Loop"]
+
+    LOOP --> ATTN["Beam Attention<br/>Shared KV + Beam KV"]
+    ATTN --> STAGE["写入当前 Step BeamKV staging"]
+    STAGE --> LM["LM Head"]
+    LM --> CTOPK["Constrained TopK"]
+    CTREG --> CTOPK
+    CTOPK --> SELECT["Global Beam Select"]
+    SELECT --> TRANS["BeamTransition<br/>parent + token + score + state"]
+
+    TRANS --> FSM["更新 Constraint State"]
+    TRANS --> KVCOMMIT["BeamKV Commit"]
+    KVCOMMIT -->|Copy 模式| REORDER["KV 物理重排 / 复制"]
+    KVCOMMIT -->|Lineage 模式| INDEX["只更新祖先索引"]
+
+    FSM --> NEXT{"最后一步？"}
+    REORDER --> NEXT
+    INDEX --> NEXT
+    NEXT -->|否| LOOP
+    NEXT -->|是| FINAL["Final Beam Select<br/>跳过下一步 KV reorder"]
+
+    FINAL --> EVENT["等待设备完成事件"]
+    EVENT --> RELEASE["释放 request 资源"]
+    RELEASE --> KVP
+    RELEASE --> BKVP
+    RELEASE --> SCRATCH
+    RELEASE -.引用计数减一.-> CTREG
+
+    CTREG -->|模型卸载或旧版本无引用| DESTROY["销毁 Constraint Table"]
+```
+
+图中“释放 request 资源”只归还逻辑 block、BeamKV lease 和 Scratch slot，不销毁物理大池。
+
+### 21.3 推荐核心对象
+
+#### 21.3.1 `ConstraintTableHandle`
+
+```python
+@dataclass(frozen=True)
+class ConstraintTableHandle:
+    table_id: str
+    version: int
+    device: torch.device
+    layout: ConstraintLayout
+    tensors: Mapping[str, torch.Tensor]
+    bytes: int
+```
+
+它表示已经加载到当前 Worker 设备、可被后处理算子直接读取的只读表。请求只保存
+`table_id/version` 或 handle，不复制整份表。
+
+#### 21.3.2 `BeamKVLease`
+
+```python
+@dataclass
+class BeamKVLease:
+    lease_id: int
+    generation: int
+    physical_slots: torch.Tensor
+    batch_bucket: int
+    beam_bucket: int
+    step_bucket: int
+    bytes_reserved: int
+```
+
+它表示请求从有限 `BeamDecodeKVPool` 中租到的空间。释放的是 lease 的所有权，不是设备 Tensor。
+
+#### 21.3.3 `BeamDecodeWorkspace`
+
+```python
+@dataclass
+class BeamDecodeWorkspace:
+    sequence: torch.Tensor
+    beam_scores: torch.Tensor
+    parent_beam_ids: torch.Tensor
+    constraint_state_ids: torch.Tensor
+    top_tokens: torch.Tensor
+    top_probs: torch.Tensor
+    decode_step: torch.Tensor
+    finished_mask: torch.Tensor
+```
+
+这些 Tensor 应来自固定地址的 Pool slice，并原地更新，以兼容 CUDA Graph/ACLGraph。
+
+#### 21.3.4 `BeamTransition`
+
+```python
+@dataclass
+class BeamTransition:
+    parent_beam_ids: torch.Tensor
+    selected_token_ids: torch.Tensor
+    selected_scores: torch.Tensor
+    next_constraint_state_ids: torch.Tensor
+    finished_mask: torch.Tensor
+    requires_next_forward: bool
+```
+
+`BeamTransition` 是受限生成、Beam 状态机和 BeamKV Provider 之间唯一的公共事务数据。
+
+### 21.4 Constraint Table 的初始化与物理申请
+
+以三级合法 SID 为例：
+
+```text
+(10, 20, 30)
+(10, 21, 31)
+(11, 22, 32)
+```
+
+ACS `rec_constrained_topk` 当前使用的三级稀疏结构可以表示为：
+
+```text
+first_token_ids = [10, 11]
+
+prefix1:
+  10 -> [20, 21]
+  11 -> [22]
+
+prefix2:
+  (10, 20) -> [30]
+  (10, 21) -> [31]
+  (11, 22) -> [32]
+```
+
+对应 Buffer：
+
+| Buffer | 语义 |
+| --- | --- |
+| `first_token_ids` | step 0 的合法首 Token |
+| `prefix1_offsets/prefix1_values` | 由第一个 Token 索引的 CSR 后继表 |
+| `prefix1_pair_keys` | `(token0, token1)` 编码并排序后的 int64 key |
+| `prefix2_value_offsets/prefix2_values` | pair key 对应的合法后继 CSR |
+| `max_prefix1_degree` | 一级前缀最大出度 |
+| `max_prefix2_degree` | 二级前缀最大出度 |
+
+加载设备前必须校验：
+
+- Token ID 小于对应 hierarchy vocabulary；
+- offsets 单调递增且 `offsets[-1] == values.numel()`；
+- pair keys 有序且唯一；
+- 每个非终止前缀存在合法后继；
+- `max_prefix*_degree` 不小于真实最大出度；
+- `top_k` 不超过算子上限；
+- Catalog 不包含重复或格式错误的 SID；
+- table version/checksum 与模型配置匹配。
+
+若 ID/offset 为 int32、pair key 为 int64，静态表大小可近似为：
+
+```text
+M_constraint ≈ 4F + 4V + 16E1 + 4E2
+```
+
+其中 `F` 是合法首 Token 数，`V` 是索引词表大小，`E1/E2` 是两级稀疏边数。
+
+建议设备申请顺序为：
+
+```text
+模型权重
+  -> Constraint Table
+  -> Graph 固定输入输出 Buffer
+  -> Beam Scratch 最低保留预算
+  -> profile / dummy run
+  -> 汇总剩余 HBM
+  -> 规划 Paged KV + BeamDecodeKV
+  -> 申请物理 Pool
+  -> Graph capture
+```
+
+如果实现上必须在 profile 后加载表，则 EngineCore 必须从 KV 可用预算中显式扣除表大小，不能让
+Worker 在 Paged KV 分配后从“剩余 HBM”偷偷申请。
+
+### 21.5 Constraint Table 的表达边界
+
+ACS 当前 ABI 的语义是：
+
+```text
+step 0：不依赖历史
+step 1：依赖前 1 个 Token
+step 2+：依赖最近 2 个 Token
+```
+
+它不是任意深度 Trie，而是一个二阶有限状态机。它适合三级 SID，或者后继合法性只依赖最近两个
+Token 的场景。如果以后 SID 有四层、五层，且合法性依赖完整历史，应升级为：
+
+```text
+state_id -> [(next_token_id, next_state_id), ...]
+```
+
+每个 Beam 只携带一个 `constraint_state_id`。这样后处理算子无需每步读取完整
+`sequence[B, W, S]` 来重新推导前缀状态，也更容易进入 Full Graph。
+
+### 21.6 请求下发：两类有限资源的原子 Admission
+
+请求进入执行前，Scheduler 需要同时确认：
+
+```text
+Shared Paged KV blocks
++ BeamDecodeKV slots
++ Beam Scratch workspace
++ Constraint Table version 可用
+```
+
+请求需求可以表示为：
+
+```python
+request_spec = BeamDecodeRequestSpec(
+    batch_size=B,
+    beam_width=W,
+    max_decode_steps=S,
+    constraint_table_id=table_id,
+    constraint_table_version=version,
+)
+```
+
+Scheduler 调用：
+
+```python
+reservation = resource_manager.try_reserve(request_spec)
+```
+
+该操作必须满足 all-or-nothing：
+
+```text
+全部资源成功
+    -> 发布 BeamDecodeReservation
+
+任意资源不足
+    -> 不改变任何资源所有权
+    -> WAITING_FOR_BEAM_KV / 降级 / 拒绝
+```
+
+不能先消耗大量 Prefill Paged KV，等 Prefill 完成后才发现 BeamDecodeKV 不足。第一版推荐 eager
+reservation，在请求进入 Prefill 前预留 decode 最坏 bucket，以换取简单且可证明的容量安全。
+
+### 21.7 Prefill 生命周期
+
+Prefill 仍由原生 vLLM Paged KV 管理：
+
+```text
+Prompt
+  -> Transformer Prefill
+  -> Shared Paged KV
+  -> Last Hidden State
+  -> LM Head
+  -> Constraint Step 0
+  -> Initial BeamTransition
+```
+
+Step 0 只从 `first_token_ids` 中选择合法首 Token。所有初始 Beam 共享同一份 Prompt KV，不应将
+Prompt KV 复制 `W` 份到 BeamDecodeKV。BeamDecodeKV 从第一个 decode forward 开始写入。
+
+### 21.8 单个 Decode Step 的完整事务
+
+推荐将每一步组织为：
+
+```text
+1. 读取上一代 committed BeamTransition
+2. Beam Attention 读取 Shared KV + BeamKV lineage
+3. 把当前输入 Token 的 K/V 写入 staging/current-step 区域
+4. LM Head 产生 logits
+5. Constraint Backend 产生每个父 Beam 的合法候选
+6. Global Beam Select 产生新 BeamTransition
+7. 原子提交 Constraint State + Beam State + BeamKV
+8. 更新 committed_generation
+9. 发布 token / score / parent
+```
+
+伪代码：
+
+```python
+txn = BeamKVStepTransaction.begin(binding, cursor)
+
+hidden, staged_kv = model_forward(
+    token_ids=workspace.last_token_ids,
+    shared_kv=shared_binding,
+    beam_kv=beam_binding,
+)
+txn.stage_kv(staged_kv)
+
+candidates = constraint_backend.constrained_topk(
+    logits=compute_logits(hidden),
+    state_ids=workspace.constraint_state_ids,
+    table=constraint_handle,
+    workspace=workspace,
+)
+
+transition = beam_selector.select(
+    candidates=candidates,
+    accumulated_scores=workspace.beam_scores,
+)
+
+txn.commit(transition)
+publish(transition)
+```
+
+必须同时提交：
+
+```text
+BeamKV lineage / reordered KV
+sequence
+beam_scores
+constraint_state_ids
+last_token_ids
+finished_mask
+committed_generation
+```
+
+不能先发布 token，再异步完成 KV 重排，否则下一轮可能用“新 token + 旧 KV lineage”执行。
+
+### 21.9 Constraint State 如何随 parent Beam 更新
+
+Constraint State 必须与 BeamKV 使用同一组 `parent_beam_ids`：
+
+```python
+parent_states = old_state_ids[parent_beam_ids]
+new_state_ids = fsm.transition(parent_states, selected_token_ids)
+```
+
+例如：
+
+```text
+old states:
+  beam0 -> state_10
+  beam1 -> state_11
+  beam2 -> state_12
+  beam3 -> state_13
+
+parent_beam_ids = [3, 1, 1, 1]
+tokens          = [20, 21, 22, 23]
+```
+
+则：
+
+```text
+new beam0 state = FSM(state_13, 20)
+new beam1 state = FSM(state_11, 21)
+new beam2 state = FSM(state_11, 22)
+new beam3 state = FSM(state_11, 23)
+```
+
+如果 Constraint State、sequence 和 BeamKV 分别通过不同代码路径 gather，很容易出现 parent 顺序不一致。
+因此应由一个 `BeamTransition` 驱动所有状态更新。
+
+### 21.10 当前 Step KV 为什么可以被多个子 Beam 继承
+
+父 Beam 输入 Token `A` 完成 forward 后，得到 `KV(A)` 和下一 Token logits。若 Beam Select 从该
+父 Beam 选出 `B/C/D` 三个子 Token，则三个新 Beam 是：
+
+```text
+parent + A + B
+parent + A + C
+parent + A + D
+```
+
+`B/C/D` 尚未进入下一轮 forward，所以三个子 Beam 当前拥有相同的历史 `... + KV(A)`：
+
+- NPU copy/reorder 模式把 `KV(A)` 复制到三个新 Beam 位置；
+- CUDA lineage 模式让三个子 Beam 的索引都引用同一份 `KV(A)`。
+
+二者 BeamSearch 语义一致，只是物理 commit 策略不同。
+
+### 21.11 两种 BeamKV commit 后端
+
+#### 21.11.1 Ascend：Copy/Reorder
+
+ACS 通过 `select_unshared_kv` 按 `parent_beam_ids` 重排所有 Layer 的 unshared KV。其优点是下一步
+物理布局连续、Attention 寻址简单；缺点是同一父 Beam 产生多个子 Beam 时会重复复制历史 KV。
+
+推荐 NPU 第一版保留该模式，但必须：
+
+- 使用启动期固定 Pool，而非请求到达后 lazy grow；
+- 按 session slot 隔离并发请求；
+- 所有 Layer commit 成功后再发布 generation；
+- 原地 commit 失败时将 session 标记为 fatal，不能继续使用半更新 KV。
+
+#### 21.11.2 CUDA：Lineage/Index
+
+NVIDIA 示例按 step 追加 BeamKV，并使用 `parent_indices/topk_indices` 描述当前 Beam 的祖先链。目标
+CUDA Provider 应预分配 append-only arena，避免示例中的动态 `torch.cat`：
+
+```text
+step 0 BeamKV
+step 1 BeamKV
+...
++ BeamPath / lineage index
+```
+
+Beam Select 后主要更新索引，不复制历史 KV；代价是 Beam Attention 必须支持 lineage gather。
+
+公共接口只暴露：
+
+```python
+class BeamKVBackend(Protocol):
+    transition_mode: Literal["copy_reorder", "index_lineage"]
+
+    def write_step(self, lease, step, key, value) -> None: ...
+    def commit_transition(self, lease, step, transition) -> None: ...
+```
+
+Scheduler 和 EngineCore 不感知 `select_unshared_kv` 或 `topk_indices`。
+
+### 21.12 最后一步与正常释放
+
+最后一次 Beam Select 后没有下一次 forward，因此无需执行仅服务于下一次 Attention 的：
+
+- NPU KV reorder；
+- CUDA lineage commit；
+- next-step Graph input 更新。
+
+只需要完成 final sequence/score selection。ACS 的 `onerec_final_beam_select` 就是这一原则的设备化
+实现，公共层应将其抽象为 `finalize()`，而不是 NPU 特例。
+
+请求结束后，释放必须等待设备任务真正完成：
+
+```text
+提交最后一个 kernel
+  -> record CUDA/NPU event
+  -> event complete
+  -> 释放 BeamKVLease
+  -> 释放 Beam Scratch slot
+  -> 释放 Paged KV logical blocks
+  -> ConstraintTableHandle request_refcount - 1
+```
+
+取消、超时和异常必须复用同一幂等 release 路径。`BeamKVLease` 使用 `(slot_id, generation)`，防止
+旧请求的迟到 completion 释放已被新请求复用的 slot。
+
+### 21.13 Constraint Table 的版本释放
+
+Constraint Table 不随单个请求销毁。在线更新应采用版本切换：
+
+```text
+加载 Catalog v1
+  -> 请求 A/B/C 引用 v1
+  -> 加载并校验 Catalog v2
+  -> 原子发布 v2 给新请求
+  -> A/B/C 完成
+  -> v1 request_refcount == 0
+  -> v1 graph_refcount == 0
+  -> 销毁 v1 设备 Buffer
+```
+
+需要分别维护：
+
+```text
+request_refcount
+graph_refcount
+```
+
+因为 CUDA Graph/ACLGraph 可能仍持有旧表地址。表 shape/layout 改变时不能原地覆盖，应先加载新
+版本，再 drain 旧版本。
+
+ACS 当前 `set_constraint_tables()` 在 `_constraint_tables_npu` 已存在时直接返回，实际是单表、单
+版本设计；此外表引用仍被 ModelRunner 持有，因此删除 Beam BufferPool 不会真正释放表。目标实现
+应由独立 `ConstraintTableRegistry` 负责加载、版本、引用计数和销毁。
+
+### 21.14 CUDA Graph / ACLGraph 联动
+
+Graph 热路径要求地址和 shape 稳定，建议按下列 bucket 预分配：
+
+```text
+(batch_bucket, beam_bucket, step_bucket)
+```
+
+`BeamGraphKey` 还应包含：
+
+```python
+BeamGraphKey(
+    platform,
+    batch_bucket,
+    beam_bucket,
+    step_bucket,
+    kv_transition_mode,
+    constraint_layout,
+    constraint_table_version,
+    dtype,
+)
+```
+
+约束表、BeamKV arena 和 Scratch Tensor 地址保持不变；请求只更新内容和有效长度。热路径禁止：
+
+- `torch.zeros/new_empty` 创建新 storage；
+- `.to(device)` 或 `.npu()`；
+- 动态 `torch.cat` 累积 KV；
+- 替换被 Graph capture 的 Tensor 对象；
+- 运行时扩大 `max_prefix_degree` 或 Beam bucket。
+
+如果以后希望多个相同 layout 的 Catalog 复用同一 Graph，可以研究稳定地址 descriptor/pointer table；
+第一版将 `table_version/layout` 纳入 Graph Key 更容易保证正确性。
+
+### 21.15 推荐模块分层与接口
+
+```text
+EngineCore / Scheduler
+└── BeamDecodeResourceManager
+    ├── memory accounting
+    ├── atomic admission
+    └── reservation / rollback / release
+
+Worker / ModelRunner
+├── BeamDecodeSessionManager
+├── ConstraintTableRegistry
+├── BeamWorkspacePool
+└── Platform Provider
+    ├── CUDA
+    │   ├── CudaConstraintBackend
+    │   └── LineageBeamKVBackend
+    └── Ascend
+        ├── AscendConstraintBackend
+        └── CopyReorderBeamKVBackend
+```
+
+推荐接口：
+
+```python
+class ConstraintBackend(Protocol):
+    def load_table(self, spec) -> ConstraintTableHandle: ...
+    def constrained_topk(
+        self,
+        logits,
+        state_ids,
+        table,
+        workspace,
+    ) -> ConstrainedCandidates: ...
+    def unload_table(self, handle) -> None: ...
+
+
+class BeamKVBackend(Protocol):
+    def create_pool(self, spec) -> BeamKVPool: ...
+    def reserve(self, request_spec) -> BeamKVLease: ...
+    def write_step(self, lease, step, key, value) -> None: ...
+    def commit_transition(self, lease, step, transition) -> None: ...
+    def release(self, lease, completion_event) -> None: ...
+
+
+class BeamDecodeResourceManager(Protocol):
+    def try_reserve(
+        self,
+        request_spec,
+        constraint_table_id,
+    ) -> Optional[BeamDecodeReservation]: ...
+```
+
+### 21.16 联动设计不变量
+
+在第 19.5 节已有 BeamKV 不变量基础上，再增加：
+
+```text
+1. Constraint Table 是 model/catalog 资源，不从 request BeamKV lease 中分配
+2. 任意 ACTIVE Beam session 必须绑定已发布的 table_id/version
+3. Constraint State、sequence 和 BeamKV 使用同一 BeamTransition.parent_beam_ids
+4. BeamKV commit 完成前不得发布新的 token/score/state generation
+5. request release 不得销毁仍被其他请求或 Graph 引用的 Constraint Table
+6. 旧 table version 只有在 request_refcount 和 graph_refcount 均为 0 时才能销毁
+7. Scheduler admission 同时覆盖 Paged KV、BeamKV、Scratch 和 Constraint handle
+8. final step 不执行下一轮专用 KV commit
+9. Graph replay 期间 Constraint Table、BeamKV 和 Scratch 的基地址保持不变
+10. Platform Provider 可以选择 copy_reorder 或 index_lineage，但必须消费相同 BeamTransition
+```
+
+---
+
+## 22. 最终设计决策
 
 建议将以下内容作为后续实现和 Issue 拆分的共同前提：
 
@@ -3182,6 +3800,13 @@ requires_next_forward
 - [ ] 第一版使用 eager reservation、固定 bucket、固定 slot；
 - [ ] 第一版不做在线扩容和 BeamKV swap；
 - [ ] BeamKV 事务边界同时支持 L0/L1/L2。
+- [ ] Constraint Table 从 BeamSearchBufferPool 中拆分，由 Worker-side Registry 独立管理；
+- [ ] Constraint Table 是只读 Catalog 资源，BeamDecodeKV/Scratch 是请求 lease 资源；
+- [ ] Scheduler 对 Paged KV、BeamKV、Scratch 和 Constraint handle 执行原子 admission；
+- [ ] Constraint State、sequence、score 和 BeamKV 由同一个 BeamTransition 原子驱动；
+- [ ] Catalog 更新采用多版本 publish/drain，不原地覆盖 Graph 正在引用的表；
+- [ ] Constraint Table 只有在 request/graph 引用均归零后才能物理销毁；
+- [ ] GPU/NPU 分别实现 ConstraintBackend 与 BeamKVBackend，不在 Common 泄漏私有表布局和 KV 算法。
 
 最终可以概括为：
 
@@ -3191,7 +3816,7 @@ requires_next_forward
 
 ---
 
-## 22. 代码与资料索引
+## 23. 代码与资料索引
 
 ### vLLM `releases/v0.22.1`
 
@@ -3230,6 +3855,7 @@ requires_next_forward
 ### ACS_vllm-GR
 
 - [BeamSearchBufferPool and BeamSearchContext](https://github.com/zhanghanleo10/ACS_vllm-GR/blob/main/vllm-ascend/vllm_ascend/beam_search/context.py)
+- [Constraint TopK、Beam Select 与 Shared/Unshared KV 算子封装](https://github.com/zhanghanleo10/ACS_vllm-GR/blob/main/vllm-ascend/vllm_ascend/ops/xllm_ops.py)
 - [Ascend Beam Attention](https://github.com/zhanghanleo10/ACS_vllm-GR/blob/main/vllm-ascend/vllm_ascend/attention/attention_v1.py)
 - [NPUModelRunner Beam integration](https://github.com/zhanghanleo10/ACS_vllm-GR/blob/main/vllm-ascend/vllm_ascend/worker/model_runner_v1.py)
 - [ACLGraph task update and Beam graph parameters](https://github.com/zhanghanleo10/ACS_vllm-GR/blob/main/vllm-ascend/vllm_ascend/compilation/acl_graph.py)
