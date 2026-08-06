@@ -136,45 +136,883 @@ metadata 开销带入每个 step。
 
 ## 3. vLLM 原生 KV Cache 的设计理念
 
-### 3.1 vLLM 将逻辑容量和物理 Tensor 分开
+### 3.1 一句话理解 Paged KVCache
 
-vLLM V1 的 KVC 具有两层所有权：
+vLLM 的 Paged KVCache 不是“请求到达后为该请求申请一块 GPU Tensor”，而是：
 
-| 层次 | 主要位置 | 职责 |
-| --- | --- | --- |
-| 逻辑 Block 管理 | EngineCore/Scheduler | block 分配、Prefix Cache、引用计数、抢占、释放 |
-| 物理 Tensor | Worker/ModelRunner | 按 `KVCacheConfig` 在本地设备创建 Tensor 并绑定 Attention |
+> Worker 启动时一次性申请物理 KV 大池；请求运行时，Scheduler 只分配逻辑 block ID；
+> ModelRunner 将 block ID 组织为 BlockTable 和 SlotMapping；Attention 据此读写固定物理大池；
+> 请求结束时只归还逻辑 Block，物理 Tensor 继续常驻并复用。
 
-`KVCacheManager.allocate_slots()` 返回的是逻辑 Block，而不是新创建的 CUDA Tensor。
-请求完成或抢占时，Scheduler 调用 `KVCacheManager.free()` 归还逻辑 Block。
+这里有两种完全不同的“申请”：
 
-### 3.2 初始化流程的真实执行位置
+| 申请类型 | 发生时间 | 执行位置 | 实际内容 |
+| --- | --- | --- | --- |
+| 物理内存申请 | Engine 初始化 | Worker/ModelRunner | 创建设备上的 KVCache Tensor |
+| 逻辑 Block 申请 | 每轮请求调度 | Scheduler/KVCacheManager | 从 BlockPool 取得 block ID |
 
-vLLM `EngineCore._initialize_kv_caches()` 的主要顺序为：
+### 3.2 三层数据结构
 
-```text
-1. model_executor.get_kv_cache_specs()
-2. model_executor.determine_available_memory()
-3. EngineCore.get_kv_cache_configs(...)
-4. 生成 Scheduler 使用的 KVCacheConfig
-5. model_executor.initialize_from_config(...)
-6. Worker 创建真实 KV Tensor
+Paged KVCache 可以拆成三个平面：
+
+| 平面 | 核心对象 | 主要位置 | 职责 |
+| --- | --- | --- | --- |
+| 容量规划 | `KVCacheSpec`、`KVCacheConfig` | EngineCore + Worker report | 决定物理池能容纳多少 Block |
+| 逻辑管理 | `KVCacheManager`、`BlockPool`、`KVCacheBlock` | Scheduler | 请求所有权、Prefix Cache、ref count、抢占、释放 |
+| 执行寻址 | `BlockTable`、`slot_mapping`、Attention metadata | ModelRunner/Worker | 把 request token 映射到物理 KV 地址 |
+
+其中：
+
+- `KVCacheBlock` 只是 Python 逻辑元数据，不持有 K/V Tensor；
+- `block_id` 是连接 Scheduler 逻辑管理和 Worker 物理 Tensor 的桥梁；
+- Scheduler 不直接访问设备 KV；
+- Worker 不自行决定请求应获得哪个 Block。
+
+### 3.3 端到端总览
+
+```mermaid
+flowchart TB
+    E["EngineCore<br/>汇总 Spec 与显存"]
+    C["KVCacheConfig<br/>blocks / groups / tensors"]
+    W["Worker / ModelRunner<br/>申请物理 KV Tensor"]
+    S["Scheduler / KVCacheManager<br/>分配逻辑 block ID"]
+    B["BlockTable<br/>request 到 block IDs"]
+    M["SlotMapping<br/>token 到 physical slot"]
+    A["Attention<br/>写当前 K/V，读历史 K/V"]
+    F["Scheduler free<br/>归还逻辑 Blocks"]
+
+    E --> C
+    C --> W
+    C --> S
+    S --> B --> M --> A --> F
+    F --> S
 ```
 
-因此：
+### 3.4 初始化：从 Layer Spec 到物理 Tensor
 
-- dummy/profile run 由 EngineCore 发起和汇总；
-- dummy/profile run 实际在各 Worker 上执行；
-- `num_blocks` 在 EngineCore 统一规划；
-- 物理 HBM Tensor 在 Worker 创建。
+#### 3.4.1 收集每一层的 KVCacheSpec
 
-BeamKV 应遵循同一理念：
+EngineCore 首先执行：
 
-> EngineCore 负责 BeamKV 容量规划，Worker 负责 BeamKV 物理内存所有权。
+```python
+kv_cache_specs = self.model_executor.get_kv_cache_specs()
+```
 
-### 3.3 为什么不能在 Native Paged KV 之后额外申请 BeamKV
+调用链为：
 
-假设 profile 得到可用于 KVC 的 HBM 为 20 GiB。原生 vLLM 会近似将这部分全部换算为
+```text
+EngineCore
+  -> Executor.get_kv_cache_specs()
+  -> GPUWorker.get_kv_cache_spec()
+  -> GPUModelRunner.get_kv_cache_spec()
+  -> Attention.get_kv_cache_spec()
+```
+
+普通 decoder Full Attention 产生的逻辑描述类似：
+
+```python
+FullAttentionSpec(
+    block_size=block_size,
+    num_kv_heads=num_kv_heads,
+    head_size=head_size,
+    dtype=kv_cache_dtype,
+)
+```
+
+`KVCacheSpec` 描述每个 Layer 需要的缓存类型、Block 大小、KV Heads、Head Dimension、dtype
+和 Page 大小。此时还没有申请最终物理 KV Tensor。
+
+不同模型可能产生不同 Spec：
+
+- `FullAttentionSpec`；
+- `SlidingWindowSpec`；
+- `MLAAttentionSpec`；
+- `MambaSpec`；
+- `CrossAttentionSpec`；
+- 多种混合/共享 Cache Spec。
+
+#### 3.4.2 Worker profile 可用显存
+
+每个 Worker 执行：
+
+```python
+GPUWorker.determine_available_memory()
+```
+
+主要计算关系为：
+
+```text
+requested device memory
+  - model weights
+  - peak activation
+  - non-framework allocation
+  - CUDA Graph memory estimate
+  = available KV cache memory
+```
+
+其中：
+
+- `profile_run()` 测量模型 forward 的峰值；
+- CUDA Graph 启用时，`profile_cudagraph_memory()` 估算 Graph pool；
+- 最终返回的是本 Worker 可用于 KVCache 的字节数。
+
+所以 dummy/profile run 的职责边界是：
+
+| 行为 | 所在位置 |
+| --- | --- |
+| 发起所有 Worker profile | EngineCore/Executor |
+| 真正执行 dummy forward | Worker/ModelRunner |
+| 汇总可用显存报告 | EngineCore |
+| 决定统一 `num_blocks` | EngineCore |
+
+#### 3.4.3 EngineCore 统一生成 KVCacheConfig
+
+EngineCore 调用：
+
+```python
+get_kv_cache_configs(
+    vllm_config,
+    kv_cache_specs,
+    available_gpu_memory,
+)
+```
+
+主要完成：
+
+1. 合并所有 Worker 的 Layer KVCacheSpec；
+2. 按 Attention/State 类型构造 `KVCacheGroupSpec`；
+3. 处理 PP Worker 拥有不同 Layer 的情况；
+4. 计算各 Worker 可以容纳的 Block 数量；
+5. 取所有相关 Worker 的最小值；
+6. 按最小 Block 数缩减各 Worker 的 Tensor size；
+7. 生成 Worker 和 Scheduler 共用的逻辑配置。
+
+核心不变量：
+
+```text
+global_num_blocks = min(worker_0_blocks, worker_1_blocks, ...)
+```
+
+因此 Scheduler 下发的任意合法 block ID，在 TP/PP 相关 Worker 上都不会超过物理容量。
+
+最终配置：
+
+```python
+KVCacheConfig(
+    num_blocks=num_blocks,
+    kv_cache_tensors=kv_cache_tensors,
+    kv_cache_groups=kv_cache_groups,
+)
+```
+
+字段语义：
+
+| 字段 | 语义 |
+| --- | --- |
+| `num_blocks` | Scheduler 可分配的统一逻辑 Block 总数 |
+| `kv_cache_tensors` | Worker 应申请的物理 Buffer 大小和共享关系 |
+| `kv_cache_groups` | 哪些 Layer 使用同一组 BlockTable 语义 |
+
+#### 3.4.4 Worker 真正申请物理 Tensor
+
+EngineCore 下发每个 Worker 对应的 `KVCacheConfig`：
+
+```text
+model_executor.initialize_from_config(kv_cache_configs)
+  -> GPUWorker.initialize_from_config()
+  -> GPUModelRunner.initialize_kv_cache()
+  -> initialize_kv_cache_tensors()
+```
+
+通用路径先按字节数申请原始设备 Buffer：
+
+```python
+tensor = torch.zeros(
+    kv_cache_tensor.size,
+    dtype=torch.int8,
+    device=self.device,
+)
+```
+
+再根据 Backend 要求解释为目标 dtype、shape 和 stride：
+
+```python
+kv_cache_shape = attn_backend.get_kv_cache_shape(...)
+kv_cache = raw_tensor.view(dtype).view(kv_cache_shape)
+```
+
+普通 Attention 可以直观理解为：
+
+```text
+Layer KVCache:
+    [K/V, num_blocks, block_size, num_kv_heads, head_dim]
+```
+
+常见逻辑形态为：
+
+```text
+[2, num_blocks, block_size, num_kv_heads, head_dim]
+```
+
+但 Common 层不能固定这一 shape，因为最终形态由 Attention Backend 的
+`get_kv_cache_shape()` 和 `get_kv_cache_stride_order()` 决定。MLA、混合 Cache、量化 KVC
+和特定 Backend 都可能使用不同布局。
+
+最终执行：
+
+```python
+bind_kv_cache(
+    kv_caches,
+    static_forward_context,
+    model_runner.kv_caches,
+)
+```
+
+它将物理 Tensor：
+
+- 放入 `ModelRunner.kv_caches`；
+- 绑定到每个 Attention Layer 的 `layer.kv_cache`；
+- 注册到静态 forward context；
+- 必要时注册给 KVConnector。
+
+从这一时刻开始，物理 KV 大池在 Worker 生命周期内持续存在。
+
+### 3.5 Scheduler 如何组织逻辑 Block
+
+EngineCore 完成物理 KV 初始化后，将同一份 Scheduler KVCacheConfig 用来创建：
+
+```python
+KVCacheManager(
+    kv_cache_config=kv_cache_config,
+    ...
+)
+```
+
+内部主要关系为：
+
+```text
+KVCacheManager
+  -> KVCacheCoordinator
+  -> SingleTypeKVCacheManager per group
+  -> shared BlockPool
+```
+
+#### 3.5.1 BlockPool 只管理元数据
+
+BlockPool 初始化：
+
+```python
+self.blocks = [
+    KVCacheBlock(0),
+    KVCacheBlock(1),
+    ...,
+    KVCacheBlock(num_blocks - 1),
+]
+```
+
+`KVCacheBlock` 主要包含：
+
+- `block_id`；
+- `ref_cnt`；
+- `block_hash`；
+- 是否为 null block；
+- Prefix Cache 和 eviction 元数据。
+
+它不持有真正的 K/V Tensor。物理关系是：
+
+```text
+KVCacheBlock(block_id=17)
+    -> 对应 KV group 内各 Layer 的 kv_cache[..., 17, ...]
+```
+
+单一 Full Attention group 下，同一请求的一组 block ID 被该 group 内所有 Layer 使用。
+Hybrid KV 场景则为每个 KV group 维护独立 Block 序列和 BlockTable。
+
+#### 3.5.2 请求到 Block 的所有权
+
+每个 SingleType manager 维护：
+
+```python
+req_to_blocks: dict[request_id, list[KVCacheBlock]]
+```
+
+例如：
+
+```text
+request A -> [block 17, block 42, block 53]
+request B -> [block 6,  block 31]
+request C -> [block 88]
+```
+
+BlockPool 维护：
+
+```text
+free_block_queue
+cached_block_hash_to_block
+```
+
+`free_block_queue` 中可能同时存在：
+
+- 没有缓存价值的空闲 Block；
+- `ref_cnt == 0`、但仍保留有效 Prefix KV 的可驱逐 Block。
+
+### 3.6 请求阶段的逻辑 Block 申请
+
+#### 3.6.1 Prefix Cache 查询
+
+新请求第一次调度时，Scheduler 调用：
+
+```python
+KVCacheManager.get_computed_blocks(request)
+```
+
+它根据 Request 的 block hashes 查询最长本地 Prefix Cache 命中，返回：
+
+```text
+computed_blocks
+num_computed_tokens
+```
+
+Prefix Cache 只以完整 Block 为稳定复用单位。即使 Prompt 全部命中，也至少保留最后一个 token
+重新计算，从而得到本次请求的 logits。
+
+#### 3.6.2 allocate_slots
+
+Scheduler 根据本轮要执行的 token 数调用：
+
+```python
+KVCacheManager.allocate_slots(
+    request,
+    num_new_tokens,
+    new_computed_blocks=...,
+    num_lookahead_tokens=...,
+)
+```
+
+它依次处理：
+
+1. 请求已有 Block；
+2. 本地 Prefix Cache 命中的 Block；
+3. KVConnector 外部命中对应的 Block；
+4. 本轮新 token；
+5. speculative decode lookahead token；
+6. Sliding Window 等场景下已经不需要的 Block；
+7. 当前 BlockPool 是否还有足够空闲容量。
+
+对普通 Full Attention，所需 Block 数可以近似写成：
+
+```text
+required_blocks
+  = ceil((computed + new + lookahead) / block_size)
+```
+
+如果：
+
+```python
+num_blocks_to_allocate > block_pool.get_num_free_blocks()
+```
+
+则 `allocate_slots()` 返回 `None`。Scheduler 会尝试抢占低优先级请求；仍不够时，本请求不会
+下发到 Worker。
+
+所以 Paged KVCache 的容量和越界保护主要发生在 Scheduler admission，而不是等 Attention
+访问时再检查。
+
+#### 3.6.3 分配新 Block
+
+通过容量检查后：
+
+```python
+new_blocks = block_pool.get_new_blocks(num_new_blocks)
+```
+
+BlockPool 从 free queue 取出 Block：
+
+- 如果 Block 带旧 Prefix hash，先执行 eviction；
+- 验证 `ref_cnt == 0`；
+- 设置 `ref_cnt += 1`；
+- 加入 `req_to_blocks[request_id]`；
+- 返回新的 block ID。
+
+### 3.7 Block ID 如何传到 Worker
+
+Scheduler 不把 `KVCacheBlock` Python 对象传给 Worker，只传 block ID。
+
+新请求使用：
+
+```python
+NewRequestData(
+    req_id=request_id,
+    block_ids=([17, 42],),
+)
+```
+
+已运行请求使用：
+
+```python
+CachedRequestData(
+    req_ids=[request_id],
+    new_block_ids=[([53],)],
+)
+```
+
+完整路径为：
+
+```text
+KVCacheBlock objects
+  -> KVCacheBlocks
+  -> get_block_ids()
+  -> NewRequestData / CachedRequestData
+  -> SchedulerOutput
+  -> Worker
+```
+
+这保持了清晰的所有权边界：
+
+- Scheduler 决定请求可使用哪些物理 page index；
+- Worker 只消费下发的 block ID；
+- Scheduler 和 Worker 使用同一份 `num_blocks` 容量空间。
+
+### 3.8 ModelRunner 如何组织 BlockTable
+
+Worker 收到 SchedulerOutput 后调用：
+
+```python
+GPUModelRunner._update_states()
+```
+
+它维护两层状态：
+
+```text
+CachedRequestState
+    保存请求完整 block ID 序列
+
+InputBatch.block_table
+    保存当前执行 batch 的二维 BlockTable
+```
+
+例如：
+
+| Request | logical block 0 | logical block 1 | logical block 2 |
+| --- | ---: | ---: | ---: |
+| A | 17 | 42 | 53 |
+| B | 6 | 31 | - |
+| C | 88 | - | - |
+
+对于持续运行的请求，新 Block 以 append-only 方式加入：
+
+```python
+input_batch.block_table.append_row(new_block_ids, req_index)
+```
+
+对于被抢占后恢复的请求，旧 block ID 已经失效，需要用 Scheduler 重新分配的完整序列替换。
+
+执行前：
+
+```python
+block_table.commit_block_table(num_reqs)
+```
+
+把 CPU/Pinned BlockTable 复制到设备，为 Attention metadata 构建做好准备。
+
+### 3.9 SlotMapping：从 token position 到物理写地址
+
+BlockTable 表示请求完整历史的 page 列表；SlotMapping 表示本轮每个 token 的具体物理写入位置。
+
+不考虑 DCP/PCP 时，对 token 的绝对 position `p`：
+
+```text
+logical_block_index = floor(p / block_size)
+block_id = BlockTable[request_index, logical_block_index]
+offset = p % block_size
+physical_slot = block_id * block_size + offset
+```
+
+#### 具体例子
+
+假设：
+
+```text
+block_size = 4
+request block table = [17, 42]
+```
+
+则：
+
+| Token position | logical block | physical block | offset | physical slot |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 0 | 17 | 0 | 68 |
+| 1 | 0 | 17 | 1 | 69 |
+| 2 | 0 | 17 | 2 | 70 |
+| 3 | 0 | 17 | 3 | 71 |
+| 4 | 1 | 42 | 0 | 168 |
+| 5 | 1 | 42 | 1 | 169 |
+
+如果本轮计算 position 5：
+
+```text
+slot_mapping = [169]
+```
+
+Attention 的 KV write 会把当前 token 的 K/V 写到每个相关 Layer 的 physical slot 169。
+
+DCP/PCP 场景还会加入 rank-local interleave 计算，但基础关系保持不变：
+
+```text
+request position
+  -> BlockTable
+  -> physical block ID
+  -> offset in block
+  -> physical slot
+```
+
+### 3.10 Attention 如何使用 Paged KVCache
+
+ModelRunner 为每个 KV group 构建 Attention metadata，主要包含：
+
+```text
+block_table_tensor
+slot_mapping
+seq_lens
+query_start_loc
+num_actual_tokens
+positions
+```
+
+每个 Attention Layer 已通过 `bind_kv_cache()` 持有自己的物理：
+
+```python
+layer.kv_cache
+```
+
+Attention 的数据流分为两个动作。
+
+#### 3.10.1 写入当前 K/V
+
+如果 Backend 没有把 KV write 融合进 Attention forward，会调用：
+
+```python
+unified_kv_cache_update(key, value, layer_name)
+```
+
+内部获得：
+
+```text
+当前 Layer 的 kv_cache
+当前 Layer 的 slot_mapping
+```
+
+再执行 Backend 的：
+
+```python
+do_kv_cache_update(
+    key,
+    value,
+    kv_cache,
+    slot_mapping,
+)
+```
+
+即：
+
+```text
+current K/V
+  -> slot_mapping
+  -> physical KV slots
+```
+
+#### 3.10.2 读取历史 K/V
+
+随后：
+
+```python
+unified_attention_with_output(...)
+```
+
+Attention Backend 得到：
+
+```text
+query
+kv_cache
+block_table
+seq_lens
+attention metadata
+```
+
+根据当前 request 的 BlockTable 遍历历史 page，完成 Paged Attention。
+
+某些 Backend 设置：
+
+```python
+forward_includes_kv_cache_update = True
+```
+
+会把当前 K/V 写入和 Attention 读取融合在一次 Backend forward 中，但寻址和所有权关系不变。
+
+### 3.11 单个调度 Step 的完整链路
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant K as KVCacheManager
+    participant W as ModelRunner
+    participant T as BlockTable
+    participant A as Attention
+
+    S->>K: allocate_slots(request, new tokens)
+    K-->>S: new block IDs
+    S->>W: SchedulerOutput
+    W->>T: append block IDs
+    W->>T: commit table to device
+    T->>T: compute slot mapping
+    W->>A: metadata + Q/K/V
+    A->>A: write K/V by slot mapping
+    A->>A: read history by BlockTable
+    A-->>W: attention output
+```
+
+这里两套索引用途不同：
+
+| 结构 | 主要用途 |
+| --- | --- |
+| BlockTable | 告诉 Attention 一个请求的历史 KV 分布在哪些 page |
+| SlotMapping | 告诉 KV write 当前 token 应写入哪个 physical slot |
+
+二者最终访问同一个物理 KVCache Tensor。
+
+### 3.12 Prefix Cache 的特殊生命周期
+
+#### 3.12.1 完整 Block 才进入 Prefix Cache
+
+当请求产生新的完整 Block 时：
+
+```python
+cache_full_blocks(...)
+```
+
+会：
+
+- 为 Block 设置 `block_hash`；
+- 建立 hash 到 `KVCacheBlock` 的映射；
+- 记录已经缓存的 Block 数量；
+- 保持 block ID 不变。
+
+不完整 tail Block 通常不能作为稳定 Prefix Cache 命中单元。
+
+#### 3.12.2 ref count 为零不等于数据立即失效
+
+请求结束后，如果一个 Block 有有效 Prefix hash：
+
+```text
+ref_cnt -> 0
+  -> 进入 free queue
+  -> block_hash 仍保留
+  -> 物理 KV 数据仍保留
+  -> 成为 eviction candidate
+```
+
+后续发生两种情况。
+
+Prefix 命中：
+
+```text
+touch(block)
+  -> 从 free queue 移除
+  -> ref_cnt += 1
+  -> 新请求直接复用原物理 KV
+```
+
+缓存驱逐：
+
+```text
+get_new_blocks()
+  -> 取出 ref_cnt == 0 的 cached block
+  -> 删除旧 block_hash
+  -> 分配给无关请求
+  -> 新 K/V 逐步覆盖旧物理内容
+```
+
+所以 vLLM Prefix Cache 的本质是：
+
+> 释放请求引用后继续保留物理数据，将零引用 Block 作为可驱逐缓存，而不是立即清零。
+
+### 3.13 请求完成、取消和抢占时如何释放
+
+#### 3.13.1 Scheduler 逻辑释放
+
+正常完成或取消的调用链为：
+
+```text
+Scheduler.finish_requests()
+  -> _free_request()
+  -> _free_blocks()
+  -> KVCacheManager.free(request)
+  -> KVCacheCoordinator.free(request_id)
+  -> SingleTypeKVCacheManager.free(request_id)
+  -> BlockPool.free_blocks(blocks)
+```
+
+SingleType manager：
+
+1. 从 `req_to_blocks` 删除该请求；
+2. 以逆序释放 Block，使尾部 Block 优先成为 eviction candidate；
+3. 对每个非 null Block 执行 `ref_cnt -= 1`；
+4. 将零引用 Block加入 free queue；
+5. 删除请求级 `num_cached_block` 元数据。
+
+#### 3.13.2 Worker 执行状态清理
+
+Scheduler 通过：
+
+```python
+SchedulerOutput.finished_req_ids
+```
+
+通知 Worker。ModelRunner 删除：
+
+- `CachedRequestState`；
+- InputBatch 中的请求 row；
+- 当前 batch 的 BlockTable 引用；
+- 相关采样和请求级 metadata。
+
+Worker 这里仍不会销毁物理 KVCache Tensor。
+
+#### 3.13.3 抢占
+
+Block 不足时 Scheduler 可能执行：
+
+```python
+_preempt_request(request)
+```
+
+主要动作：
+
+```text
+KVCacheManager.free(request)
+request.num_computed_tokens = 0
+request.status = PREEMPTED
+request -> waiting queue
+```
+
+恢复时请求重新进行 Prefix Cache 查询和必要的 recompute，再获得新的 block ID。
+
+因此典型 vLLM 抢占不是保留原 BlockTable，也不是把 KV 完整 swap 到 CPU，而是释放并在恢复时
+重建执行状态。
+
+### 3.14 物理 Tensor 什么时候真正释放
+
+物理 KVCache 的正常生命周期：
+
+```text
+Worker 初始化
+  -> 一次性申请物理 KV Tensor
+  -> 所有请求共享并复用
+  -> Worker shutdown / model unload / sleep discard
+  -> 物理内存真正释放
+```
+
+`GPUModelRunner.shutdown()` 会：
+
+- 清理 `kv_caches` 引用；
+- 清理 Attention Layer 上绑定的 KV Tensor；
+- 清理 Graph 和 workspace；
+- 触发 GC 和 allocator cache 清理。
+
+启用 CuMem sleep mode 时，带 `kv_cache` tag 的物理内存还可以被暂时 discard，并在 wake-up
+阶段恢复运行所需状态。
+
+生命周期对比：
+
+| 操作 | 释放逻辑 Block | 销毁物理 KV Tensor |
+| --- | ---: | ---: |
+| 请求正常完成 | 是 | 否 |
+| 请求取消 | 是 | 否 |
+| 请求抢占 | 是 | 否 |
+| Prefix Cache eviction | 改为其他请求所有 | 否 |
+| Worker shutdown | 是 | 是 |
+| 模型 unload/显存 sleep | 视模式而定 | 是或暂时 discard |
+
+### 3.15 Paged KVCache 的核心不变量
+
+容量不变量：
+
+```text
+所有活跃请求引用的物理 Block 数
+    <= global num_blocks
+```
+
+多 Worker 一致性：
+
+```text
+global num_blocks
+    = 所有相关 Worker 可支持 Block 数的最小值
+```
+
+Block 所有权：
+
+```text
+ref_cnt > 0
+    -> Block 不能被重新分配
+```
+
+Prefix Cache：
+
+```text
+ref_cnt == 0 and block_hash != None
+    -> Block 是可驱逐缓存
+```
+
+寻址安全：
+
+```text
+slot_mapping 中的 physical slot
+    必须来自 Scheduler 已分配给该请求的 block ID
+```
+
+生命周期：
+
+```text
+request free
+    != physical KV tensor free
+```
+
+### 3.16 对 BeamKV 设计的直接启示
+
+Paged KVCache 最值得继承的不是 page/block 物理布局，而是所有权分层：
+
+```text
+EngineCore
+    规划物理容量
+
+Scheduler / KVCacheManager
+    管理逻辑所有权
+
+Worker / ModelRunner / Attention
+    使用固定物理内存
+```
+
+对应关系：
+
+| Native Paged KVCache | BeamKV 目标对象 |
+| --- | --- |
+| `KVCacheConfig` | `BeamKVCacheConfig` |
+| `BlockPool` | `BeamSlotPool` |
+| `KVCacheBlock` | `BeamKVSlot` |
+| `allocate_slots()` | `reserve_beam_slot()` |
+| `block_ids` | `BeamKVBinding` |
+| `BlockTable` | Beam slot/lineage/permutation metadata |
+| `slot_mapping` | Beam append target |
+| `free(request)` | `release_beam_session()` |
+| 物理 KV Tensor 常驻 | BeamKVPool 常驻 |
+
+共同原则：
+
+> 控制面决定“哪个请求拥有哪些物理地址”，Worker 只使用下发的 binding；请求结束时释放逻辑
+> 所有权，物理 Pool 不随请求反复申请和销毁。
+
+### 3.17 为什么不能在 Native Paged KV 之后额外申请 BeamKV
+
+假设 profile 得到可用于全部 KVC 的 HBM 为 20 GiB。原生 vLLM 会近似将这部分全部换算为
 Paged KV blocks。如果 Worker 随后额外申请 4 GiB BeamKV：
 
 ```text
@@ -193,6 +1031,11 @@ Native 可用容量
     - BeamKV 预留
     - Beam Graph/Metadata/Workspace 预留
 ```
+
+所以 BeamKV 应完全遵循 vLLM 的容量规划哲学：
+
+> EngineCore 负责 NativeKV、BeamKV、Graph 和 Workspace 的统一容量规划；Worker 负责按配置
+> 创建物理 Tensor；Scheduler 同时管理 Native Block 和 Beam slot 的逻辑所有权。
 
 ---
 
@@ -2354,9 +3197,15 @@ requires_next_forward
 
 - [EngineCore KV cache initialization](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/engine/core.py)
 - [KVCacheManager](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/core/kv_cache_manager.py)
+- [BlockPool and Prefix Cache block lifecycle](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/core/block_pool.py)
+- [Single-type request-to-block ownership](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/core/single_type_kv_cache_manager.py)
 - [KV cache config planning](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/core/kv_cache_utils.py)
+- [Scheduler allocation, preemption and release](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/core/sched/scheduler.py)
 - [GPUWorker memory profiling and initialization](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/worker/gpu_worker.py)
 - [GPUModelRunner KV tensor initialization](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/worker/gpu_model_runner.py)
+- [Worker BlockTable and SlotMapping](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/worker/block_table.py)
+- [KV cache binding helpers](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/worker/utils.py)
+- [Attention KV update and Paged Attention entry](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/model_executor/layers/attention/attention.py)
 - [CompilationConfig and CUDAGraphMode](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/config/compilation.py)
 - [CudagraphDispatcher](https://github.com/vllm-project/vllm/blob/releases/v0.22.1/vllm/v1/cudagraph_dispatcher.py)
 
