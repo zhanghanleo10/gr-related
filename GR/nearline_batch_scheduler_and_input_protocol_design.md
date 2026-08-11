@@ -1,1597 +1,729 @@
-# GR 近线多 Batch 调度策略与输入协议设计
+# 近线 GR 多 Batch 调度策略设计
 
-> 状态：设计草案
+> 对比对象：vLLM V1、NVIDIA SID-GR、xLLM OneRec
 >
-> 场景：近线 Generative Recommendation，输入由上游规整成批，单批 Prompt 长度相近
->
-> 典型范围：Prompt 1K～10K tokens、Beam Width 64～512、输出步数 2～5、P99 目标不高于 100 ms
->
-> 核心结论：将上游 `BatchEnvelope` 提升为调度原子，第一版采用 sealed cohort、
-> Prefill barrier 和固定形状 Decode；不依赖到达时间推断 batch 边界。
->
-> 架构边界：推荐策略是 runtime-agnostic 的 clean-slate 设计，可由 vLLM、独立 Serving
-> Runtime 或其他 Engine 实现；现有代码只作为机制案例，不构成方案前提。
+> 目标场景：上游已规整 Batch，Prompt 约 1K～10K tokens，Beam Width 64～512，
+> 输出 2～5 个位置，目标整批 P99 不高于 100 ms，并保持固定执行形状
 
-若只评审新方案，可直接阅读第 5、6、8、10、12 和 16 节；第 3、4 节是非规范性的参考机制与
-现状案例。
+## 0. 阅读路径与结论
+
+本文按 `vLLM → NVIDIA → xLLM → 用户场景 → 推荐方案` 展开。核心选择如下：
+
+| 层次 | 推荐语义 |
+| --- | --- |
+| 输入协议 | 一个 `BatchEnvelope` 明确携带一批 Item |
+| 调度 | 一个 Envelope 对应一个 sealed `ExecutionCohort` |
+| Prefill | 允许切 chunk，但必须等全 Cohort 完成 |
+| Decode | 固定 `B_bucket × W`，执行中不加入新请求 |
+| 多 Batch | 通过多个 `ExecutionSlot` 或多个副本并发 |
+| 多轮控制 | 优先放在 Executor 内；必要时可退化为 Coordinator 逐步驱动 |
+
+结论：这类负载不应直接照搬 request-level continuous batching。
 
 ---
 
-## 1. 为什么需要单独设计 GR Batch Scheduler
+## 1. vLLM 原生调度：request-level continuous batching
 
-通用大模型在线服务通常接收彼此独立的请求。Scheduler 每个 tick 根据 token budget、KV
-容量和请求状态动态拼接 Prefill 与 Decode，以提高设备利用率。
+### 1.1 核心原理
 
-GR 近线场景不同：
+vLLM V1 不维护独立的 Prefill 队列和 Decode 队列。它统一计算每个请求本轮需要推进的
+`num_scheduled_tokens`。
 
-- 上游通常已经完成 batch 规整；
-- 同一批请求的 Prompt 长度接近；
-- Beam Width 较大，但输出只有少量固定步；
-- Decode 物理工作量接近 `B × W`，远大于 Scheduler 看见的逻辑请求数 `B`；
-- Decode Graph、BeamKV 和后处理都更依赖稳定 shape；
-- 与极致吞吐相比，整批完成时间和 P99 抖动更重要。
+```mermaid
+flowchart TD
+    A["Running + Waiting"] --> B["先调度 Running"]
+    B --> C["消费 token 与 KV budget"]
+    C --> D["用剩余容量准入 Waiting"]
+    D --> E["生成一个 SchedulerOutput"]
+    E --> F["一次逻辑 Mixed Forward"]
+    F --> G["完成、继续或抢占"]
+    G --> A
+```
 
-如果仍把每个 Item 当作完全独立的在线请求，会产生三个根本问题：
+> `running-first` 不等于 `decode-first`：未完成的 chunked Prefill 也属于 Running。
 
-1. **Batch 边界丢失**：Scheduler 不知道哪些请求必须共同进入下一阶段；
-2. **资源低估**：逻辑请求数是 `B`，物理 Beam lane 却可能是 `B × W`；
-3. **阶段交错**：部分请求已 Decode，另一部分仍 Prefill，破坏固定 Graph 和整批完成语义。
+三个主要预算：
 
-因此，外部协议和内部 Scheduler 必须共同理解“一个上游 batch”。仅增加一个批量 RPC
-不足以解决问题。
-
-本文中的“多 Batch”首先表示系统能同时接收和管理 `Q` 个有明确边界的 Envelope，并可在
-`K` 个 ExecutionSlot 上并发执行完整 Cohort；它不自动表示把多个 Envelope 合成一个物理
-batch。后者是可选 coalescing 策略，默认关闭。
-
----
-
-## 2. 统一术语与记号
-
-### 2.1 三个生命周期对象与一个执行切片
-
-| 对象 | 含义 | 生命周期与责任 |
+| 预算 | 限制什么 | 不等于什么 |
 | --- | --- | --- |
-| `ItemRequest` | 一个业务 Prompt | 保存 item ID、原始 token、单 item 输出 |
-| `BatchEnvelope` | 上游规整好的 `B` 个 Item | 提交、校验、幂等、排队和取消原子 |
-| `ExecutionCohort` | 服务端完整执行批 | reservation、Barrier、Decode、释放 |
-| `ExecutionSubBatch` | 一次物理 forward 的输入切片 | 只切执行，不改变 Cohort membership |
+| `max_num_scheduled_tokens` | 本轮 query token 总数 | 总上下文长度或真实 FLOPs |
+| `input_budget` | 本轮模型输入 token 容量 | BeamKV 或 Top-K workspace |
+| `max_num_seqs` | Running 请求/sequence 数 | 专用 fused Beam 容量模型 |
+| KV capacity | 可分配的 Context KV | BeamKV、Top-K workspace |
 
-第一版采用最强且最容易验证的关系：
+### 1.2 一个 Mixed Batch 例子
+
+设 scheduled-token 和 input budget 都允许 12，且 sequence、KV 与 long-prefill 约束也满足：
+
+| 请求 | 状态 | 本轮需求 |
+| --- | --- | ---: |
+| D1 | Running Decode | 1 token |
+| P1 | Running Prefill | 9 tokens |
+| P2 | Waiting Prefill | 还剩 6 tokens |
+
+开启 chunked Prefill 后：
+
+```text
+num_scheduled_tokens = {D1: 1, P1: 9, P2: 2}
+```
+
+- 三者合计 12 个 query token，组成一个 `SchedulerOutput`；
+- Prefill chunk 与 Decode token 通常进入同一次逻辑 target-model forward；
+- P2 尚未完成 Prefill，不发布生成 token；
+- 下一轮重新组 batch，membership 可以变化。
+
+### 1.3 对 GR 的意义
+
+| 优点 | 对本场景的不足 |
+| --- | --- |
+| 长 Prompt 可分块，控制面成熟 | 没有上游 Batch 原子边界 |
+| Context KV 与 prefix reuse 成熟 | Stock Beam 展开为 `B × W` 请求；fused GR 需额外账本 |
+| 动态到达时利用率高 | 同一批 Item 可能处于不同阶段 |
+| Prefill/Decode 可混合 | 固定 Graph、整批 P99 更难稳定 |
+| 请求级抢占灵活 | 大 Beam Session 的抢占与恢复代价高 |
+
+一句话：**vLLM 擅长动态请求利用率，不天然表达 GR 的整批阶段语义。**
+
+---
+
+## 2. NVIDIA SID-GR：stage-aware、shape-aware tick
+
+### 2.1 一个 tick 不是一次 forward
+
+NVIDIA 的调度器先管理请求阶段，再按 shape 把同阶段请求分组。
+
+```mermaid
+flowchart TD
+    A["Tick 开始"] --> B["准入 Waiting Prefill"]
+    B --> C["按 input shape 形成 Prefill groups"]
+    C --> D["逐组执行 Prefill forward"]
+    D --> E["按 decode key 形成 Decode groups"]
+    E --> F["逐组执行 Decode forward"]
+    F --> G["更新状态并释放完成请求"]
+```
+
+在 cache miss/disabled，且 group 指切块后的 planned microbatch 时：
+
+\[
+\text{forwards per tick}
+= \#\text{Prefill groups} + \#\text{Decode groups}
+\]
+
+Cache exact hit 可能不执行 Prefill model forward，prefix extension 也可能走额外路径。在单设备
+上，实际产生的 group forward 通常是**顺序调用**，不是把多个自回归 forward 同时算完。
+
+### 2.2 Decode 如何分组
+
+典型 Decode group key 包含：
+
+```text
+(current_decode_step, active_beam_width, next_beam_width, context_len)
+```
+
+只有 key 兼容的请求才进入同一个 Decode forward。
+
+### 2.3 多请求例子
+
+某个 tick 开始时：
+
+- C 是新到达的 Prefill 请求；
+- A、B 都在 Decode step 1，shape 相同；
+- D 在 Decode step 2，Beam Width 不同。
+
+以下假设 `max_decode_batch_size >= 2` 且 C 没有命中 Prefill cache：
+
+```mermaid
+sequenceDiagram
+    participant S as Tick Scheduler
+    participant P as Prefill Runner
+    participant D as Decode Runner
+    S->>P: Prefill C
+    P-->>S: C ready
+    S->>D: C step 0
+    D-->>S: result
+    S->>D: A+B step 1
+    D-->>S: result
+    S->>D: D step 2
+    D-->>S: result
+```
+
+这个 tick 实际包含四次模型调用。A、B 因 key 相同且 group 上限允许而合成一个 microbatch；
+D 单独执行。若保持默认 `max_decode_batch_size=1`，A、B 会再拆成两次 forward。
+Decode groups 在 Prefill groups 完成后重新形成，所以新完成 Prefill 的 C 才能在同一 tick 进入
+step 0。Prefill 已产生第一个输出位置；这里的 step 0 是第一次增量 Decode，产生第二个位置。
+
+### 2.4 对 GR 的意义
+
+| 优点 | 对本场景的不足 |
+| --- | --- |
+| 显式理解 Prefill 与多阶段 Decode | tick 内可能产生多次小 forward |
+| 按 Beam、step、context shape 分组 | 上游 Batch 仍可能被拆散 |
+| 动态在线利用率高于固定 cohort | 整批完成时间取决于 group 交错 |
+| 适合多种请求同时在线 | shape 变化多，Graph/P99 更难固定 |
+
+一句话：**NVIDIA 比 vLLM 更理解 GR 计算形状，但仍以动态 request/group 为核心。**
+
+---
+
+## 3. xLLM OneRec：FixedSteps 外层 + 两种多轮执行
+
+### 3.1 OneRec 没有走通用 ContinuousScheduler 入口
+
+OneRec 的 REC 入口固定创建 `FixedStepsScheduler`。
+
+```mermaid
+flowchart TD
+    A["RecMaster"] --> B["FixedStepsScheduler"]
+    B --> C["prepare_batch"]
+    C --> D["形成固定物理 cohort"]
+    D --> E{"max_decode_rounds"}
+    E -->|"等于 0"| L["OneRec Legacy"]
+    E -->|"大于 0"| X["OneRec XAttention"]
+```
+
+`FixedStepsScheduler` 虽继承 `ContinuousScheduler`，但 OneRec 覆盖了 batch 准备与执行路径；
+不能把它理解为普通 token-step continuous batching。
+
+### 3.2 固定的是物理 cohort，不是上游 Envelope
+
+重要边界：
+
+- 若 A、B 同时在队列且资源足够，可形成一个 cohort；
+- 若预算不足，A、B 仍可能被拆开；
+- cohort 形成后，新到达的 C 不能 late join；
+- xLLM 本身没有表达“这几个 Item 属于同一个上游 Batch”的 Envelope 协议。
+
+此外，首个请求即可唤醒调度，代码中没有显式 batch-fill 等待窗口；低流量下可能形成未填满的
+physical cohort。
+
+### 3.3 Legacy 与 XAttention 的执行位置
+
+```mermaid
+flowchart TB
+    C["Fixed physical cohort"] --> M{"Execution mode"}
+    M -->|"Legacy"| H["Host：Forward、Beam、decoder 重算"]
+    M -->|"XAttention"| W["Worker：Prefill、Beam、增量 Decode"]
+    H --> R["Final result"]
+    W --> R
+```
+
+Legacy 固定做 1 次初始 forward 和 2 次后续 forward；Host 每轮 Beam，后续 round 跳过
+encoder，只对当前完整 decoder token prefix 做 PREFILL-style 重算。XAttention 只做一次 Engine
+pipeline invocation，每个分布式 Worker 各调用一次 `step_async`，多轮留在 Worker/device 内。
+
+注意 round 计数：
+
+```text
+max_decode_rounds = total_rounds
+round 0 = Prefill
+round 1 ... total_rounds-1 = incremental Decode
+```
+
+因此配置为 3 表示 `1 Prefill + 2 Decode`，不是 `1 Prefill + 3 Decode`。
+
+`max_decode_rounds > 0` 只负责选择 XAttention pipeline；实际进入多轮还要求
+`total_round > 1`、`beam_width > 1` 且 selected indices 有效，否则会退化为单轮。
+
+### 3.4 两条路径与并发参数
+
+<!-- markdownlint-disable MD013 -->
+
+| 维度 | OneRec Legacy | OneRec XAttention |
+| --- | --- | --- |
+| 外层调度 | FixedSteps physical cohort | FixedSteps physical cohort |
+| 多轮控制 | Engine/Host 循环 | Worker/device 内循环 |
+| Engine pipeline 调用 | 每轮一次 | 整个 cohort 一次 |
+| 后续轮 | decoder prefix 重算 | 真正增量 Decode |
+| Beam 状态处理 | Host 每轮参与 | Worker/device 内处理 |
+| 适用性 | 兼容简单，开销大 | 短固定多轮更合适 |
+
+<!-- markdownlint-enable MD013 -->
+
+`rec_worker_max_concurrency = K` 允许 K 个独立 fixed cohort 占用 K 套执行 pipeline。实现中会
+创建 K 套 model/context/executor/stream pipeline，并非轻量逻辑 slot；它也不是 Beam Width，
+更不会把新请求连续插入正在执行的 cohort。
+
+一句话：**xLLM XAttention 最接近本场景需要的固定短程执行，但仍缺少显式上游 Batch 原子语义。**
+
+---
+
+## 4. 用户场景与策略选择
+
+### 4.1 负载约束
+
+```mermaid
+flowchart TD
+    L["Prompt：1K～10K"] --> P["Prefill 允许 chunk"]
+    W["Beam：64～512"] --> R["显式预留 Decode 资源"]
+    S["Output：2～5"] --> D["Resident 短 Decode"]
+    B["上游已规整 Batch"] --> C["保留 sealed cohort"]
+    P --> G["目标：低整批 P99"]
+    R --> G
+    D --> G
+    C --> G
+```
+
+由此得到五条不变量：
+
+1. 不靠到达时间猜 Batch 边界；
+2. 不只按逻辑 request/token 估算大 Beam 成本；
+3. Prefill 可以分块，但 Decode 前必须全 Cohort ready；
+4. Decode 期间 membership 与物理 shape 固定；
+5. 多 Batch 通过多 ExecutionSlot 并发，不向活跃 Cohort 填新 Item。
+
+### 4.2 对比结论
+
+下表是架构倾向，不是性能基准；吞吐与 P99 必须在目标硬件和 Profile 上实测。
+
+<!-- markdownlint-disable MD013 -->
+
+| 维度 | vLLM V1 | NVIDIA SID-GR | xLLM Legacy | xLLM XAttention |
+| --- | --- | --- | --- | --- |
+| 调度原子 | Request/token | Stage/shape group | Physical cohort | Physical cohort |
+| Batch membership | 每轮可变 | group 动态形成 | cohort 内固定 | cohort 内固定 |
+| Prefill/Decode | Mixed forward | tick 内分组 | decoder prefix 重算 | Prefill 后增量 Decode |
+| 多轮控制 | Control plane | Tick scheduler | Engine/Host | Worker/device |
+| Beam 资源认知 | Stock Beam request fan-out | group key 感知 | pipeline 专用 | pipeline 专用 |
+| Graph 友好度 | 低 | 中 | 中 | 高 |
+| 整批 P99 可预测性 | 低 | 中 | 中 | 高 |
+
+<!-- markdownlint-enable MD013 -->
+
+vLLM 与 NVIDIA 的动态利用率更高；xLLM XAttention 的短固定多轮更贴近本场景，但三者都
+没有完整的上游 Batch 原子协议。
+
+固定 membership 也不自动等于固定地址；还需在 Cohort 生命周期内绑定 slot-local buffer、
+Context/BeamKV lease 与 workspace。
+
+### 4.3 组合原则
+
+| 采用 | 不直接复制 |
+| --- | --- |
+| vLLM 的 Context KV 与 chunked Prefill | request-level admission |
+| NVIDIA 的 stage/shape profile | 任意跨请求动态 grouping |
+| xLLM XAttention 的 fixed cohort/resident rounds | Legacy decoder prefix 重算 |
+| 新增显式 `BatchEnvelope` | 把物理 cohort 当成业务 Batch |
+
+---
+
+## 5. 推荐方案：Sealed Cohort + Resident Decode
+
+### 5.1 总体架构
+
+```mermaid
+flowchart TD
+    I["BatchEnvelope Ingress"] --> V["Validation + Profile Match"]
+    V --> Q["Profile-aware Sealed Queues"]
+    Q --> D["Select feasible replica + slot"]
+    D --> A["Atomic whole-cohort lease"]
+    A --> S["ExecutionSlot"]
+    S --> O["Batch Result"]
+```
+
+每层只负责一件事：
+
+| 层 | 意图 |
+| --- | --- |
+| `BatchEnvelope` | 保留上游批边界、参数、幂等与超时 |
+| Profile Queue | 只让 shape/能力明确的批进入对应队列 |
+| Dispatcher | 选择资源可行的 slot/replica |
+| Cohort Admission | 在目标 slot/replica 上原子预留整批最坏资源 |
+| ExecutionSlot | 执行 Prefill Barrier 与固定短 Decode |
+
+### 5.2 一个 ExecutionSlot 的状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> QUEUED
+    QUEUED --> ADMITTED: all credits reserved
+    ADMITTED --> PREFILLING
+    PREFILLING --> BEAM_INIT: all items ready
+    BEAM_INIT --> DECODING: more positions needed
+    BEAM_INIT --> FINALIZING: terminal or S equals 1
+    DECODING --> DECODING: next fixed step
+    DECODING --> FINALIZING: last or all terminal
+    FINALIZING --> DONE
+    DONE --> [*]
+    QUEUED --> CANCELLED
+    QUEUED --> EXPIRED
+    ADMITTED --> FAILED
+    PREFILLING --> FAILED
+    BEAM_INIT --> FAILED
+    DECODING --> FAILED
+    FINALIZING --> FAILED
+    ADMITTED --> CANCELLED: boundary cancel
+    PREFILLING --> CANCELLED: chunk boundary
+    BEAM_INIT --> CANCELLED: boundary cancel
+    DECODING --> CANCELLED: step boundary
+    FINALIZING --> CANCELLED: boundary cancel
+    FAILED --> [*]
+    CANCELLED --> [*]
+    EXPIRED --> [*]
+```
+
+一个 slot 同时只拥有一个 active Cohort；一个模型副本可以发布 `K >= 1` 个 slot。所有终态都
+必须在设备 completion 安全后释放整批 lease。
+
+### 5.3 Cohort 内部执行语义
+
+```mermaid
+flowchart TD
+    P["Chunked Prefill"] --> B["Full-cohort Barrier"]
+    B --> I["Beam Init"]
+    I --> D["Resident Decode：S−1 steps"]
+    D --> F["Finalize"]
+```
+
+| 记号 | 含义 |
+| --- | --- |
+| `B` | Envelope 中实际 Item 数 |
+| `B_bucket` | Profile 的固定 batch bucket |
+| `W` | Beam Width |
+| `S` | 总生成位置数 |
+| `N_exec` | 固定物理 lane 数，`B_bucket × W` |
+| `N_inc` | Beam Init 后的增量次数，`S - 1` |
+
+Prefill 可以按 Item 或连续 token range 切分，但不改变 Cohort membership：
+
+```text
+token_start == num_computed_tokens[item]
+num_computed_tokens[item] += token_count
+ready[item] := num_computed_tokens[item] == prompt_len[item]
+```
+
+乱序、重叠或越界 chunk 必须拒绝；所有 Item ready 后才能 Beam Init。Beam Init 使用 B 份
+logits 绑定 `N_exec` 个 lane，它本身不是一次 `B × W` 行的 Decode forward。
+
+- `exact_steps`：始终生成 S 个位置；
+- `max_steps`：EOS 可让 Item 提前 terminal；
+- terminal lane 只修改 `active_mask`，不缩 shape；
+- 空出的 lane 不从下一个 Envelope 补请求。
+
+这牺牲少量尾部利用率，换来固定地址、固定 Graph、简单 BeamKV 与更稳定的 P99。
+
+多轮默认留在 Executor 内，同时保留语义等价的 Coordinator-driven fallback：
+
+<!-- markdownlint-disable MD013 -->
+
+| 模式 | 优点 | 代价 | 用途 |
+| --- | --- | --- | --- |
+| Executor-resident | 少控制往返，地址/Graph 稳定，最适合 S=2～5 | Executor 需持有 Beam 状态与后处理 | 推荐默认 |
+| Coordinator-driven | 易调试、易逐步观测，后端改造小 | 每步控制与同步开销更高 | bring-up 与兼容模式 |
+
+<!-- markdownlint-enable MD013 -->
+
+两种模式必须共享同一 sealed membership、资源 reservation 与结果语义，不能形成两套外部协议。
+
+### 5.4 整批资源准入
+
+不能只检查 `max_num_seqs` 或 token budget。每个 Envelope 的容量向量至少包含：
+
+```text
+Need(E) = {
+  ExecutionSlotCredit,
+  ContextCacheCredit,
+  DecodeLaneCredit = B_bucket × W,
+  BeamKVCacheCredit,
+  BeamSearchStateCredit,
+  WorkspaceCredit,
+  OutputBufferCredit,
+  GraphWorkspaceCredit
+}
+```
+
+`BeamKVCacheCredit` 至少由 `B_bucket × W × (S - 1)`、层数、KV heads、head dim、dtype 和
+block rounding 共同决定；`BeamSearchStateCredit` 覆盖 score、parent、mask 等状态。
+
+Graph executable 命中本身不是通用 credit；只有 `fallback_policy=reject` 时，Profile/Graph 命中
+才是 admission 前置条件。
+
+\[
+\operatorname{Admit}(E)
+\iff
+\forall r,\ \operatorname{Need}_{r}(E) \leq \operatorname{Free}_{r}
+\]
+
+```mermaid
+flowchart TD
+    E["Envelope at queue head"] --> P["Profile valid?"]
+    P -->|"No"| R["Reject"]
+    P -->|"Yes"| C["All credits free?"]
+    C -->|"No"| Q["Remain queued"]
+    C -->|"Yes"| L["Atomic lease"]
+    L --> A["Admit whole Cohort"]
+```
+
+推荐队列策略：
+
+- 每个 Profile 内 FIFO；
+- 多租户之间使用 batch-granularity weighted fair queue；
+- 从各 Profile 队首选择 oldest feasible Envelope，减少全局 head-of-line blocking；
+- active Cohort 不做 step-level 抢占；
+- 等待超过 `max_queue_ms` 转为 `EXPIRED`，不静默拆批。
+
+Profile 的 service-time envelope 必须由目标硬件实测；若某个 `L/W/B/S` 组合无法满足 100 ms
+目标，应标记为不支持，而不是在运行时静默降级。
+
+### 5.5 多 Batch 如何并发
+
+`K=2` 时，A、B 可各占一个 slot，C 等待任一 slot 释放：
+
+```mermaid
+sequenceDiagram
+    participant Q as Profile Queues
+    participant S0 as Slot 0
+    participant S1 as Slot 1
+    Q->>S0: Admit Envelope A
+    Q->>S1: Admit Envelope B
+    Note over S0: A prefill barrier and decode
+    Note over S1: B prefill barrier and decode
+    Q-->>Q: Envelope C waits
+    S0-->>Q: A releases credits
+    Q->>S0: Admit Envelope C
+```
+
+`K` 是资源隔离后的并发槽位数，不是越大越好：
+
+| 配置 | 适用场景 |
+| --- | --- |
+| `K=1` | 最强整批 P99、最大单 Cohort 资源、实现最简单 |
+| `K=2` | 有独立 pipeline 或 stage interleave 时可降低批间阻塞 |
+| `K>2` | 仅在资源账本、Graph workspace 与带宽验证后启用 |
+
+K 个逻辑 slot 不自动等于 K 个 forward 物理并行。单设备若没有独立 stream/pipeline 或受控的
+stage interleave，两个 slot 仍可能顺序执行；最清晰的并发隔离是不同模型副本。
+
+---
+
+## 6. 最小输入协议与能力协商
+
+### 6.1 三个对象
+
+| 对象 | 边界 |
+| --- | --- |
+| `ItemRequest` | 一个 Prompt 与一个 Item 结果 |
+| `BatchEnvelope` | 客户提交、幂等、排队、取消边界 |
+| `ExecutionCohort` | 服务端 reservation、Barrier、Decode 边界 |
+| `ExecutionSubBatch` | 一次 Prefill chunk；不改变 membership |
+
+V1 规定：
 
 ```text
 1 BatchEnvelope = 1 ExecutionCohort
 ```
 
-即不拆分、不跨 Envelope 合并、不允许执行中的 late join。
+`sealed` 只承诺整批校验、整批准入和固定 membership，不表示输出具备事务回滚语义；结果仍按
+Item 返回终态。
 
-### 2.2 统一记号
+对外统一使用 `generation.num_output_tokens`：它只计算模型生成位置，不包含服务端管理的
+begin/end 边界 token；`include_stop_token` 仅决定触发终止的模型 token 是否进入业务结果。
+旧接口的 `max_tokens/pre_calc` 换算属于 adapter，不进入新协议。
 
-| 记号 | 含义 |
+### 6.2 Capability/Profile
+
+客户端先读取 `/v1/gr/capabilities`。每个离散 Profile 至少发布：
+
+| 字段 | 示例 |
 | --- | --- |
-| `Q` | 同时排队或在途的 BatchEnvelope 数量 |
-| `K` | 一个模型副本发布的独立 ExecutionSlot 数量 |
-| `B` | 一个 Envelope 内的实际 Item 数 |
-| `B_bucket` | Graph/Profile 使用的物理 batch bucket |
-| `L_i` | 第 `i` 个 Item 的 Prompt 长度 |
-| `L_bucket` | Prefill Profile 使用的长度 bucket |
-| `W` | 固定 Beam Width |
-| `S` | 模型生成位置上限，即 `output_steps` |
-| `N_inc` | 最大增量 Decode 次数，`S - 1` |
-| `N_exec` | reservation/固定图执行 lane 数，`B_bucket × W` |
-| `N_live` | 当前仍有业务效果的 lane 数，`active_item_count × W` |
-
-本文统一规定：
-
-```text
-output_steps = S
-```
-
-表示最多执行 `S` 个模型生成位置，不包含服务端管理的 begin/end 边界 token。Prefill forward
-产生第一个模型 token 的候选，Beam Init 后：
-
-```text
-generated_count = 1
-N_inc = S - 1
-decode_step = generated_count - 1 = 0 ... S - 2
-is_last_step = (decode_step == S - 2)
-```
-
-`generated_count` 是唯一持久化的权威计数；`decode_step` 是提交下一次增量 forward 前由它派生的
-零基索引，不独立递增。一次 step 成功 commit 后只原子执行
-`generated_count += 1`，下个 `decode_step` 随之改变。
-
-`exact_steps` 始终产生并返回 `S` 个模型 token；`max_steps` 允许 stop token 使结果短于 `S`。
-若触发终止的 stop token 不返回，业务结果甚至可以是 0 个 token。两种策略的 reservation 都按
-最坏情况 `S - 1` 个增量 step 计算。这样可以同时避免“decode rounds 是否包含 Prefill”的歧义
-和容量计算的 off-by-one。
-
-begin/end 边界 token 由选中的 Profile/catalog revision 管理，客户端不能在每个 Item 中任意
-覆盖；它们按来源从业务结果剥离。既有 API 的计数转换属于兼容层，不进入新协议定义，见第
-18 节。
-
-### 2.3 Batch、Beam 与物理行的关系
-
-```mermaid
-flowchart TD
-    E["BatchEnvelope"] --> I["B 个 ItemRequest"]
-    I --> P["Prefill：B 个逻辑行"]
-    P --> T["Beam Init：每个 Item 选择 W 条路径"]
-    T --> D["Decode：N_exec 个固定物理 lane"]
-    D --> O["按 Item 聚合最终结果"]
-```
-
-首轮 Prefill 不应简单乘上 Beam Width。只有完成初始候选选择后，后续增量 Decode 才进入
-`B_bucket × W` 的 Beam 几何。Beam Init 自身仍以每个 Item 的首轮 logits 为输入，它是“选择并
-绑定 `N_exec` 条 Decode lane”，不是一次 `N_exec` 行的增量 Decode forward。Padding 或已结束
-Item 对应的 lane 仍可能参与固定图执行，但通过 mask 失效，因此通常有 `N_live <= N_exec`。
-
----
-
-## 3. 参考调度机制：哪些能力值得借鉴
-
-这一节只讨论可复用的调度原理，不要求目标系统复制任何一套完整运行时。
-
-### 3.1 请求级动态 Tick 调度
-
-NVIDIA SID-GR 的 continuous scheduler 将请求维护为
-`waiting_prefill → decoding → finished` 三个阶段。每个 tick 的控制流是：
-
-1. 处理超时；
-2. 按 Prefill batch 上限和内存预算准入新请求；
-3. 执行一个或多个 Prefill microbatch；
-4. 将所有 decoding 请求按执行几何重新分组；
-5. 每个 Decode group 前进一步；
-6. 发布完成请求和资源使用量。
-
-源码中 `tick()` 先调用 Prefill executor，再规划并调用 Decode executor；Decode group key
-至少包含 step、当前 Beam Width、下一步 Beam Width和 Context Length。因此一个 tick
-不是一次 model forward，而是一个控制面调度周期。
-
-参考代码：
-
-- [continuous scheduler 状态与策略](https://github.com/NVIDIA/recsys-examples/blob/9a3bf5df169969b71defdced0cc29079fe897064/examples/sid-gr-inference/src/gr_inference/gr_serving/continuous.py#L89-L258)
-- [`tick()` 的 Prefill → Decode 顺序](https://github.com/NVIDIA/recsys-examples/blob/9a3bf5df169969b71defdced0cc29079fe897064/examples/sid-gr-inference/src/gr_inference/gr_serving/continuous.py#L382-L428)
-- [Prefill admission 与 Decode grouping](https://github.com/NVIDIA/recsys-examples/blob/9a3bf5df169969b71defdced0cc29079fe897064/examples/sid-gr-inference/src/gr_inference/gr_serving/continuous.py#L515-L576)
-
-#### 一个 tick 同时有 Prefill 和 Decode 时怎样执行
-
-假设 tick 开始前：
-
-| 请求 | 当前状态 | 几何 |
-| --- | --- | --- |
-| A、B | Decode step 1 | `W=128, L=4K` |
-| C | Waiting Prefill | `W=128, L=4K` |
-| D | Decode step 2 | `W=64, L=2K` |
-
-本 tick 可能执行：
-
-```mermaid
-sequenceDiagram
-    participant S as Scheduler
-    participant P as Prefill Executor
-    participant D as Decode Executor
-
-    S->>S: Admit C
-    S->>P: Prefill C
-    P-->>S: ContextKV 与初始候选
-    S->>S: 按 step、W、L 分组
-    S->>D: 提交有序 Decode groups
-    D->>D: Forward C，step 0
-    D->>D: Forward A/B，step 1
-    D->>D: Forward D，step 2
-    D-->>S: 发布各组结果
-```
-
-这些 forward 通常按顺序提交。它们不表示一个设备上存在三个相互依赖的 Decode forward
-同时计算。动态 tick 的收益来自每轮重新组织 ready 请求，而不是消除自回归依赖。
-
-Prefill executor 内部还会按 `input_ids.shape` 再分组。因此，如果本 tick 同时 admit 了
-`L=4K` 和 `L=2K` 两类请求，可能连续执行两次 Prefill forward，然后再执行若干 Decode
-forward。更准确的关系是：
-
-```text
-一个 scheduler tick
-  -> 0..N 次 Prefill forward
-  -> 0..M 次 Decode forward
-```
-
-参考代码：[Prefill shape grouping](https://github.com/NVIDIA/recsys-examples/blob/9a3bf5df169969b71defdced0cc29079fe897064/examples/sid-gr-inference/src/gr_inference/gr_serving/continuous.py#L1491-L1550)
-
-#### 多阶段 Decode 怎样推进
-
-每个请求只在一次 tick 内推进一个逻辑 step。不同 step 的请求被放入不同 Decode group：
-
-```text
-Tick 7: A/B step 1, D step 2
-Tick 8: A/B step 2, D 完成
-Tick 9: A/B 完成
-```
-
-同一个 tick 可以包含多个 Decode group，因此可能触发多次 `forward_decode_step()`。这种策略
-适合请求级在线服务，优点是利用率高；代价是 batch membership、step 和 shape 持续变化，整批
-P99、Graph 命中与资源预测更复杂。
-
-#### 对目标调度器的借鉴边界
-
-值得借鉴：
-
-- Context token 和 Beam capacity 同时进入 admission budget；
-- Decode 按完整执行几何分组，不能只看总 token 数；
-- 每个 tick 发布明确的状态与资源指标；
-- Prefill、Decode 和完成请求具有独立队列语义。
-
-第一版不直接采用：
-
-- 在一个上游 batch 内逐请求动态准入；
-- Prefill 与同一 Envelope 的 Decode 交错；
-- 在每个 Decode step 重新改变 cohort membership；
-- 动态 Beam Width。
-
-### 3.2 xLLM OneRec 的两条固定 Cohort 路径
-
-xLLM 当前 OneRec 外层由 `FixedStepsScheduler` 接收并封闭 cohort。虽然该类继承了通用
-Scheduler 基类，但 OneRec 的 REC 入口没有实例化普通 `ContinuousScheduler`。路径选择由
-`max_decode_rounds` 决定：
-
-| OneRec 路径 | 选择条件 | 多轮控制位置 | KV 行为 |
-| --- | --- | --- | --- |
-| Legacy/Default | `max_decode_rounds == 0` | Engine/Host | 完整序列重算 |
-| XAttention | `max_decode_rounds > 0` | Worker | Prefill 后增量 Decode |
-
-参考代码：
-
-- [OneRec pipeline 选择](https://github.com/xLLM-AI/xllm/blob/cd167a6aca8b4de200a1e7ab76b105cf102e7b72/xllm/core/util/rec_model_utils.h#L32-L87)
-- [RecMaster 创建 FixedStepsScheduler](https://github.com/xLLM-AI/xllm/blob/cd167a6aca8b4de200a1e7ab76b105cf102e7b72/xllm/core/distributed_runtime/rec_master.cpp#L557-L573)
-- [Legacy Engine/Host 多轮循环](https://github.com/xLLM-AI/xllm/blob/cd167a6aca8b4de200a1e7ab76b105cf102e7b72/xllm/core/distributed_runtime/rec_engine.cpp#L699-L759)
-- [XAttention Worker 内多轮循环](https://github.com/xLLM-AI/xllm/blob/cd167a6aca8b4de200a1e7ab76b105cf102e7b72/xllm/core/runtime/rec_worker_impl.cpp#L1741-L1959)
-
-#### Legacy/Default 例子
-
-`B=2, W=4`，一个 Item 由 3 个 token 表示：
-
-```text
-Scheduler 封闭 Cohort[A, B]
-
-Forward 0: [prompt]
-  -> Host Beam 得到 token 1
-
-Forward 1: [prompt + token 1]
-  -> Host Beam 得到 token 2
-
-Forward 2: [prompt + token 1 + token 2]
-  -> Host Beam 得到 token 3
-```
-
-后两轮 Builder 仍按 Prefill 构造完整序列，因此属于全量重算，而不是复用 Paged KV 的标准
-单 token Decode。
-
-#### XAttention multi-round 例子
-
-同样是 `B=2, W=4, total_rounds=3`：
-
-```mermaid
-flowchart TD
-    A["Scheduler 封闭 Cohort A/B"] --> B["Engine 只准备一次输入"]
-    B --> C["Worker Round 0：Prefill 与 Beam Init"]
-    C --> D["Worker Round 1：Decode 与 KV Select"]
-    D --> E["Worker Round 2：Decode 与 Final Select"]
-    E --> F["一次性返回最终结果"]
-```
-
-两条路径执行期间都不接受新请求 C 加入 A/B。区别不是是否 continuous batching，而是多轮
-控制留在 Engine/Host，还是下沉到 Worker/Device。
-
-#### 对目标调度器的启示
-
-- sealed cohort 非常适合上游已规整的近线 batch；
-- Prefill barrier 是多轮状态安全的边界；
-- Legacy 路径实现简单，但重复 Prefill 计算不可作为长期性能目标；
-- Worker-resident loop 最适合最终形态，但不应阻塞第一版 single-step Decode Graph；
-- 外部 BatchEnvelope 协议不应绑定 Coordinator loop 或 Executor loop，执行层可以独立替换。
-
-### 3.3 控制面异步流水的真实收益与风险
-
-调度器可以维护深度为 2 的在途队列，使 batch `n+1` 的 CPU scheduling、KV 元数据准备、
-RPC 提交，与 batch `n` 的设备 forward 或输出 D2H 重叠。
-
-它能重叠：
-
-- CPU Scheduler 计算；
-- KV block/slot bookkeeping；
-- RPC 与命令提交；
-- 上一批输出 D2H 和下一批设备工作。
-
-它不能消除：
-
-- 同一请求 token `n+1` 对 token `n` 的数据依赖；
-- 同一默认 stream 上的顺序执行；
-- Beam parent 选择完成前下一步输入未知的问题。
-
-对 sealed batch 更重要的风险是：如果没有显式 Prefill barrier，Scheduler 可能在 Cohort 的
-部分 Prompt 尚未 Prefill 时，提前推进已完成 Item 的 Decode。第一版因此不做跨阶段异步预排；
-只有当前 Cohort 全部 Prompt ready 后才允许切换状态。
-
----
-
-## 4. 当前 vLLM-GR：一个非规范性案例
-
-本节只回答“现有实现实际上怎样运行”，用于说明批量传输、Host barrier 与真正 Batch
-Scheduler 的差别。第 5 节以后的推荐方案不继承本节的类、消息、队列或迁移约束；即使完全
-重写 Runtime，策略结论仍成立。
-
-截至 `JiusiServe/vllm-gr@6ece5a6`，主干没有独立的 GR Fixed Scheduler。当前实现是：
-
-> Host 逐输出 step 维护 Beam barrier，底层仍调用原生 vLLM Scheduler。
-
-Scheduler patch 临时适配 grouped-beam 的 KV 查询边界，并把 `beam_width`、`prefix_len`、
-`beam_decode_steps` 写入 `SchedulerOutput.beam_data`，最后仍调用 `_original_schedule()`。
-
-参考代码：
-
-- [Scheduler patch](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/v1/engine/engine_core_patch.py#L196-L281)
-- [Beam scheduling metadata](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/v1/engine/scheduler_metadata.py)
-
-### 4.1 CUSTOM Beam Attention 路径
-
-```mermaid
-flowchart TD
-    H["Host 将 Prompt 切成 instances_batch"] --> A["Step 0：ADD_BATCH"]
-    A --> E["EngineCore 逐个转成普通 ADD"]
-    E --> S["原生 vLLM Scheduler"]
-    S --> W["Worker 执行当前可调度部分"]
-    W --> B["Host 等本组全部 Item 完成该 step"]
-    B --> K["Host Beam Top-K"]
-    K --> U["每个 Item 发送 grouped Beam update"]
-    U --> S
-```
-
-具体语义：
-
-1. `concurrency_limit` 将 Prompt list 切成 frontend cohort；
-2. Step 0 用 `ADD_BATCH(force_batch=True)` 一次发送 `B` 个 Prefill 请求；
-3. EngineCore 解码后循环处理每个 Item，并逐个放回普通 `ADD` 队列；
-4. Scheduler 可以同 tick 调度，也可以因 token budget、KV 或 chunked prefill 拆开；
-5. Host 收齐整个 frontend cohort 的结果后才做 Beam Top-K；
-6. 后续每个 Item 创建一个 grouped Request，内部携带该 Item 的 `W` 条 Beam；
-7. Scheduler 看见 `B` 个逻辑 grouped Request，Worker 再展开成约 `B × W` 个物理行；
-8. Host 再次收齐本步所有 Item，循环到最终 step。
-
-参考代码：
-
-- [`ADD_BATCH` 客户端发送](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/v1/engine/core_client.py#L10-L49)
-- [EngineCore 将 `ADD_BATCH` 拆为普通请求](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/v1/engine/core.py#L323-L346)
-- [Offline Host step barrier](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/entrypoints/gr.py#L329-L465)
-- [Grouped Beam Request 构造](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/v1/engine/core.py#L109-L239)
-
-### 4.2 非 CUSTOM 路径
-
-非 CUSTOM 路径每个输出 step 将当前所有 active Beam 展平为 `B × W` 个普通 Prompt，调用一次
-`generate(max_tokens=1)`，等待全部结果后在 Host 选择下一组 Beam。
-
-它具有 step barrier，但底层 Scheduler 看到的是 `B × W` 个普通独立请求，既没有 grouped
-Beam 语义，也没有 Scheduler 级 cohort 原子性。
-
-参考代码：[普通 Beam Host 循环](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/entrypoints/gr.py#L630-L809)
-
-### 4.3 Online Serving 路径
-
-每个 HTTP Beam 请求独立等待自己的当前 step，再提交下一步。不同 HTTP session 可以在共享的
-原生 Scheduler 中混排或合批，没有 server-wide BatchEnvelope barrier。
-
-参考代码：[Online Beam lifecycle](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/entrypoints/openai/serving_engine.py#L47-L171)
-
-### 4.4 `ADD_BATCH` 为什么不是 Batch Scheduler
-
-当前 `ADD_BATCH` 只表达一个 wire payload 中携带多个请求。它不包含：
-
-- `batch_id` 或 `expected_items`；
-- seal/commit 状态；
-- 全批校验和 all-or-reject；
-- 全批资源 reservation；
-- 同 tick 或同 Cohort 保证；
-- Batch 级完成、取消和幂等；
-- `N_exec = B_bucket × W` 物理 Decode lane accounting。
-
-其中一个 Item 预处理失败时，其他 Item 仍可能继续入队。因此它甚至不应被描述为业务层的
-原子 admission。
-
-此外，`current_wave` 沿用 vLLM 的 DP wave 协调语义，不是 GR batch identity，也不能作为
-Prefill barrier 或 Decode wave ID。
-
-参考代码：[字段透传](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/v1/engine/core_client.py#L10-L75)
-
-### 4.5 从案例中暴露的通用 Gap
-
-| 能力 | 当前实现 | 目标 V1 |
-| --- | --- | --- |
-| Batch 边界 | Frontend Python 隐式维护 | `BatchEnvelope` 显式协议对象 |
-| Scheduler 单位 | 独立 Item/grouped Request | sealed `ExecutionCohort` |
-| Prefill barrier | Host 收齐结果形成 | Scheduler 状态机硬约束 |
-| Beam 容量 | `max_num_seqs` 与 token budget 间接限制 | 显式 `B_bucket × W` reservation |
-| 多 Batch | Offline 分块串行；Online 动态混排 | Profile queue + bounded admission |
-| Decode loop | Host 每步往返 | Coordinator/Executor 策略可替换 |
-| 幂等与取消 | Request 级 | Batch 级 + Item mask |
-| Graph Profile | 下层按现有 batch 决定 | admission 前协商并钉住 |
-
-这些 Gap 是需求证据，不是“在现有 Scheduler 上打补丁”的实现清单。目标架构只保留
-Batch identity、barrier、resource lease 和 stage transition 等逻辑契约。
-
----
-
-## 5. 策略选择与实现无关的目标方案
-
-### 5.1 四种候选策略
-
-<!-- markdownlint-disable MD013 -->
-
-| 策略 | 调度原子 | 多轮驱动位置 | 优点 | 代价 | 最适场景 |
-| --- | --- | --- | --- | --- | --- |
-| Request Continuous Tick | 单请求/单 step | Scheduler + Executor | 动态利用率最高，天然吸收随机到达 | 上游 Batch 边界弱，shape 和整批 P99 波动大 | 通用在线、独立请求、吞吐优先 |
-| Sealed Cohort + Coordinator Step Loop | Envelope/Cohort | Coordinator 每 step | 实现与调试简单，Beam 策略灵活 | 每步 RPC/D2H/barrier，控制面易成瓶颈 | 算法快速迭代、早期验证 |
-| Sealed Cohort + Executor Multi-round | Envelope/Cohort | Executor/Device 内循环 | 固定 shape，控制开销低，整批延迟稳定 | 设备状态机、取消和错误恢复复杂 | 近线规整 Batch、固定 `W/S`、低 P99 |
-| Multi-cohort Stage Overlap | 多个独立 Cohort slot | Stage-aware Scheduler | 可重叠 E1 Decode 与 E2 Prefill，提高利用率 | 资源干扰、Graph slot 和公平性更复杂 | 吞吐与 P99 都重要且资源充足 |
-
-<!-- markdownlint-enable MD013 -->
-
-这里的关键选择分成两个正交层面：
-
-1. **Membership policy**：请求级动态重组，还是 sealed Cohort；
-2. **Decode driver**：Coordinator-driven，还是 Executor-resident。
-
-因此，选择 sealed Cohort 并不强制多轮必须立刻下沉 Executor。协议和 Scheduler 可以先稳定
-Batch identity、barrier 与 lease，执行层再独立选择 `coordinator_step` 或
-`executor_multi_round`。
-
-### 5.2 推荐结论及理由
-
-对“上游已规整、Prompt 长度相近、Beam Width 大、输出步数少、整批 P99 优先”的场景，推荐：
-
-> Sealed BatchEnvelope + Scheduler-managed Cohort + 全组 Prefill Barrier + 固定形状 Decode。
-
-推荐它并不是为了迁就某个已有代码结构，而是因为 workload 本身具备稳定的 `B/L/W/S`，可以
-用少量利用率弹性换取以下收益：
-
-- Batch 完成语义可验证；
-- Decode State、可选 Graph 和 workspace 可在 admission 时精确预算；
-- Decode shape 和地址稳定，适合 Graph/静态编译；
-- 取消、幂等、重试和结果聚合都有明确边界；
-- Coordinator loop 与 Executor loop 可以在不改用户协议的情况下替换。
-
-不选择它的情况也很明确：如果请求彼此独立、到达高度随机、`W/S` 经常变化，且单请求 TTFT
-或设备吞吐比整批 P99 更重要，应直接使用 Request Continuous Tick，而不是强行构造 Envelope。
-
-### 5.3 设计不变量
-
-1. 一个 Envelope 是校验、排队、幂等和 membership 原子；
-2. 一个 Envelope 等于一个 Cohort，不跨 Envelope 隐式 merge；
-3. Cohort admission 必须一次性获得全部资源 credit；
-4. Prefill 可分多个 chunk，但 Decode 只能在全组 Prompt ready 后开始；
-5. Decode membership、`B_bucket`、`W`、`S` 和 Decode-state binding 固定；
-6. 新 Envelope 不能 late join 到 active Cohort；
-7. `max_steps` 下的 EOS 或 Item cancel 只将 lane 标记 inactive，不从下一批补位；
-8. Cohort 全部 Item terminal 后 Batch 才进入终态并释放资源；
-9. 每个 `cohort_session_slot` 同时只绑定一个 Cohort；每个副本的 slot 数 `K >= 1` 由
-   Profile/SLA 决定，不写死在协议中；
-10. Scheduler 不通过超时窗口推断 batch 边界。
-
-### 5.4 逻辑架构
-
-```mermaid
-flowchart TD
-    C["Client 或上游 Batch Aggregator"] --> V["Batch API：校验、幂等、Seal"]
-    V --> Q["Profile-aware Bounded Queues"]
-    Q --> A["Admission：Profile 与资源 Lease"]
-    A --> S["K 个独立 Cohort Slot"]
-    S --> P["Prefill：允许多 Chunk"]
-    P --> R["全 Cohort Prefill Barrier"]
-    R --> D["Beam Init 与固定 Decode Session"]
-    D --> F["Finalize：聚合结果与释放"]
-```
-
-这是一组逻辑角色，不要求对应特定类或进程。API、Scheduler、Capacity Manager 和 Execution
-Runtime 可以在一个进程，也可以通过 RPC 解耦；正确性只依赖契约，不依赖部署拓扑。
-
-### 5.5 `K` 个 Active Cohort Slot 怎样选择
-
-<!-- markdownlint-disable MD013 -->
-
-| 部署策略 | 能重叠什么 | 优点 | 缺点 | 推荐条件 |
-| --- | --- | --- | --- | --- |
-| `K=1` | 只重叠控制面与当前设备工作 | 干扰最小、资源最容易证明、P99 最稳定 | Prefill/Decode 空洞无法被另一 Cohort 填充 | 强 SLA、大 `W`、单 Cohort 已接近满载 |
-| `K>1` 同副本 | E1 Decode 与 E2 Prefill，或不同 Profile 的 ready stage | 利用率更高、队列下降 | KV/Graph/workspace 争用，调度和取消复杂 | 单 Cohort 不能填满设备且容量可静态预留 |
-| 多副本各 `K=1` | 不同副本独立执行 Cohort | 隔离强、扩容直观 | 模型副本成本高，路由需 profile-aware | 内存允许、P99 比单卡利用率更重要 |
-
-<!-- markdownlint-enable MD013 -->
-
-即使 `K>1`，不同 Cohort 的 Prefill/Decode 也通常是独立 `ExecutionSubBatch` 和独立 forward；
-“同一 scheduler cycle 可选择多个 stage”不等于把它们融合为一次模型 forward。默认选择规则：
-
-- 强 P99 Profile 从 `K=1` 起步，通过多副本扩展；
-- 吞吐 Profile 可启用 `K>1`，但必须为每个 Cohort 独立 reservation；
-- `K` 是服务端 Capability/Profile，不是用户逐请求调节旋钮。
-
-### 5.6 Queue 策略也应显式选择
-
-<!-- markdownlint-disable MD013 -->
-
-| Queue 策略 | 优点 | 缺点 | 适用条件 |
-| --- | --- | --- | --- |
-| Global FIFO | 到达顺序最直观，不会主动越队 | 队头 Profile 暂不可执行时产生 HOL blocking | `K=1`、Profile 单一、强顺序诉求 |
-| Per-profile FIFO + oldest-feasible | slot/资源利用率更高 | 跨 Profile 不再严格全局 FIFO | 多 Profile、`K>1` 或多副本 |
-| Deadline-aware | 可直接优化 SLA miss | 策略复杂，可能饿死大 Batch | 明确 deadline 产品语义后再启用 |
-
-<!-- markdownlint-enable MD013 -->
-
-推荐默认在每个 Profile queue 内 FIFO，并从各队头选择“最老且当前可完整 admission”的
-Envelope；对被绕过的队头做 aging 和最大绕过次数限制。`max_queue_ms` 仍只定义超时，不隐式
-改变同一 queue 内顺序。无论选择哪种 queue policy，都不能拆分或重排 Envelope 内的 Item。
-
-### 5.7 Cohort 状态机
-
-```mermaid
-stateDiagram-v2
-    [*] --> Received
-    Received --> Validating
-    Validating --> Rejected: 参数或 Profile 错误
-    Validating --> Queued: 整批校验成功
-    Queued --> Admitted: 获得完整资源 Lease
-    Admitted --> Prefilling
-    Prefilling --> Prefilling: 下一个 Prefill Chunk
-    Prefilling --> BeamInit: 全部 Prompt ready
-    BeamInit --> Finalizing: 全部 Item 已 terminal
-    BeamInit --> Decoding: 仍有 active Item
-    Decoding --> Decoding: 下一增量 Step
-    Decoding --> Finalizing: 达到 stop policy
-    Finalizing --> Done
-    Done --> [*]
-    Queued --> TimedOut: 超过 max_queue_ms
-    Prefilling --> Failed: 执行失败
-    Decoding --> Failed: 执行失败
-    TimedOut --> [*]
-    Failed --> [*]
-```
-
-状态切换必须由 BatchScheduler 统一发布，不能由某个 Item 的输出回调自行切换整个 Cohort。
-`DONE` 表示所有 Item 成功或按 stop policy 正常终止；若基础设施错误使整批无法继续，则为
-`FAILED`；若只有部分 Item 失败而其余结果仍可交付，则为 `PARTIAL_FAILED`。无论哪一种，只有
-全部 Item 都进入 terminal 状态后，Batch 才能进入对应终态。协议不承诺已发布输出的回滚。
-
----
-
-## 6. 用户输入协议
-
-### 6.1 推荐提供两个清晰的服务等级
-
-| Endpoint | 语义 | 适用场景 |
-| --- | --- | --- |
-| `/v1/gr/batches` | 强 Batch 语义，sealed cohort | 近线、上游已规整 batch、稳定 Graph |
-| OpenAI-compatible endpoint | Request 级动态合批 | 通用在线与兼容性 |
-
-不要让一个模糊的 `generate(list[prompt])` 同时承担两种语义。调用方必须明确选择是“整批执行”
-还是“独立请求交给服务端动态合批”。
-
-### 6.2 BatchEnvelope V1
+| `profile_id` / `revision` | `gr-b4-l4096-w128-s3-graph` / `7` |
+| 模型约束 | model revision、dtype、backend |
+| Batch 约束 | `max_items`、`B_bucket`、总 Prompt token 上限 |
+| 生成约束 | `beam_width`、`num_output_tokens`、stop policy |
+| 执行约束 | graph/eager、padding、fallback policy |
+| 队列约束 | payload bytes、queued batches、`max_queue_ms` |
+| SLA 约束 | 经过基准验证的 service-time envelope |
+
+若 `B=3` 匹配 `B_bucket=4`，只允许按 Profile 明示 padding；V1 不用另一个 Envelope 填第
+4 个 lane。
+
+### 6.3 Submit
 
 ```json
 {
   "schema_version": "gr.batch.v1",
-  "batch_id": "batch-20260812-0042",
-  "idempotency_key": "upstream-job-9834",
-  "model_revision": "onerec-v7",
-  "catalog_revision": "catalog-20260812",
+  "batch_id": "batch-20260812-0001",
+  "idempotency_key": "order-feed-9817",
+  "profile_id": "gr-b4-l4096-w128-s3-graph",
+  "profile_revision": 7,
+  "membership_atomicity": "sealed",
+  "fallback_policy": "reject",
+  "max_queue_ms": 20,
   "generation": {
     "beam_width": 128,
-    "output_steps": 3,
-    "stop_policy": "exact_steps",
+    "num_output_tokens": 3,
+    "stop_policy": "max_steps",
     "include_stop_token": false
   },
-  "execution": {
-    "membership_atomicity": "sealed",
-    "profile_policy": "auto",
-    "execution_mode": "auto",
-    "fallback_policy": "reject",
-    "coalescing_policy": "forbid",
-    "max_queue_ms": 20,
-    "e2e_sla_ms": 100
-  },
   "items": [
-    {
-      "request_id": "item-1001",
-      "prompt_token_ids": [101, 203, 304]
-    },
-    {
-      "request_id": "item-1002",
-      "prompt_token_ids": [102, 204, 305]
-    }
+    {"request_id": "item-0", "prompt_token_ids": [101, 102]},
+    {"request_id": "item-1", "prompt_token_ids": [201, 202]},
+    {"request_id": "item-2", "prompt_token_ids": [301, 302]},
+    {"request_id": "item-3", "prompt_token_ids": [401, 402]}
   ]
 }
 ```
 
-服务端必须从 `items` 重算 `B_actual`、每个 `L_i` 和总 Prompt token，不能信任客户端的
-shape hint。V1 不需要单独的 `batch_size` 字段，避免声明值与实际数组长度不一致。
+服务端必须按实际 `items` 和 token 内容重新计算 B、长度、资源需求，不能相信客户端声明的
+shape。
 
-#### 必填字段
-
-| 字段 | 语义 |
-| --- | --- |
-| `schema_version` | 协议版本，避免字段含义随服务升级漂移 |
-| `batch_id` | 租户范围内的业务 Batch ID |
-| `idempotency_key` | 网络重试去重键 |
-| `generation.beam_width` | Batch 级固定 `W` |
-| `generation.output_steps` | 模型生成位置上限 `S`，不含服务端边界 token |
-| `generation.stop_policy` | `exact_steps` 或 `max_steps` |
-| `generation.include_stop_token` | `max_steps` 下是否返回触发终止的模型 stop token |
-| `execution.membership_atomicity` | V1 固定为 `sealed` |
-| `execution.execution_mode` | `auto/eager/graph_single_step/graph_multi_step` |
-| `execution.coalescing_policy` | V1 默认 `forbid`；未来显式允许物理合批 |
-| `execution.max_queue_ms` | 从接受入队到 admission 的最大等待时间 |
-| `execution.e2e_sla_ms` | 可选 E2E 目标，用于可行性校验，不用于越队 |
-| `items` | 完整、已 sealed 的 Item 列表 |
-| `items[].request_id` | Batch 内唯一的 Item ID |
-| `items[].prompt_token_ids` | 未 Padding 的原始 token IDs |
-
-#### 不应暴露给用户的字段
-
-- Context Cache block/address ID；
-- Decode-state/BeamKV slot ID、地址和 generation；
-- backend wave/cycle ID；
-- Executor/replica rank；
-- Padding 后的 Prompt Tensor；
-- Graph executable ID；
-- 设备 workspace 指针；
-- `generated_count` 的设备 buffer；
-- begin/end 边界 token ID；它们由 Profile/catalog revision 管理；
-
-这些是服务端实现细节。用户只声明业务语义，服务端选择物理 Profile 并返回确认结果。
-
-### 6.3 接受响应
+接受后返回异步 handle：
 
 ```json
 {
-  "batch_id": "batch-20260812-0042",
-  "batch_handle": "grb_01J52Z8V0Q5T",
+  "batch_handle": "grb_01J5XYZ",
   "state": "QUEUED",
-  "accepted_items": 2,
-  "selected_profile": "b2-l4096-w128-s3-v2",
-  "profile_revision": 2,
-  "status_url": "/v1/gr/batches/grb_01J52Z8V0Q5T",
-  "result_url": "/v1/gr/batches/grb_01J52Z8V0Q5T/result"
+  "status_url": "/v1/gr/batches/grb_01J5XYZ",
+  "result_url": "/v1/gr/batches/grb_01J5XYZ/result",
+  "cancel_url": "/v1/gr/batches/grb_01J5XYZ"
 }
 ```
 
-`QUEUED` 只表示请求已通过静态校验并进入有界队列，不表示设备资源已经 reservation。POST
-成功时返回 `202 + batch_handle`。同步 HTTP/gRPC 也可以保持调用直到终态，但内部状态机与
-资源语义必须完全相同。
-
-最终结果示例：
-
-```json
-{
-  "batch_id": "batch-20260812-0042",
-  "state": "DONE",
-  "selected_profile": "b2-l4096-w128-s3-v2",
-  "items": [
-    {
-      "request_id": "item-1001",
-      "token_ids": [7001, 42, 19],
-      "state": "DONE",
-      "finish_reason": "exact_steps"
-    },
-    {
-      "request_id": "item-1002",
-      "token_ids": [7002, 31, 88],
-      "state": "DONE",
-      "finish_reason": "exact_steps"
-    }
-  ]
-}
-```
-
-结果按 `items` 原顺序返回，同时携带 `request_id`，避免调用方依赖隐式位置。
-`token_ids` 永远不含服务端管理的 begin/end 边界 token；是否包含模型生成且触发终止的 stop
-token，只由 `generation.include_stop_token` 决定。
-
-### 6.4 异步查询、结果与取消
-
-V1 至少提供以下完整生命周期：
-
-| 操作 | 语义 |
-| --- | --- |
-| `POST /v1/gr/batches` | 校验并尝试进入有界队列，成功返回 `202` |
-| `GET /v1/gr/batches/{handle}` | 查询 Batch 状态、Item 终态和时间戳 |
-| `GET /v1/gr/batches/{handle}/result` | 终态后读取完整结果；未终态返回 `409 NOT_TERMINAL` |
-| `DELETE /v1/gr/batches/{handle}` | 请求取消；实际生效点取决于当前 chunk/step 边界 |
-
-状态响应至少返回 `received_at`、`queued_at`、`admitted_at`、当前 stage、每个 Item 状态和
-`result_expires_at`。Batch 终态与结果默认保留一个可配置 TTL，TTL 必须覆盖客户端重试窗口。
-SSE/gRPC stream 或 callback 只能作为可选通知通道；handle 查询与结果读取是基础能力，避免
-通知丢失后无法恢复。
-
-### 6.5 完整消息与分片提交
-
-推荐 V1 使用一个 unary HTTP/gRPC 消息携带完整 Item list：
-
-```text
-一个提交消息 = 一个 sealed BatchEnvelope
-```
-
-不要使用“首个 Item 到达后等待若干毫秒”来猜 batch 是否结束。这会引入 underfilled batch、
-边界歧义和 P99 抖动。
-
-只有在 payload 很大、生产者分布式或无法一次组装时，才增加事务式扩展：
+### 6.4 协议时序
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant G as Batch Gateway
-    participant S as Scheduler
-
-    C->>G: OpenBatch，声明 expected_items
-    C->>G: AppendItems，chunk 0
-    C->>G: AppendItems，chunk 1
-    C->>G: CommitBatch
-    G->>G: 全批校验与 Seal
-    G->>S: 发布一个 BatchEnvelope
+    participant G as GR Gateway
+    participant S as Cohort Scheduler
+    participant E as Executor
+    C->>G: GET capabilities
+    G-->>C: profiles and limits
+    C->>G: POST BatchEnvelope
+    G->>S: validate and enqueue
+    S-->>G: enqueue accepted
+    G-->>C: 202 with batch_handle
+    S->>E: admit whole Cohort
+    E-->>S: terminal BatchResult
+    C->>G: GET result
+    G-->>C: item results
 ```
 
-`CommitBatch` 前 Scheduler 完全看不到该 batch。缺失 Item、重复 chunk 或 seal timeout 都在
-Gateway 层失败，不允许产生部分 Cohort。
+### 6.5 固定错误语义
+
+| 条件 | 结果 |
+| --- | --- |
+| Profile/参数静态不匹配 | `422 PROFILE_MISMATCH` |
+| Payload 超限 | `413 PAYLOAD_TOO_LARGE` |
+| 队列容量已满 | `429 RESOURCE_EXHAUSTED` + `retry_after_ms` |
+| 同幂等键、不同 payload | `409 IDEMPOTENCY_CONFLICT` |
+| 已接收但排队超时 | 状态转为 `EXPIRED` |
+| Active batch 取消 | 在 chunk/step 边界停止并释放整批 lease |
+
+禁止静默降低 W、拆 Batch或跨 Envelope 合并。未经请求协议允许，也不得从 Graph 静默切换为
+eager execution。
 
 ---
 
-## 7. Capability 与 Profile 协商
-
-### 7.1 能力发现
-
-客户端启动时可查询并缓存：
-
-```http
-GET /v1/gr/capabilities
-```
-
-示例响应：
-
-```json
-{
-  "schema_versions": ["gr.batch.v1"],
-  "model_revision": "onerec-v7",
-  "profile_revision": 2,
-  "limits": {
-    "max_items_per_batch": 8,
-    "max_payload_bytes": 4194304,
-    "max_total_prompt_tokens": 32768,
-    "max_queued_batches": 64,
-    "max_execution_slots_per_replica": 2
-  },
-  "beam_widths": [64, 128, 256, 512],
-  "output_steps": [2, 3, 4, 5],
-  "prompt_buckets": [1024, 2048, 4096, 8192, 10240],
-  "membership_atomicity": ["sealed"],
-  "stop_policies": ["exact_steps", "max_steps"],
-  "include_stop_token": [false, true],
-  "execution_modes": ["eager", "graph_single_step", "graph_multi_step"],
-  "fallback_policies": ["reject", "allow_eager"],
-  "coalescing_policies": ["forbid"],
-  "boundary_token_policy": "profile_managed_excluded_from_result",
-  "queue_durability": "durable",
-  "queue_policy": "per_profile_fifo_oldest_feasible_aging",
-  "profiles": [
-    {
-      "profile_id": "b4-l4096-w128-s3-v2",
-      "batch_bucket": 4,
-      "max_prompt_tokens_per_item": 4096,
-      "max_total_prompt_tokens": 16384,
-      "beam_width": 128,
-      "output_steps": 3,
-      "stop_policies": ["exact_steps", "max_steps"],
-      "execution_modes": ["eager", "graph_single_step"],
-      "default_execution_mode": "graph_single_step",
-      "service_time_upper_bound_ms": 72
-    }
-  ]
-}
-```
-
-能力结果应与 `model_revision` 和 `profile_revision` 一起缓存。模型、Decode-state layout 或
-execution-mode contract 变化时必须升级 revision。
-
-`B_actual` 始终由 `items.length` 推导，客户端不重复声明。Capability 的硬上限用于静态校验，
-Profile 的 `service_time_upper_bound_ms` 则描述 admission 后、在指定 shape 下的服务时间包络。
-若某个 10K Prompt 或 `W=512` Profile 无法满足已声明 SLA，服务端就不应发布该 Profile，而
-不是接受后静默降级。端到端延迟统一从服务端收到完整 Envelope 开始，至 Batch 进入终态结束：
-
-```text
-batch_e2e_ms = queue_wait_ms + admitted_service_ms
-```
-
-其中 `max_queue_ms` 只约束 `queue_wait_ms`，不会触发 deadline-aware 越队。
-若客户端声明 `e2e_sla_ms`，服务端只有在
-`max_queue_ms + service_time_upper_bound_ms <= e2e_sla_ms` 时才能接受；否则返回
-`422 SLA_UNSATISFIABLE`。
-
-### 7.2 自动选择与严格钉住
-
-支持两类客户端：
-
-#### 普通客户端
-
-客户端只声明 `B`、实际 token、`W`、`S`，由服务端选择：
-
-```text
-B_actual -> B_bucket
-max(L_i) -> L_bucket
-(B_bucket, L_bucket, W, S) -> selected_profile
-```
-
-服务端在接受响应中返回最终 Profile。
-
-#### 强 SLA 客户端
-
-客户端显式携带：
-
-```json
-{
-  "profile_id": "b4-l4096-w128-s3-v2",
-  "profile_revision": 2
-}
-```
-
-任何 shape 或 revision 不匹配都返回 `422 PROFILE_MISMATCH`，不能静默：
-
-- 缩小 Beam Width；
-- 减少输出步数；
-- 拆分上游 Batch；
-- 与其他 Batch 合并；
-- 切换到未声明的 eager fallback。
-
-### 7.3 Padding 规则
-
-当 `B_actual=3`、`B_bucket=4` 时，可以使用一条 dummy lane，但必须满足：
-
-- Profile 明确允许 `PAD_TO_PROFILE`；
-- dummy lane 的 token、mask、KV 和输出区域固定；
-- dummy 结果不进入业务输出；
-- 不使用下一个 Envelope 的 Item 填补空位。
-
-后者看似提高利用率，实际会破坏两个 Envelope 的生命周期隔离、取消语义和完成时间。
-
-### 7.4 Prefill 与 Decode 的 Graph Key 不应混为一个整数
-
-Prefill 主要关心：
-
-```text
-(model revision, backend, dtype, B_bucket, L_bucket, LoRA/catalog mode)
-```
-
-Decode 主要关心：
-
-```text
-(model revision, backend, dtype, B_bucket, W, step shape,
- BeamKV layout, postprocess mode)
-```
-
-`B=1,W=8` 与 `B=2,W=4` 虽然总 lane 都是 8，但 Shared Context 行数、Beam grouping、
-BlockTable 和结果形状不同，不能只按 `num_tokens=8` 复用同一张图。
-
-更详细的 Graph 与 BeamKV 约束见：
-
-- [BeamKV Cache 架构、数据流与容量调度设计](./beam_kv_cache_architecture_and_scheduling_design.md)
-- [Beam Incremental Decode 统一架构设计](./beam_incremental_decode_unified_architecture_design.md)
-
----
-
-## 8. Scheduler Admission 与资源模型
-
-### 8.1 Admission 必须是整批事务
-
-Scheduler 准入一个 Cohort 时，需要同时检查并 reservation：
-
-1. `ExecutionSlotCredit`：可绑定一个 Cohort 的执行 slot；
-2. `ContextCacheCredit`：Prefill/共享上下文状态；
-3. `DecodeStateCredit`：Beam Item、物理 lane 和 Beam 状态容量；
-4. `WorkspaceCredit`：算子与后处理临时空间；
-5. `OutputBufferCredit`：结果和元数据 buffer；
-6. 条件资源：Graph/static-buffer 或其他编译后端资源；
-7. 队列深度和已排队 Prompt token。
-
-任何一项失败都不能只放入部分 Item。静态 shape/Profile 在空闲设备上也永远不可执行时，直接
-拒绝；请求有效但 active lease 暂时繁忙时保持 `QUEUED`，直到获得资源或超过
-`max_queue_ms`。
-
-### 8.2 Context Cache 预算
-
-Context Cache 可以是 paged、dense、prefix-shared 或平台自定义布局。Capacity Manager 只依赖
-Profile 发布的 credit 函数，不依赖某个具体 KV 类。例如 paged backend 设 block size 为 `P`：
-
-```text
-prompt_blocks = sum(ceil(L_i / P))
-```
-
-Prefix cache 命中可以减少实际新增 block，但 admission 必须使用可验证的保守 credit，避免
-完成 Prefill 后才发现 Beam Decode 资源不足。
-
-### 8.3 Cohort Session、Beam Item 与物理 Lane 预算
-
-这里必须冻结三个不同单位：
-
-```text
-cohort_session_slots_per_cohort = 1
-beam_item_slots = B_bucket
-physical_decode_lanes = N_exec = B_bucket × W
-live_decode_lanes = N_live = active_item_count × W
-```
-
-一个 Item 在控制面仍可能只是一个逻辑对象，但 Executor 会展开为 `W` 条 Beam lane。一个
-Cohort 持有一个长生命周期 Decode Session；其中每个 Item 占一个
-`beam_item_slot`，该 slot 最多绑定 `W × (S - 1)` 深度的 suffix BeamKV。Pool 可以采用其他
-物理布局，但外部容量账本仍必须同时表达这三个单位；逻辑 Item 数不能替代 lane 和
-Decode-state bytes budget。
-
-### 8.4 Decode State 与 BeamKV 容量
-
-`DecodeStateCredit` 至少覆盖 token、score、parent、active mask、约束状态和增量 KV。BeamKV
-是适合 GR fixed-round 的一种布局，其近似容量为：
-
-```text
-beam_kv_bytes =
-    num_layers
-  × B_bucket
-  × W
-  × max_incremental_steps
-  × num_kv_heads
-  × head_dim
-  × 2
-  × element_size
-```
-
-其中 `max_incremental_steps = N_inc = S - 1`，`2` 表示 K 和 V。实际布局、对齐、共享 Prefix
-和平台后端可能改变 stride，因此服务启动时应把每个 Profile 的精确 bytes 预计算到
-Capability；请求 admission 只消费预计算 credit。
-
-### 8.5 Graph 是条件资源，不是架构前提
-
-Profile 必须明确 `execution_mode`：
-
-<!-- markdownlint-disable MD013 -->
-
-| Mode | Admission 额外检查 | 特点 |
-| --- | --- | --- |
-| `eager` | launch/workspace credit | shape 弹性大，单次开销较高 |
-| `graph_single_step` | Graph executable + 固定 buffer credit | 单 step 稳定，仍可由 Coordinator 驱动 |
-| `graph_multi_step` | 完整 Session/Graph window credit | 往返最少，取消和状态恢复最复杂 |
-
-<!-- markdownlint-enable MD013 -->
-
-只有 Graph mode 才必须 reservation Graph 资源。若请求 `fallback_policy=allow_eager`，Graph miss
-可以重新计算 eager CapacityVector；若为 `reject`，Graph 命中才是 admission 契约。
-
-### 8.6 Reservation 时机
-
-推荐在 `QUEUED → ADMITTED` 时一次性取得整批 credit：
-
-```mermaid
-sequenceDiagram
-    participant S as BatchScheduler
-    participant C as CapacityManager
-    participant E as ModelExecutor
-
-    S->>C: reserve Cohort 资源
-    C-->>S: CapacityVector Lease
-    S->>E: Cohort Execution Plan
-    E-->>S: 全部 Prompt ready
-    S->>E: 启动固定 Decode Session
-    E-->>S: Completion Event
-    S->>C: release Lease
-```
-
-物理 Cache 可以在 Prefill chunk 中逐步绑定，但 admission credit 已经预留。这样不会出现
-“Prompt 都算完了，却没有 Decode State、Executor slot 或所选 mode 资源”的半完成状态。
-
----
-
-## 9. Prefill、Barrier 与 Decode 策略
-
-### 9.1 Prefill 可以分 Chunk
-
-sealed cohort 不等于一次 forward 必须容纳全部 Prompt。若 token budget 不足，可以按 Item
-子集切分，也可以对单个长 Prompt 按 token range 做 chunked prefill。例如：
-
-```text
-Prefill Chunk 0: Item 0、1
-Prefill Chunk 1: Item 2，token [0, 4096)
-Prefill Chunk 2: Item 2，token [4096, L_2)；Item 3，token [0, 2048)
-Prefill Chunk 3: Item 3，token [2048, L_3)
-```
-
-但这些 chunk 始终属于同一个 Cohort。执行期间：
-
-- 后到 Envelope 不进入这些 chunk；
-- 已完成 Prefill 的 Item 不提前进入 Decode；
-- Scheduler 为每个 Item 维护 `num_computed_tokens[i]`；
-- 每个物理 chunk 显式携带 `(item_idx, token_start, token_count)`；
-- 调度前验证 `token_start == num_computed_tokens[i]` 且
-  `0 < token_count <= L_i - token_start`；
-- chunk commit 后原子执行 `num_computed_tokens[i] += token_count`；重复、重叠、乱序和越界
-  range 必须拒绝，或先通过唯一 chunk ID 做显式幂等去重；
-- 只有 `num_computed_tokens[i] == L_i` 的 Item 才算 Prefill ready；
-- 所有实际 Item 都满足该条件时才触发 Barrier；
-- 每个 Item 的 Prompt KV binding 必须在 Barrier 前完成发布。
-
-### 9.2 Beam Init
-
-Beam Init 是 Prefill 与增量 Decode 的明确边界：
-
-1. 每个 Item 获得首 token 的候选 logits；
-2. 应用 Catalog/约束 mask；
-3. 选择初始 `W` 条 Beam；
-4. 初始化 Beam score、parent、token 和 active mask；
-5. 绑定固定 Decode State 和 mode-specific buffer；
-6. 设置 `generated_count=1`；下一次 forward 的 `decode_step` 由它派生为 `0`。
-
-`max_steps` 下，若首 token 使某个 Item EOS，必须在第一次增量 Decode 前更新
-`active_item_mask/N_live`；若全部 Item 已 terminal，则从 Beam Init 直接进入 `FINALIZING`。其他
-情况只有完成以上操作后，Cohort 才进入 `DECODING`。
-
-### 9.3 固定步 Decode
-
-第一版采用 single-step Decode Graph：
+## 7. 完整执行例子
+
+### 7.1 参数
+
+| 参数 | 值 |
+| --- | ---: |
+| Envelope A | 4 Items |
+| Prompt | 每个约 4K tokens |
+| `B_bucket` | 4 |
+| `W` | 128 |
+| `S` | 3 个生成位置 |
+| Prefill budget | 每次 8K tokens |
+| 固定 Decode lanes | `4 × 128 = 512` |
+
+### 7.2 执行
 
 ```mermaid
 flowchart TD
-    S["读取固定 Session Buffer"] --> F["Single-step Decode Forward"]
-    F --> K["Executor 或 Coordinator Beam Top-K"]
-    K --> C["Decode State Commit 与 parent 更新"]
-    C --> U["generated_count 加一"]
-    U --> Q{"达到 stop policy"}
-    Q -->|否| S
-    Q -->|是| O["Final Select"]
+    A["Atomic lease：含 512 Decode lanes"] --> P0["Prefill P0：Item 0 + 1"]
+    P0 --> P1["Prefill P1：Item 2 + 3"]
+    P1 --> B["Barrier：4 / 4 ready"]
+    B --> I["Beam Init：生成位置 1"]
+    I --> D1["512-lane Decode：位置 2"]
+    D1 --> D2["512-lane Decode：位置 3"]
+    D2 --> F["Finalize and release"]
 ```
 
-循环可以由 Coordinator 逐 step 驱动，也可以完整留在 Executor；只要 Session、资源 Lease 和
-Cohort membership 不变，两种执行策略可以替换而不修改 BatchEnvelope 协议。
+在 A 执行期间到达的 Envelope B：
 
-### 9.4 Stop Policy、EOS 与 Item Cancel
+- 有空闲 slot：整批路由到另一个 slot；
+- 没有空闲 slot：在 Profile Queue 中等待；
+- 不能加入 A 的 Prefill chunk；
+- 不能填充 A 因 EOS 空出的 Decode lane。
 
-Profile 必须显式声明支持的 stop policy：
-
-| Policy | Stop 行为 | 每个 Item 的业务结果长度 |
-| --- | --- | --- |
-| `exact_steps` | 不因 EOS 提前终止；EOS ID 作为普通模型 token 或由约束 mask | 恒为 `S` |
-| `max_steps` + include | stop token 使该 Item terminal，并保留触发 token | `1 ... S` |
-| `max_steps` + exclude | stop token 使该 Item terminal，但不返回触发 token | `0 ... S` |
-
-固定 shape 下，`max_steps` 的某个 Item 因 EOS 提前结束，或任一策略下 Item 被取消时：
-
-- 将该 Item 的 `W` 条 lane 标记 inactive；
-- 后续 Graph replay 通过 mask 跳过其有效写入和结果发布；
-- 不收缩 `B_bucket × W`；
-- 不使用其他 Envelope 补位；
-- Cohort 完成或整体取消后统一释放物理资源。
-
-这种策略会浪费少量尾部计算，但显著简化 Graph、地址稳定性和正确性验证。即使所有业务 Item
-已经 EOS，Scheduler 也可以在 step 边界提前结束 Cohort；若仍回放固定图，结果写入必须全部
-mask。由于 `S` 只有 2～5，浪费通常可控。
+这就是“多 Batch 输入”与“跨 Batch 动态拼接”的区别。
 
 ---
 
-## 10. 多 Batch 执行例子
+## 8. 方案优劣、演进与结论
 
-### 10.1 输入
+### 8.1 推荐方案的收益
 
-设备 Prefill token budget 为 8K：
-
-| Envelope | `B` | Prompt 长度 | `W` | `S` | 到达时刻 |
-| --- | ---: | --- | ---: | ---: | --- |
-| E1 | 4 | 3900、4000、4050、3950 | 128 | 3 | T0 |
-| E2 | 4 | 2000、2050、1980、2100 | 128 | 3 | E1 Prefill 中 |
-| E3 | 2 | 8000、7900 | 256 | 2 | E1 Decode 中 |
-
-E1 的 Decode 物理 lane 数是：
-
-```text
-4 × 128 = 512
-```
-
-### 10.2 `K=1` 强隔离策略时间线
-
-```mermaid
-sequenceDiagram
-    participant Q as Profile Queue
-    participant S as BatchScheduler
-    participant W as ModelExecutor
-
-    Q->>S: E1 ready
-    S->>W: E1 Prefill Chunk 0，Item 0/1
-    Q->>Q: E2 到达并排队
-    S->>W: E1 Prefill Chunk 1，Item 2/3
-    S->>W: E1 Beam Init，绑定 512 Decode lanes
-    Q->>Q: E3 到达并排队
-    S->>W: E1 Decode Step 0，第 2 个 token
-    S->>W: E1 Decode Step 1，第 3 个 token
-    W-->>S: E1 Done，释放 Lease
-    S->>W: Admit E2
-```
-
-完整执行表：
-
-| 阶段 | Active Cohort | E2 | E3 |
-| --- | --- | --- | --- |
-| Prefill-0 | E1 Item 0/1 | 未到达 | 未到达 |
-| Prefill-1 | E1 Item 2/3 | FIFO 等待 | 未到达 |
-| Beam Init | E1，选择并绑定 512 lanes | FIFO 等待 | 未到达 |
-| Decode step 0 | E1，执行 512 lanes | FIFO 等待 | 到达并排队 |
-| Decode step 1 | E1，执行 512 lanes | FIFO 等待 | FIFO 等待 |
-| Finalize | E1 | FIFO 等待 | FIFO 等待 |
-| Next Admission | E2 | Active | FIFO 等待 |
-
-### 10.3 哪些行为明确禁止
-
-E2 不能：
-
-- 加入 E1 的第二个 Prefill chunk；
-- 与 E1 的 512-lane Decode 合并；
-- 填补 E1 提前 EOS 的 Item lane；
-- 复用 E1 的 Decode-state binding；
-- 因为 Prompt 更短而越过 E1。
-
-本例假设 E1/E2/E3 属于同一个 Profile queue，因此按 FIFO 执行。跨 Profile 或 `K>1` 时使用
-第 5.6 节的 oldest-feasible + aging。若某 Profile 永远无法在空闲设备上独立 admission，应在
-`VALIDATING` 阶段直接 `422`，而不是让它永久堵塞队头。
-
-### 10.4 `K>1` 多 Cohort Slot
-
-多副本可以这样运行：
-
-```text
-Model replica 0: Active Cohort E1
-Model replica 1: Active Cohort E2
-Profile queues: E3、E4...
-```
-
-同一副本的 `K>1` 也可以是：
-
-```text
-Execution slot 0: E1 Decode
-Execution slot 1: E2 Prefill
-Profile queues: E3、E4...
-```
-
-每个 Cohort 仍保持 sealed。多个 slot 是并列生命周期，不是把新 Item late join 到旧 Cohort；
-E1 Decode 与 E2 Prefill 是否可真正 overlap，取决于 Executor 和硬件，Scheduler 必须把它们当作
-两个独立 sub-batch/forward 计费。
-
----
-
-## 11. Sealed 语义、幂等、取消与 Backpressure
-
-### 11.1 Sealed Membership 的四项保证
-
-| 层级 | 必须保证的语义 |
+| 收益 | 来源 |
 | --- | --- |
-| 校验原子 | 一个 Item 非法则整批拒绝 |
-| 排程原子 | Envelope 不拆成多个 Cohort |
-| 执行原子 | Active Cohort 不接受新成员 |
-| 生命周期门闩 | 所有 Item terminal 后 Batch 才进入 Batch 终态 |
+| 上游 Batch 不被意外拆散 | Envelope + whole-cohort admission |
+| 长 Prompt 不独占单次 forward | Cohort 内 chunked Prefill |
+| Fused 大 Beam 成本完整计费 | 显式 Decode lane/BeamKV/workspace credits |
+| Decode shape 与地址稳定 | sealed membership + active mask |
+| 短多轮控制开销低 | Executor-resident loop |
+| 多 Batch 可扩展 | K slots + multi-replica dispatcher |
 
-协议字段因此叫 `membership_atomicity="sealed"`，而不是笼统的“结果原子”。结果可以按 Item
-流式返回，且不会回滚已经发布的 Item 输出；Batch 状态不能因第一个 Item 完成而提前进入终态。
+### 8.2 需要接受的代价
 
-| Batch 终态 | 定义 |
+| 代价 | 控制方式 |
 | --- | --- |
-| `DONE` | 所有 Item 正常完成或按 stop policy 结束 |
-| `PARTIAL_FAILED` | 至少一个 Item 有可用结果，同时至少一个 Item 失败或取消 |
-| `FAILED` | Cohort 基础设施失败，或没有任何可交付结果 |
-| `CANCELLED` | 整批被取消且没有继续执行 |
-| `TIMED_OUT` | 在 admission 前超过 `max_queue_ms` |
+| EOS 后可能有 masked 空 lane | S 很短，优先换取固定 shape |
+| Whole-cohort admission 可能等待 | Profile queue + oldest feasible |
+| Resident executor 实现更复杂 | 先提供 Coordinator fallback |
+| 大 profile 容量碎片 | 离散 B/L/W/S bucket 与容量监控 |
+| active cohort 不抢占 | admission 前做最坏 service-time 校验 |
 
-### 11.2 幂等
+### 8.3 能力分阶段
 
-建议 key：
-
-```text
-(tenant_id, idempotency_key)
-```
-
-服务端对规范化 payload 计算 hash：
-
-- 同 key、同 hash：返回已有 handle 或最终结果；
-- 同 key、不同 hash：返回 `409 IDEMPOTENCY_CONFLICT`；
-- 去重记录 TTL 必须覆盖调用方最大重试窗口。
-
-这可以避免网络重试导致同一 Batch 重复占用 Decode State 和重复产生业务结果。
-
-### 11.3 取消
-
-| 状态 | 取消语义 |
+| 阶段 | 可验证结果 |
 | --- | --- |
-| `QUEUED` | 整批从所属 Profile queue 移除，不申请执行资源 |
-| `PREFILLING` | 在当前 chunk completion 后终止，释放已绑定资源 |
-| `DECODING` | 在当前 step completion 后终止，避免破坏执行/Decode-state 事务 |
-| 单 Item cancel | 将 Item lane mask 为 inactive，Cohort 生命周期继续 |
+| P1 | 协议不再依赖请求到达时间推断 Batch |
+| P2 | 任一资源不足都不会半批 admission |
+| P3 | 所有 Item ready 前绝不进入 Beam Init |
+| P4 | S−1 个 Decode step 不回控制面重建 membership |
+| P5 | 多 Cohort 并发且资源、状态、失败域隔离 |
 
-释放前必须等待相关设备 completion event，防止 slot 被新 Cohort 复用时旧 kernel 仍在写入。
+最终策略：
 
-### 11.4 Backpressure
+> **协议层封住 Batch，调度层整批预留，Prefill 层允许分块但设置全批 Barrier，Decode 层在
+> Executor 内以固定 `B_bucket × W` 运行短多轮；多 Batch 通过独立 slot/replica 并发。**
 
-服务端使用有界队列，至少限制：
-
-- `queued_batches`；
-- `queued_items`；
-- `queued_prompt_tokens`；
-- 每 Profile 等待数量；
-- 可预留的 Cohort session、Beam Item、物理 lane 和 Decode-state credit；
-- 各 execution mode 的 active Session 数量。
-
-若 POST 时有界队列已经满，立即返回：
-
-```text
-429 RESOURCE_EXHAUSTED
-retry_after_ms: 8
-reason: QUEUE_FULL | TENANT_QUEUE_LIMIT
-```
-
-只要请求已通过静态校验且队列有位置，即使 Decode State、执行 mode 或 active Cohort lease
-正忙，也先返回 `202 QUEUED`；达到队头后等待资源，不把暂时性繁忙误报为永久错误。超过
-`max_queue_ms` 后异步状态变为 `TIMED_OUT/QUEUE_TIMEOUT`，同步等待接口可映射为 HTTP 408。
-
-`202` 表示 Envelope 与幂等记录已经提交到 Capability 声明的队列持久层，不表示设备资源已
-reservation。推荐 `queue_durability="durable"`；若部署只支持进程内队列，必须显式广告
-`process_lifetime`，并要求客户端在进程重启后用相同幂等键重试。系统不静默拆分 Batch，也不因
-`max_queue_ms` 改变同一 Profile queue 内的 FIFO；跨 queue 选择遵循已发布的 queue policy。
-
-### 11.5 错误码
-
-| HTTP/业务码 | 含义 |
-| --- | --- |
-| `400 INVALID_BATCH` | 缺失字段、重复 Item ID、token 非法 |
-| `409 IDEMPOTENCY_CONFLICT` | 同一幂等键对应不同 payload |
-| `413 BATCH_TOO_LARGE` | 单 Envelope 超过硬上限 |
-| `422 PROFILE_MISMATCH` | `B/L/W/S` 无可执行 Profile |
-| `422 SLA_UNSATISFIABLE` | 已发布 Profile 与排队预算无法满足声明的 E2E 目标 |
-| `408 QUEUE_TIMEOUT` | 已接受请求在 admission 前超过 `max_queue_ms`；异步查询返回业务码 |
-| `429 RESOURCE_EXHAUSTED` | POST 时有界队列或租户队列配额已满 |
-| `499 CLIENT_CANCELLED` | 调用方取消 |
-| `500 EXECUTION_FAILED` | Executor、执行 mode 或算子失败，整批进入终态 |
+它不是 vLLM、NVIDIA 或 xLLM 的简单复制，而是针对“上游已规整、长 Prompt、大 Beam、短
+Decode、整批低 P99”这组约束做的最小组合。
 
 ---
 
-## 12. 调度策略比较与最终选择
+## 9. 代码与延伸阅读
 
-### 12.1 横向比较
+### 9.1 vLLM V1
 
-以下评价是架构性质判断，最终数值仍需在目标硬件上 profiling。
+- [统一 token-progress、Running-first 与 Waiting admission](https://github.com/vllm-project/vllm/blob/52be12cfac0c5a18ba906814b2d2bcadb40a9c4b/vllm/v1/core/sched/scheduler.py#L438-L790)
+- [EngineCore 的 schedule → execute → update](https://github.com/vllm-project/vllm/blob/52be12cfac0c5a18ba906814b2d2bcadb40a9c4b/vllm/v1/engine/core.py#L580-L608)
+- [Stock Beam active-beam fan-out](https://github.com/vllm-project/vllm/blob/52be12cfac0c5a18ba906814b2d2bcadb40a9c4b/vllm/entrypoints/generate/beam_search/offline.py#L210-L275)
 
-<!-- markdownlint-disable MD013 -->
+### 9.2 NVIDIA SID-GR
 
-| 维度 | Request Dynamic Tick | Sealed + Coordinator Steps | Sealed + Executor Resident | Multi-slot Hybrid |
-| --- | --- | --- | --- | --- |
-| Admission 粒度 | 单请求 | 整 Cohort | 整 Cohort完整窗口 | 每 Cohort 独立 |
-| Batch membership | 动态 | 固定 | 固定 | 每个 Cohort 固定 |
-| Prefill barrier | 无全组 barrier | 有 | 有 | 每 Cohort 有 |
-| 控制面往返 | 每 step | 每 step | 通常一次计划、一次结果 | 取决于各 slot mode |
-| 动态利用率 | 最高 | 中低 | 中 | 高 |
-| 固定 Graph 友好度 | 中低 | 高 | 最高 | 高，但资源更多 |
-| 整批 P99 可控性 | 中低 | 高 | 最高 | 中高，存在跨 Cohort 干扰 |
-| 取消灵活性 | 高 | 高，step 边界 | 中，step/flag 边界 | 中高 |
-| 资源预留压力 | 动态碎片化 | 单 Cohort step/window | 完整 Decode window | 多 Cohort 总和 |
-| 故障影响域 | 单请求为主 | Cohort | Cohort | 单 slot/Cohort |
-| 实现复杂度 | 中高 | 低到中 | 中高 | 高 |
+- [Scheduler 与 tick](https://github.com/NVIDIA/recsys-examples/blob/9a3bf5df169969b71defdced0cc29079fe897064/examples/sid-gr-inference/src/gr_inference/gr_serving/continuous.py#L270-L434)
+- [Policy 默认 group 上限](https://github.com/NVIDIA/recsys-examples/blob/9a3bf5df169969b71defdced0cc29079fe897064/examples/sid-gr-inference/src/gr_inference/gr_serving/continuous.py#L141-L157)
+- [Prefill admission](https://github.com/NVIDIA/recsys-examples/blob/9a3bf5df169969b71defdced0cc29079fe897064/examples/sid-gr-inference/src/gr_inference/gr_serving/continuous.py#L515-L545)
+- [Prefill executor grouping](https://github.com/NVIDIA/recsys-examples/blob/9a3bf5df169969b71defdced0cc29079fe897064/examples/sid-gr-inference/src/gr_inference/gr_serving/continuous.py#L1491-L1546)
+- [Decode planning](https://github.com/NVIDIA/recsys-examples/blob/9a3bf5df169969b71defdced0cc29079fe897064/examples/sid-gr-inference/src/gr_inference/gr_serving/continuous.py#L547-L578)
+- [Decode execution](https://github.com/NVIDIA/recsys-examples/blob/9a3bf5df169969b71defdced0cc29079fe897064/examples/sid-gr-inference/src/gr_inference/gr_serving/continuous.py#L2014-L2153)
 
-<!-- markdownlint-enable MD013 -->
+### 9.3 xLLM OneRec
 
-### 12.2 决策规则
+- [RecMaster 创建 FixedStepsScheduler](https://github.com/xLLM-AI/xllm/blob/cd167a6aca8b4de200a1e7ab76b105cf102e7b72/xllm/core/distributed_runtime/rec_master.cpp#L557-L573)
+- [FixedSteps prepare_batch](https://github.com/xLLM-AI/xllm/blob/cd167a6aca8b4de200a1e7ab76b105cf102e7b72/xllm/core/scheduler/fixed_steps_scheduler.cpp#L193-L321)
+- [Legacy Engine/Host 多轮](https://github.com/xLLM-AI/xllm/blob/cd167a6aca8b4de200a1e7ab76b105cf102e7b72/xllm/core/distributed_runtime/rec_engine.cpp#L699-L759)
+- [XAttention Engine 到 Worker fan-out](https://github.com/xLLM-AI/xllm/blob/cd167a6aca8b4de200a1e7ab76b105cf102e7b72/xllm/core/distributed_runtime/rec_engine.cpp#L845-L908)
+- [XAttention Worker 内多轮](https://github.com/xLLM-AI/xllm/blob/cd167a6aca8b4de200a1e7ab76b105cf102e7b72/xllm/core/runtime/rec_worker_impl.cpp#L1741-L1959)
+- [多套 Worker pipeline](https://github.com/xLLM-AI/xllm/blob/cd167a6aca8b4de200a1e7ab76b105cf102e7b72/xllm/core/runtime/rec_worker_impl.cpp#L3002-L3088)
 
-| 条件 | 推荐选择 |
-| --- | --- |
-| 请求随机到达，`B/L/W/S` 变化大 | Request Dynamic Tick |
-| Batch 已规整，但设备后处理尚未闭环 | Sealed + Coordinator Steps |
-| Batch 规整、`W/S` 固定、整批 P99 严格 | Sealed + Executor Resident |
-| 多副本或单 Cohort 无法填满设备 | Sealed + Multi-slot Hybrid |
-| 需要请求级抢占或细粒度优先级 | Request Dynamic Tick |
-| 无法预留完整 Decode window | Coordinator Steps，或缩小 Profile |
-| Graph/静态编译不是硬需求 | 仍可选 sealed + eager Executor |
+### 9.4 本仓库相关设计
 
-本文推荐的是 **sealed membership + whole-cohort admission**；Coordinator-driven 或
-Executor-resident 是可替换的执行策略，不属于外部协议。若 Device postprocess 尚未就绪，先用
-Coordinator Steps；若 profiling 表明每步控制开销显著，再切换 Executor Resident。
-
-### 12.3 为什么默认不跨 Envelope 物理合并
-
-可选的 Envelope coalescing 只在 model/profile、`W/S/L_bucket` 和 stop policy 完全兼容时，将
-多个逻辑 Envelope 物理拼到一个更大 bucket。它能改善 underfilled batch 和 Graph 命中，但会
-引入等待窗口、跨 Batch 拖尾、取消隔离和失败拆分问题。
-
-因此默认 `coalescing_policy=forbid`。只有上游经常提交明显未满的 Batch、吞吐优先于单 Batch
-P99，并且用户显式 `allow` 时才评估；它不是 sealed Cohort 推荐方案的必要组成部分。
-
----
-
-## 13. 实现无关的逻辑组件与契约
-
-### 13.1 Protocol Plane
-
-```text
-BatchEnvelope
-BatchItem
-BatchGenerationSpec
-BatchExecutionPolicy
-BatchAcceptedResponse
-BatchResult
-```
-
-职责：协议校验、token 化边界、幂等、完整 Batch 输出，不持有执行资源。
-
-### 13.2 Control Plane / Cohort Scheduler
-
-```text
-BatchIngress
-ProfileRegistry
-CohortQueue
-CapacityLedger
-CohortScheduler
-ReplicaRouter
-```
-
-职责：
-
-- seal 后入队；
-- Profile 选择；
-- CapacityVector 的原子 reservation；
-- Prefill chunk 进度；
-- Barrier 与状态发布；
-- Batch cancel/failure；
-- 完成后释放。
-
-这些名称表示职责边界，不要求一一映射成类或微服务。
-
-### 13.3 CohortExecutionPlan
-
-Control Plane 交给 Executor 的 plan 建议显式携带：
-
-```text
-cohort_id
-cohort_generation
-profile_id
-stage
-prefill_chunks[(item_idx, token_start, token_count)]
-prompt_lengths[B]
-num_computed_tokens[B]
-decode_state_bindings
-capacity_lease_id
-mode_specific_bindings
-generated_count
-active_item_mask
-is_last_step
-```
-
-`mode_specific_bindings` 只在选定执行 mode 需要时出现，例如 Graph buffer 或 compiled executable；
-eager mode 不需要伪造这些字段。Cohort identity 必须显式携带，不能从 Item ID 命名规则推导。
-
-### 13.4 ModelExecutor / ExecutionSlot
-
-```text
-CohortDecodeSession
-ContextCacheAdapter
-DecodeStateManager
-ExecutionModeAdapter
-BeamPostprocessBackend
-```
-
-职责：消费已经 reservation 的 plan；执行 Prefill、Beam Init、single-step 或 multi-step Decode
-和 Final Select；发布 completion event；不自行决定跨 Batch admission。Context Cache 可以是
-paged 或 dense，Execution Mode 可以是 eager、Graph 或平台静态编译。
-
-### 13.5 Coordinator-driven 的可选 Step Command
-
-如果选择 Coordinator 每 step 驱动，可以使用 Batch 级内部命令：
-
-```text
-CohortStepCommand
-  cohort_id
-  cohort_generation
-  generated_count
-  item_updates[B]
-  active_item_mask[B]
-  is_last_step
-```
-
-这样可以一次验证 `B` 个 Item 的 step 一致性，避免部分 update 已提交、另一部分仍在途的中间
-状态。选择 Executor-resident multi-step 时，这个命令不存在，Executor 只接收一次完整 plan。
-
----
-
-## 14. 按能力演进的落地阶段
-
-### Phase 0：协议与 Executor Contract
-
-- 冻结 `BatchEnvelope V1`、Capability/Profile 和终态语义；
-- 定义 `CohortExecutionPlan` 与 completion contract；
-- 建立幂等、取消、错误码和 Batch 级指标；
-- 用任意正确的 eager Executor 建立黄金结果。
-
-### Phase 1：Sealed Admission 与 Prefill Barrier
-
-- Envelope 成为 CohortScheduler 的 membership 原子；
-- 全批校验、整批 admission、bounded queue；
-- Prefill chunk progress 与全组 barrier；
-- 每个 ExecutionSlot 同时只绑定一个 Cohort；
-- Coordinator-driven step 建立正确性基线。
-
-### Phase 2：Profile 与 Capacity Ledger
-
-- `ExecutionSlot/ContextCache/DecodeState/Workspace/OutputBuffer` 成为一等 credit；
-- 原子 CapacityVector reservation 与 generation-safe release；
-- 明确 `B_bucket/L_bucket/W/S` 和 padding policy；
-- Profile 选择与 E2E SLA 可行性校验。
-
-### Phase 3：优化的 Single-step Executor
-
-- 优化 Beam Top-K、约束 mask、parent 和 Decode-state commit；
-- 可选固定地址 buffer 与 `graph_single_step` adapter；
-- eager 与 compiled/graph backend 保持相同 plan 和结果契约；
-- Item inactive mask 和 step-boundary cancel。
-
-### Phase 4：Executor-resident Multi-step
-
-- 一次下发完整 Cohort plan；
-- Executor 内执行最多 `S - 1` 个增量 step；
-- 控制面只接收最终结果或低频进度；
-- 外部 Batch 协议和 CapacityVector 不变。
-
-### Phase 5：Multi-slot 与 Multi-replica
-
-- ReplicaRouter 按完整 Envelope 和 Profile 路由；
-- 一个副本可发布 `K >= 1` 个独立 ExecutionSlot；
-- 每个 slot 独立 lease、故障域和 completion；
-- Profile-aware queue、aging 和全局 backpressure。
-
-### Phase 6：可选 Stage Overlap 或物理 Coalescing
-
-只有 profiling 证明收益且 P99 可控后，才启用同设备 Prefill/Decode overlap。跨 Envelope 的物理
-coalescing 必须由新协议字段显式 opt-in，保持独立结果、取消和故障语义，默认关闭。
-
----
-
-## 15. 测试与验收
-
-### 15.1 协议测试
-
-- 重复 `batch_id` 和幂等键；
-- 同 key 同 payload 重试；
-- 同 key 不同 payload 冲突；
-- 重复 Item ID；
-- 混合 `W/S/model/catalog revision`；
-- `exact_steps` 恒定输出 `S`，`max_steps` 可因 stop token 提前结束；
-- `include_stop_token=false` 的首 token 终止结果允许为空；
-- 服务端 begin/end 边界 token 不计入 `S`，并按来源从业务结果剥离；
-- 模型正常生成与边界 token 相同 ID 时，不得被结果适配误删；
-- Profile revision 过期；
-- 完整消息和分片 Commit 的等价性。
-
-### 15.2 Sealed Membership 测试
-
-- 一个 Item 非法时整批没有请求进入 Scheduler；
-- 所有 ingress path 都必须经过 Envelope validation 和 whole-cohort admission；
-- Prefill token budget 不足时可多 chunk，但不接纳下一 Envelope；
-- 部分 Item Prefill ready 时不得开始 Decode；
-- 单个长 Prompt 跨 chunk 时，只有 `num_computed_tokens[i] == L_i` 才可通过 Barrier；
-- 重复、重叠、乱序或越界 Prefill range 不得推进 `num_computed_tokens`；
-- `max_steps` 的全部 Item 在 Beam Init 命中 EOS 时，不得再提交增量 Decode；
-- Decode 中途到达的新 Envelope 不得进入 active Cohort；
-- Batch 只有在所有 Item terminal 后才进入对应 Batch 终态。
-
-### 15.3 容量测试
-
-- `B=1,W=512` 必须按 512 Beam lanes 计费；
-- `B=8,W=128` 必须按 1024 Beam lanes 计费；
-- `S=3` 的 BeamKV suffix 只按两个增量 step 建模，并在 step 0、1 后正确终止；
-- Context Cache 足够但 Decode State 不足时不得 admission；
-- `execution_mode=graph_*` 且 Graph credit 不足时不得进入 `ADMITTED`；eager mode 不受此项约束；
-- cancel/failure 后 slot generation 更新，旧 completion 不得污染新 Cohort。
-
-### 15.4 Graph 与 Padding 测试
-
-- `B_actual < B_bucket` 时 dummy lane 不产生业务输出；
-- inactive Item 不污染 live lane；
-- `B=1,W=8` 与 `B=2,W=4` 不误用同一 Graph key；
-- fixed buffer 地址在 Session 生命周期内不变；
-- Graph miss 的 fallback 必须符合 Envelope policy。
-
-### 15.5 多 Batch 时间线测试
-
-构造 E1/E2/E3 在 Prefill、Beam Init、Decode 不同时刻到达，断言：
-
-- 同一 Profile queue 内 FIFO 稳定，跨 queue 选择符合 oldest-feasible/aging；
-- E2/E3 不 late join；
-- E1 的任何 chunk/step 都只包含 E1 Item；
-- E1 release completion 后 E2 才获得相同 slot；
-- 重复运行输出顺序和 Batch metadata 一致。
-
-### 15.6 性能指标
-
-至少记录：
-
-| 指标 | 目的 |
-| --- | --- |
-| `batch_queue_wait_ms` | 观察 nearline 排队与 P99 |
-| `batch_admission_ms` | Profile 和资源 reservation 开销 |
-| `prefill_chunks_per_batch` | 判断 token budget 是否合理 |
-| `prefill_barrier_wait_ms` | 观察长度差和 chunk 尾部等待 |
-| `beam_init_ms` | 首轮候选与 Session 初始化 |
-| `decode_step_ms{step}` | 定位每一步性能 |
-| `cohort_sessions_reserved/used` | 观察 active Cohort Session 容量 |
-| `beam_item_slots_reserved/used` | 观察每个 Cohort 的 Item/Beam group 容量 |
-| `physical_decode_lanes_reserved/live` | 识别固定执行 lane 与 inactive mask 浪费 |
-| `graph_hit/miss/fallback` | 判断 Profile 覆盖率 |
-| `inactive_lane_ratio` | 衡量 EOS/cancel padding 浪费 |
-| `batch_e2e_p50/p95/p99` | 核心 SLA |
-
-吞吐指标应同时区分 `items/s`、`batches/s` 和 `beam-lanes/s`，否则 Beam Width 不同时无法公平
-比较。
-
----
-
-## 16. 最终推荐
-
-对于当前近线、batch 已规整、Prompt 长度相近、固定 `W/S` 的 GR 场景，建议冻结以下决策：
-
-1. 新增强语义 `/v1/gr/batches`，一个完整请求就是一个 sealed Envelope；
-2. V1 使用 `1 Envelope = 1 Cohort`，不拆、不合并、不 late join；
-3. Profile-aware bounded queue；每个 queue 内 FIFO，静态不可行或队列已满才早拒绝，暂时性
-   lease 繁忙则排队；
-4. admission 原子预留 `ExecutionSlot`、`ContextCache`、`DecodeState`、`Workspace` 和
-   `OutputBuffer` credit，Graph 只在对应 execution mode 下预留；
-5. Prefill 可多 chunk，但设置全 Cohort barrier；
-6. Beam Init 后固定 `B_bucket/W/S` 和 Cohort Session binding；
-7. 每个 ExecutionSlot 同时一个 active Cohort；副本可发布 `K >= 1` 个 slot；
-8. Decode driver 可插拔：Coordinator-driven 适合正确性与灵活性，Executor-resident 适合固定
-   `W/S` 的低 P99，二者共享同一协议与 plan；
-9. `exact_steps/max_steps`、`include_stop_token` 和边界 token 归一化显式协商；EOS/cancel 使用
-   inactive mask，不用下一个 Envelope 补位；
-10. capabilities/profile、幂等、错误码和 Batch 状态从第一版纳入协议。
-
-这条路线形成三个相互独立的层：
-
-- **协议层**：sealed Envelope、幂等、Profile、stop 和结果语义；
-- **调度层**：whole-cohort admission、barrier、CapacityVector 和多 slot 路由；
-- **执行层**：eager/graph、paged/dense context cache、Coordinator/Executor-resident loop
-  均可替换。
-
-最重要的是先把 Batch 作为协议和调度对象定义正确，再根据 profiling 选择 forward 在
-Coordinator 还是 Executor 中循环。推荐方案不要求基于任何既有 Runtime；已有系统可以适配，
-新 Runtime 也可以直接实现同一组契约。
-
----
-
-## 17. 非规范性参考与相关文档
-
-以下材料用于理解已有实现和底层数据结构，不是目标方案的依赖：
-
-- [vLLM-GR Decode BeamKV Cache 架构、数据流与容量调度设计](./beam_kv_cache_architecture_and_scheduling_design.md)
-- [Beam Incremental Decode 统一架构设计](./beam_incremental_decode_unified_architecture_design.md)
-- [BeamSearch 优化方案代码分析](./BEAM_SEARCH_OPTIMIZATION_ANALYSIS.md)
-- [xLLM OneRec 五阶段代码走读](../xLLM/onerec_code_walkthrough_detailed.md)
-
----
-
-## 18. 兼容性附录：既有 GR API 的 Token 计数
-
-本节只服务旧接口 adapter，不影响第 6 节的新协议。兼容当前 GR API 时：
-
-```text
-S = max_tokens - reserved_begin - reserved_end
-```
-
-`reserved_begin/reserved_end` 表示旧接口为有效边界配置预留的计数，并不等价于“每条最终 Beam
-都实际包含该 token”：begin 在推理前追加到 Prompt，end 只在循环结束后追加到仍 active 的
-Beam。适配层必须按来源标记并从业务结果排除服务端边界 token，不能按 token ID 全局删除，
-否则会误删模型正常生成的同 ID token。旧 Online 路径可能把追加的边界 token 切进
-`CompletionOutput.token_ids`，因此计数转换和结果归一化必须同时完成。
-
-参考代码：
-
-- [Offline 边界计数与生成循环](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/entrypoints/gr.py#L526-L651)
-- [Offline end token 追加](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/entrypoints/gr.py#L789-L808)
-- [Online 边界计数](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/entrypoints/openai/serving_engine.py#L268-L334)
-- [Online stop token 与结果切片](https://github.com/JiusiServe/vllm-gr/blob/6ece5a625d406ca298e9549f6975c7d1e4631447/vllm_gr/entrypoints/openai/serving_engine.py#L537-L659)
+- [BeamKV Cache 架构与调度](./beam_kv_cache_architecture_and_scheduling_design.md)
+- [Beam 增量 Decode 统一架构](./beam_incremental_decode_unified_architecture_design.md)
+- [Beam Search 优化分析](./BEAM_SEARCH_OPTIMIZATION_ANALYSIS.md)
+- [xLLM OneRec 代码走读](../xLLM/onerec_code_walkthrough_detailed.md)
