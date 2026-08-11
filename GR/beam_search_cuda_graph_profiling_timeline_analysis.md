@@ -14,6 +14,7 @@
 - [4. CUDA Graph 的实际边界](#4-cuda-graph-的实际边界)
 - [5. BeamSearch 后处理在时间线中的位置](#5-beamsearch-后处理在时间线中的位置)
 - [6. CUDA Stream 职责](#6-cuda-stream-职责)
+- [6.4 一次完整 Replay 的端到端时间账本](#64-一次完整-replay-的端到端时间账本)
 - [7. 两张 Decode Graph 之间的时间分析](#7-两张-decode-graph-之间的时间分析)
 - [8. 约 84.8 ms 间隔的分阶段拆解](#8-约-848-ms-间隔的分阶段拆解)
 - [9. D2H 与同步是不是主要瓶颈](#9-d2h-与同步是不是主要瓶颈)
@@ -395,6 +396,241 @@ Stream 13 没有计算 kernel，主要负责 D2H。
 ### 6.3 Stream 25 和 Stream 29
 
 这两条流分别承载两个独立 Graph replay。Stream ID 本身没有固定的 CUDA 语义；“第一步”和“第二步”是由本次程序的 capture/replay 关系赋予的。
+
+
+### 6.4 一次完整 Replay 的端到端时间账本
+
+前面各节解释了 Graph、后处理和 Stream 的职责。本节以 `beam_search_replay_0` 为样本，将一次完整执行从外层 annotation 开始到结束全部计入，防止只分析两张 Graph 之间的局部区间。
+
+#### 6.4.1 总时长与总体设备占用
+
+```text
+outer annotation start = 3448821097190.790 us
+outer annotation end   = 3448821423302.720 us
+total wall span        = 326.112 ms
+```
+
+一次 replay 中所有 GPU activity 的原始累计时间：
+
+| Stream / activity | 事件数 | 累计设备时间 |
+| --- | ---: | ---: |
+| Stream 7 kernel | 577 | 73.760 ms |
+| Stream 7 memcpy | 173 | 0.456 ms |
+| Stream 7 memset | 34 | 0.036 ms |
+| Stream 13 D2H | 12 | 0.032 ms |
+| Stream 25 Graph kernel | 617 | 10.468 ms |
+| Stream 25 memset | 56 | 0.051 ms |
+| Stream 29 Graph kernel | 617 | 10.534 ms |
+| Stream 29 memset | 56 | 0.051 ms |
+| 所有 GPU activity 原始累计 | 2,142 | **95.387 ms** |
+
+如果直接用原始累计值除以外层 wall span：
+
+```text
+95.387 / 326.112 = 29.25%
+```
+
+这不是严格意义上的 GPU utilization，因为不同 Stream 的事件可能重叠，而且 Profiler 会放大 wall span；但它清楚说明，在该 profiled replay 中，绝大多数外层时间没有对应的 GPU activity。
+
+#### 6.4.2 七个端到端阶段
+
+以关键 GPU 边界为锚点，一次完整 replay 可以拆成七个互斥的 wall-time 区间：
+
+| 阶段 | 相对起止 | Wall span | 外层占比 | 主要工作 |
+| --- | --- | ---: | ---: | --- |
+| P0 CPU 请求/输入准备 | 0.000–19.957 ms | 19.957 ms | 6.12% | 外层 replay 进入、Tensor/metadata 准备、首个 GPU 工作提交 |
+| P1 首轮 Eager 执行 | 19.957–96.065 ms | 76.109 ms | 23.34% | 输入初始化、Eager Transformer、LM Head、首轮 Beam 后处理与首轮 D2H |
+| P2 首轮 Beam transition | 96.065–129.200 ms | 33.134 ms | 10.16% | CPU 候选/状态处理、slot/KV metadata、第一张 Graph 输入准备 |
+| P3 Decode Graph 1 + 后处理 | 129.200–141.779 ms | 12.580 ms | 3.86% | Stream 25 Graph 10.819 ms，随后 Stream 7 LM Head/TopK |
+| P4 中间 Beam/KV transition | 141.779–224.813 ms | 83.034 ms | 25.46% | D2H、CPU Beam transition、逐层 KV/state 更新、第二张 Graph 输入准备 |
+| P5 Decode Graph 2 + 后处理 | 224.813–237.725 ms | 12.911 ms | 3.96% | Stream 29 Graph 10.923 ms，随后 Stream 7 LM Head/TopK |
+| P6 Final D2H 与 CPU 收尾 | 237.725–326.112 ms | 88.387 ms | 27.10% | 最终结果回传、sequence/score 整理、输出构造与外层 annotation 退出 |
+| 合计 | 0–326.112 ms | **326.112 ms** | **100%** | 一次完整 profiled replay |
+
+这些区间由相邻关键边界相减得到，因此互不重叠、可以相加回总时长。需要强调：
+
+- P1、P3、P5 是 GPU 计算最集中的阶段；
+- P2、P4、P6 同时包含真实 CPU 业务逻辑、框架调度和 Profiler 放大；
+- P6 的 88.387 ms 不能全部认定为模型计算，它包含最终返回路径和 Profiler 外层 annotation 的收尾；
+- 如果性能指标只关心“最后一个 GPU 结果 ready”，应额外报告 `GPU completion latency`，不要和完整 API/Replay wall latency 混为一个指标。
+
+#### 6.4.3 完整时间线
+
+```mermaid
+gantt
+    title One Complete beam_search_replay_0 Timeline
+    dateFormat X
+    axisFormat %L ms
+
+    section CPU and setup
+    P0 Input preparation        :0, 20
+    P2 First beam transition    :96, 129
+    P4 Middle beam transition   :142, 225
+    P6 Final result and cleanup :238, 326
+
+    section GPU-heavy path
+    P1 Initial eager execution  :20, 96
+    P3 Decode graph 1 and post  :129, 142
+    P5 Decode graph 2 and post  :225, 238
+```
+
+#### 6.4.4 Wall-time 组成
+
+```mermaid
+pie showData
+    title Profiled Replay Wall-Time Composition
+    "P0 CPU input preparation" : 19.957
+    "P1 Initial eager path" : 76.109
+    "P2 First Beam transition" : 33.134
+    "P3 Decode Graph 1 and post" : 12.580
+    "P4 Middle Beam and KV transition" : 83.034
+    "P5 Decode Graph 2 and post" : 12.911
+    "P6 Final D2H and CPU cleanup" : 88.387
+```
+
+从 wall span 看，三个 CPU/control-heavy 阶段：
+
+```text
+P2 + P4 + P6
+= 33.134 + 83.034 + 88.387
+= 204.555 ms
+= 62.73% of the outer replay
+```
+
+再加上 P0 输入准备：
+
+```text
+P0 + P2 + P4 + P6
+= 224.512 ms
+= 68.85% of the outer replay
+```
+
+因此这次 profiled replay 的首要问题不是 Decode Graph 内部的 10–11 ms Transformer，而是 Graph 前后与 step 之间的控制路径。
+
+#### 6.4.5 每个模型步骤的对比
+
+一次 replay 中三个模型步骤的结构并不相同：
+
+| 模型步骤 | 模型执行方式 | 模型/后处理所在流 | 可见阶段跨度 | 说明 |
+| --- | --- | --- | ---: | --- |
+| Initial step | Eager | Stream 7 | P1 = 76.109 ms | 包含初始化、Eager forward、LM Head、后处理和首轮 D2H，不能与纯 Graph replay 直接等价比较 |
+| Decode step 1 | CUDA Graph | Stream 25 + Stream 7 | P3 = 12.580 ms | Graph 10.819 ms；图外 LM Head/TopK 等约 1.76 ms |
+| Decode step 2 | CUDA Graph | Stream 29 + Stream 7 | P5 = 12.911 ms | Graph 10.923 ms；图外 LM Head/TopK 等约 1.99 ms |
+
+两个 Decode step 的 GPU-heavy 阶段高度稳定：
+
+```text
+P3 = 12.580 ms
+P5 = 12.911 ms
+difference = 0.331 ms
+```
+
+相比之下，step transition：
+
+```text
+P4 = 83.034 ms
+```
+
+约为单次 Decode Graph + 后处理的：
+
+```text
+83.034 / 12.580 = 6.60x
+```
+
+因此当前优化一张 10.8 ms Graph 内部的某个小 kernel，即使获得 10% Graph 加速，也只有约 1 ms 量级；而消除中间 CPU Beam/KV transition 才可能获得数量级更大的端到端收益。
+
+#### 6.4.6 P1 首轮 Eager 阶段内部
+
+P1 中最主要的连续 GPU cluster 为：
+
+```text
+start = 3448821121860.032 us
+end   = 3448821193256.110 us
+span  = 71.396 ms
+raw GPU activity sum = 70.260 ms
+```
+
+该 cluster 包含 Transformer GEMM、FlashAttention、KV cache write、LM Head、TopK 以及首轮回传。GPU 在这段时间内较为饱满。
+
+CPU `aten::topk` annotation 的 timestamp 早于部分实际 GPU Transformer kernel，并不意味着 TopK 在模型层中间执行。这是异步 launch/queue 的结果：CPU 已经继续提交后续工作，而 GPU 仍在消费先前排队的 kernel。分析 GPU 顺序时必须使用 GPU timestamp 和 correlation，不能只按 CPU annotation timestamp 判断依赖。
+
+#### 6.4.7 P4 中间 transition 进一步拆分
+
+P4 是最值得优化的中间步骤。以 Graph 1 后处理结束为相对 0 点：
+
+| P4 子阶段 | 相对时间 | Wall span | 可见 GPU activity | 判断 |
+| --- | --- | ---: | ---: | --- |
+| P4.1 结果等待与 D2H | 0–3.436 ms | 3.436 ms | 约 0.024 ms D2H/小操作 | 搬运很短，但建立 CPU 控制边界 |
+| P4.2 CPU Beam 状态整理 | 3.436–57.846 ms | 54.410 ms | GPU 基本空闲 | 数百次 select/copy/view 与 Python 逻辑 |
+| P4.3 Slot/metadata 更新 | 57.846–59.391 ms | 1.545 ms | 约 0.016 ms | GPU 小操作，主要时间仍在调度 |
+| P4.4 KV transition 准备 | 59.391–68.373 ms | 8.982 ms | GPU 基本空闲 | 逐层 KV 调用前的 CPU dispatch |
+| P4.5 28 层 KV/state 更新 | 68.373–72.765 ms | 4.392 ms | 约 1.338 ms | 28 组 elementwise + scatter/gather + D2D |
+| P4.6 下一步 Graph 输入准备 | 72.765–80.455 ms | 7.690 ms | 少量 H2D/D2D | input、block/slot metadata 更新 |
+| P4.7 Graph 2 launch 前尾部 | 80.455–83.034 ms | 2.579 ms | GPU 基本空闲 | CPU launch/Profiler/runtime 尾部 |
+| 合计 | 0–83.034 ms | **83.034 ms** | 约 1–2 ms 有效 GPU | 中间 step 控制瓶颈 |
+
+P4.2 是最大且最明确的 GPU 空洞。P4.4–P4.7 则说明 KV transition 和下一步输入准备仍然是大量 CPU 驱动的小操作，而不是单一 device-resident transaction。
+
+#### 6.4.8 P6 为什么必须单独测量
+
+P6 从第二轮 Graph + 后处理的最后一个 GPU cluster 结束，到外层 `beam_search_replay_0` annotation 退出，跨度约 88.387 ms。其间可见最终 D2H cluster：
+
+```text
+start = 3448821337491.052 us
+end   = 3448821338304.942 us
+span  = 0.814 ms
+raw GPU activity = 0.024 ms
+```
+
+D2H 结束后到外层 annotation 结束仍有约：
+
+```text
+3448821423302.720 - 3448821338304.942
+= 84.998 ms
+```
+
+该区间没有对应的大量 GPU activity，可能包含：
+
+- final sequence/score 构造；
+- Python list/result object 转换；
+- correctness/reference 处理；
+- benchmark harness；
+- Profiler flush/annotation；
+- 外层函数其他 CPU 逻辑。
+
+因此下一次采集必须增加：
+
+```text
+beam.final_select
+beam.final_d2h
+beam.result_build
+beam.api_return
+```
+
+四个独立 NVTX range。否则无法判断这约 85 ms 中有多少属于真正的 serving 返回路径，有多少属于 benchmark/profiler 包装。
+
+#### 6.4.9 性能分析应同时报告的四个指标
+
+后续不要只报告一个“总时间”，建议同时报告：
+
+| 指标 | 起止边界 | 作用 |
+| --- | --- | --- |
+| `model_graph_ms` | cudaGraphLaunch 对应 GPU first/last activity | 判断 Transformer Graph 性能 |
+| `decode_step_gpu_ms` | Graph first kernel 到 Beam postprocess last kernel | 判断单 step 的 GPU-heavy 路径 |
+| `step_transition_wall_ms` | 当前 step 后处理完成到下一 Graph first kernel | 判断 CPU/Beam/KV 控制瓶颈 |
+| `request_wall_ms` | 外层 API/replay 进入到结果返回 | 判断用户可感知端到端延迟 |
+
+本次样本对应：
+
+```text
+model_graph_ms          ~= 10.82 / 10.92 ms
+decode_step_gpu_span_ms ~= 12.58 / 12.91 ms
+step_transition_wall_ms ~= 83.03 ms
+request_wall_ms         ~= 326.11 ms  (with full profiler)
+```
+
+这四个指标可以防止“Graph 内优化有效，但端到端几乎不变”时无法解释收益去向。
+
 
 ---
 
