@@ -9,6 +9,7 @@
 ## 目录
 
 - [1. 结论摘要](#1-结论摘要)
+- [1.1 一页图看懂结论](#11-一页图看懂结论)
 - [2. Trace 基本信息与分析方法](#2-trace-基本信息与分析方法)
 - [3. 一次 BeamSearch Replay 的总体结构](#3-一次-beamsearch-replay-的总体结构)
 - [4. CUDA Graph 的实际边界](#4-cuda-graph-的实际边界)
@@ -62,6 +63,273 @@
 核心判断是：
 
 > 当前主要问题不是某一个 TopK 或 KV gather kernel 太慢，而是 Decode Graph 结束后回到 CPU/Python，执行大量细粒度 BeamSearch 状态整理、逐层 KV 重排和下一步 Graph 输入准备。优化目标应是消除中间 D2H 控制边界、设备化 Beam transition，并将 LM Head、Beam 后处理和 KV transition 纳入稳定地址的 Decode Full Graph。
+
+
+### 1.1 一页图看懂结论
+
+如果只想快速判断性能瓶颈，先看本节六张图；后续章节用于查证具体 timestamp、kernel 和 API。
+
+#### 图 1：一次完整 Replay 的 326 ms 花在哪里
+
+```mermaid
+flowchart LR
+    P0["P0<br/>CPU 输入准备<br/>19.96 ms"]
+    P1["P1<br/>首轮 Eager<br/>76.11 ms"]
+    P2["P2<br/>首轮 Transition<br/>33.13 ms"]
+    P3["P3<br/>Graph 1 + Post<br/>12.58 ms"]
+    P4["P4<br/>中间 Transition<br/>83.03 ms"]
+    P5["P5<br/>Graph 2 + Post<br/>12.91 ms"]
+    P6["P6<br/>Final CPU 收尾<br/>88.39 ms"]
+
+    P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6
+```
+
+颜色无法表达真实长度，因此时间关系应结合下面的比例图理解：
+
+```mermaid
+pie showData
+    title One Profiled Replay: 326.112 ms
+    "GPU-heavy P1/P3/P5" : 101.600
+    "CPU input P0" : 19.957
+    "Beam/KV transitions P2/P4" : 116.168
+    "Final CPU path P6" : 88.387
+```
+
+最直观的结论：
+
+```text
+两次 Decode Graph + 图外后处理
+    = 12.58 + 12.91
+    = 25.49 ms
+
+两段 Beam/KV transition
+    = 33.13 + 83.03
+    = 116.16 ms
+```
+
+Transition 的 profiled wall time约为两个 Decode GPU-heavy 阶段总和的 **4.56 倍**。
+
+---
+
+#### 图 2：四条 CUDA Stream 各自在做什么
+
+```mermaid
+sequenceDiagram
+    participant CPU as CPU/Python
+    participant S7 as Stream 7<br/>Eager/Postprocess
+    participant S13 as Stream 13<br/>D2H
+    participant S25 as Stream 25<br/>Decode Graph 1
+    participant S29 as Stream 29<br/>Decode Graph 2
+
+    CPU->>S7: Initial eager model
+    S7->>S7: LM Head + TopK
+    S7->>S13: Candidate/score tensors
+    S13-->>CPU: First D2H
+    CPU->>CPU: First Beam transition
+
+    CPU->>S25: cudaGraphLaunch
+    S25->>S25: Transformer backbone 10.82 ms
+    S25-->>S7: Final hidden state
+    S7->>S7: LM Head + TopK
+    S7->>S13: 2 x 66048-byte results
+    S13-->>CPU: Intermediate D2H
+    CPU->>CPU: Beam/state processing
+    CPU->>S7: 28-layer KV transition
+
+    CPU->>S29: cudaGraphLaunch
+    S29->>S29: Transformer backbone 10.92 ms
+    S29-->>S7: Final hidden state
+    S7->>S7: LM Head + final TopK
+    S7->>S13: Final results
+    S13-->>CPU: Result construction
+```
+
+读图方法：
+
+- Stream 25/29 很“干净”：只执行固定的 Transformer Graph；
+- Stream 7 很“杂”：既执行 Eager forward，也执行所有 Graph 外后处理和 KV 更新；
+- Stream 13 只负责 D2H；
+- 真正打断连续 GPU decode 的不是 Stream ID，而是 Stream 13 回到 CPU 后触发的 Python transition。
+
+---
+
+#### 图 3：当前 Graph 为什么还不是端到端 Decode Full Graph
+
+```mermaid
+flowchart TB
+    subgraph IN["Already inside one cudaGraphLaunch"]
+        A["Embedding/Input"]
+        B["28 Transformer Layers"]
+        C["Final RMSNorm"]
+        A --> B --> C
+    end
+
+    subgraph OUT["Still outside CUDA Graph"]
+        D["LM Head"]
+        E["LogSoftmax / Argmax / TopK"]
+        F["Beam Score + Parent Select"]
+        G["D2H to CPU"]
+        H["Python Beam Transition"]
+        I["28-layer KV/State Update"]
+        J["Next-step Input Update"]
+        D --> E --> F --> G --> H --> I --> J
+    end
+
+    C -->|"Graph break"| D
+    J -->|"next cudaGraphLaunch"| A
+```
+
+当前所谓“Full Graph”只覆盖模型 backbone：
+
+```text
+Embedding -> Transformer -> Final RMSNorm
+```
+
+vLLM-GR 真正需要的 Decode Full Graph 是：
+
+```text
+Backbone -> LM Head -> Beam Select -> KV Transition -> Next Input
+```
+
+---
+
+#### 图 4：把最关键的 83.03 ms 放大
+
+```mermaid
+flowchart LR
+    A["D2H/等待<br/>3.44 ms"]
+    B["CPU Beam 整理<br/>54.41 ms"]
+    C["Slot/Metadata<br/>1.55 ms"]
+    D["KV 准备<br/>8.98 ms"]
+    E["28 层 KV 更新<br/>4.39 ms"]
+    F["下一步输入<br/>7.69 ms"]
+    G["Launch 尾部<br/>2.58 ms"]
+
+    A --> B --> C --> D --> E --> F --> G
+```
+
+```mermaid
+pie showData
+    title Middle Beam/KV Transition: 83.034 ms
+    "D2H and wait" : 3.436
+    "CPU Beam processing" : 54.410
+    "Slot metadata" : 1.545
+    "KV preparation" : 8.982
+    "28-layer KV update" : 4.392
+    "Next graph input" : 7.690
+    "Launch tail" : 2.579
+```
+
+这张图说明：
+
+- 最大项是 CPU Beam 状态整理，占该 transition 的约 **65.5%**；
+- 28 层 KV 更新的时间线跨度只有 4.39 ms；
+- D2H 搬运不是最大项；
+- 优化单个 KV gather kernel不会解决 54 ms CPU 空洞。
+
+---
+
+#### 图 5：为什么 66 KB D2H 不是搬运瓶颈，却仍是架构瓶颈
+
+```mermaid
+flowchart TB
+    A["GPU candidates/scores"]
+    B["D2H<br/>2 x 66048 bytes<br/>about 14 us device time"]
+    C["CPU reads results"]
+    D["Hundreds of select/copy/view ops"]
+    E["Rebuild device tensors"]
+    F["H2D/D2D metadata updates"]
+    G["Next Graph replay"]
+
+    A --> B --> C --> D --> E --> F --> G
+```
+
+```text
+数据搬运成本很小
+        !=
+D2H 控制边界没有成本
+```
+
+真正昂贵的是 D2H 之后的控制链。也就是说，应当优化“为什么中间 step 必须回 CPU”，而不是只优化 PCIe 带宽。
+
+---
+
+#### 图 6：瓶颈证据如何对应到优化动作
+
+```mermaid
+flowchart LR
+    A["551 select<br/>586 copy_<br/>728 as_strided"]
+    B["Python per-Beam loop"]
+    C["Device BeamTransition kernel"]
+    D["28 x layer updates"]
+    E["Python per-layer dispatch"]
+    F["All-layer KV transition"]
+    G["Intermediate D2H"]
+    H["CPU control boundary"]
+    I["Device-resident state"]
+
+    A --> B --> C
+    D --> E --> F
+    G --> H --> I
+```
+
+对应关系：
+
+| Trace 证据 | 性能含义 | 首选改造 |
+| --- | --- | --- |
+| 551 次 `select`、586 次 `copy_` | Beam/candidate 被逐项处理 | 单个向量化或 Triton BeamTransition |
+| 28 组 scatter/gather/D2D | KV transition 按层下发 | 单 facade、all-layer op 或纳入 Graph |
+| 中间 2 × 66,048-byte D2H | step 控制权回到 CPU | Beam state 常驻 device |
+| Graph 只到 final RMSNorm | LM Head/TopK 尚在图外 | 逐步扩大 Graph 边界 |
+| Stream 7 大量空洞 | CPU launch/dispatch 驱动 GPU | 固定地址 Buffer + 单次 replay |
+
+---
+
+#### 图 7：优化前后的目标执行形态
+
+当前执行：
+
+```mermaid
+flowchart TB
+    A["CUDA Graph<br/>Transformer"]
+    B["Eager LM Head"]
+    C["Eager TopK"]
+    D["D2H"]
+    E["Python Beam Logic"]
+    F["Per-layer KV Update"]
+    G["Prepare Next Inputs"]
+
+    A --> B --> C --> D --> E --> F --> G
+    G --> A
+```
+
+目标执行：
+
+```mermaid
+flowchart TB
+    subgraph FULL["One Decode Full Graph"]
+        A["Transformer"]
+        B["LM Head"]
+        C["Constrained TopK"]
+        D["Global Beam Select"]
+        E["Beam/KV Transition"]
+        F["Next Input Update"]
+        A --> B --> C --> D --> E --> F
+    end
+
+    F -->|"next replay"| A
+    F -->|"final step only"| H["D2H Final Result"]
+```
+
+目标不是简单地把更多 kernel 圈进 Graph，而是让中间 step 的状态保持在设备端：
+
+```text
+No intermediate D2H
+No Python per-Beam loop
+No Python per-layer KV loop
+One stable-address Decode replay per step
+```
+
 
 ---
 
