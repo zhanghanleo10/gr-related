@@ -104,10 +104,11 @@ flowchart TD
 
 在 cache miss/disabled，且 group 指切块后的 planned microbatch 时：
 
-\[
-\text{forwards per tick}
-= \#\text{Prefill groups} + \#\text{Decode groups}
-\]
+```text
+forwards_per_tick
+  = executed_prefill_microbatches
+  + executed_decode_microbatches
+```
 
 Cache exact hit 可能不执行 Prefill model forward，prefix extension 也可能走额外路径。在单设备
 上，实际产生的 group forward 通常是**顺序调用**，不是把多个自回归 forward 同时算完。
@@ -437,11 +438,9 @@ block rounding 共同决定；`BeamSearchStateCredit` 覆盖 score、parent、ma
 Graph executable 命中本身不是通用 credit；只有 `fallback_policy=reject` 时，Profile/Graph 命中
 才是 admission 前置条件。
 
-\[
-\operatorname{Admit}(E)
-\iff
-\forall r,\ \operatorname{Need}_{r}(E) \leq \operatorname{Free}_{r}
-\]
+```text
+Admit(E) iff Need_r(E) <= Free_r for every resource r
+```
 
 ```mermaid
 flowchart TD
