@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1260" viewBox="0 0 1600 1260" role="img" aria-labelledby="title desc">
+  <title id="title">Kimi K3 KV Cache: 69 fixed-state KDA layers and 24 paged Gated MLA layers</title>
+  <desc id="desc">A four-stage engineering diagram showing the layer split, per-layer state layout, one-thousand-token storage, and coordinated prefix-cache management for Kimi K3 in vLLM.</desc>
+  <defs>
+    <style>
+      .bg{fill:#f8fafc}.panel{fill:#fff;stroke:#cbd5e1;stroke-width:2}.title{font:500 34px Inter,"Noto Sans SC",Arial,sans-serif;fill:#0f172a}.sub{font:400 18px Inter,"Noto Sans SC",Arial,sans-serif;fill:#475569}.step{font:500 20px Inter,"Noto Sans SC",Arial,sans-serif;fill:#fff}.h{font:500 24px Inter,"Noto Sans SC",Arial,sans-serif;fill:#0f172a}.label{font:500 18px Inter,"Noto Sans SC",Arial,sans-serif;fill:#0f172a}.small{font:400 15px Inter,"Noto Sans SC",Arial,sans-serif;fill:#334155}.tiny{font:400 13px Inter,"Noto Sans SC",Arial,sans-serif;fill:#475569}.white{fill:#fff}.blue{fill:#dbeafe;stroke:#3b82f6;stroke-width:2}.teal{fill:#ccfbf1;stroke:#14b8a6;stroke-width:2}.purple{fill:#f3e8ff;stroke:#a855f7;stroke-width:2}.amber{fill:#fef3c7;stroke:#f59e0b;stroke-width:2}.slate{fill:#e2e8f0;stroke:#64748b;stroke-width:2}.pool{fill:#0f172a}.line{stroke:#64748b;stroke-width:2;fill:none}.arrow{stroke:#334155;stroke-width:2.5;fill:none;marker-end:url(#arrow)}.dash{stroke:#94a3b8;stroke-width:2;stroke-dasharray:8 7;fill:none}.empty{fill:#f1f5f9}.mono{font:500 15px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#0f172a}
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#334155"/></marker>
+  </defs>
+  <rect class="bg" width="1600" height="1260"/>
+  <text class="title" x="70" y="58">Kimi K3 · KV Cache 从层类型到 Hybrid 管理</text>
+  <text class="sub" x="70" y="90">关键不是 93 层都做 Paged KV，而是 69 层固定状态 + 24 层逐 token latent</text>
+
+  <!-- STEP 1 -->
+  <rect class="panel" x="55" y="120" width="1490" height="225" rx="22"/>
+  <circle cx="90" cy="160" r="22" fill="#0f766e"/><text class="step" x="90" y="167" text-anchor="middle">1</text>
+  <text class="h" x="125" y="168">93 层先按 Cache 语义拆成两类</text>
+  <rect class="pool" x="105" y="210" width="230" height="82" rx="16"/><text class="white label" x="220" y="246" text-anchor="middle">Kimi K3</text><text class="white small" x="220" y="274" text-anchor="middle">93 transformer layers</text>
+  <path class="arrow" d="M335 240L475 220"/><path class="arrow" d="M335 270L970 282"/>
+  <rect class="teal" x="475" y="184" width="420" height="76" rx="16"/><text class="label" x="685" y="216" text-anchor="middle">69 × KDA layers</text><text class="small" x="685" y="244" text-anchor="middle">保存固定 conv / recurrent state</text>
+  <rect class="purple" x="970" y="252" width="480" height="76" rx="16"/><text class="label" x="1210" y="284" text-anchor="middle">24 × Gated MLA layers</text><text class="small" x="1210" y="312" text-anchor="middle">每 token 保存一个 576-element latent</text>
+
+  <!-- STEP 2 -->
+  <rect class="panel" x="55" y="370" width="1490" height="290" rx="22"/>
+  <circle cx="90" cy="410" r="22" fill="#0f766e"/><text class="step" x="90" y="417" text-anchor="middle">2</text>
+  <text class="h" x="125" y="418">单层物理内容：KDA 是状态快照，MLA 才是逐 token page</text>
+
+  <text class="label" x="115" y="477">一个 KDA 层 / TP rank</text>
+  <rect class="teal" x="115" y="500" width="420" height="90" rx="14"/><text class="label" x="325" y="536" text-anchor="middle">Conv state</text><text class="mono" x="325" y="568" text-anchor="middle">[3, 36864 / TP] · BF16</text>
+  <text class="label" x="625" y="477">+</text>
+  <rect class="blue" x="680" y="500" width="450" height="90" rx="14"/><text class="label" x="905" y="536" text-anchor="middle">Recurrent state</text><text class="mono" x="905" y="568" text-anchor="middle">[96 / TP, 128, 128] · FP32</text>
+  <rect class="slate" x="1210" y="500" width="250" height="90" rx="14"/><text class="label" x="1335" y="536" text-anchor="middle">O(1)</text><text class="small" x="1335" y="568" text-anchor="middle">长度增加，大小不变</text>
+
+  <text class="label" x="115" y="630">一个 Gated MLA token</text>
+  <rect class="purple" x="390" y="607" width="650" height="38" rx="8"/><rect class="amber" x="1040" y="607" width="180" height="38" rx="8"/><text class="small" x="715" y="633" text-anchor="middle">512 latent</text><text class="small" x="1130" y="633" text-anchor="middle">64 PE tail</text><text class="mono" x="1380" y="633" text-anchor="middle">576 × BF16 = 1152 B</text>
+
+  <!-- STEP 3 -->
+  <rect class="panel" x="55" y="685" width="1490" height="300" rx="22"/>
+  <circle cx="90" cy="725" r="22" fill="#0f766e"/><text class="step" x="90" y="732" text-anchor="middle">3</text>
+  <text class="h" x="125" y="733">1000 token：只有 MLA 历史随长度增长</text>
+
+  <rect class="teal" x="105" y="780" width="570" height="145" rx="18"/>
+  <text class="label" x="390" y="818" text-anchor="middle">KDA state group · 69 layers</text>
+  <rect x="145" y="840" width="220" height="48" rx="8" fill="#99f6e4"/><rect x="365" y="840" width="250" height="48" rx="8" fill="#bfdbfe"/>
+  <text class="small" x="255" y="870" text-anchor="middle">conv state</text><text class="small" x="490" y="870" text-anchor="middle">recurrent state</text>
+  <text class="small" x="390" y="912" text-anchor="middle">token 1 → 1000：仍是一份 rolling state</text>
+
+  <path class="arrow" d="M675 852H760"/>
+  <rect class="purple" x="760" y="780" width="700" height="145" rx="18"/>
+  <text class="label" x="1110" y="818" text-anchor="middle">MLA paged group · 24 layers</text>
+  <g>
+    <rect x="800" y="840" width="100" height="48" rx="7" fill="#e9d5ff" stroke="#a855f7"/><rect x="900" y="840" width="100" height="48" rx="7" fill="#e9d5ff" stroke="#a855f7"/><rect x="1000" y="840" width="100" height="48" rx="7" fill="#e9d5ff" stroke="#a855f7"/><rect x="1100" y="840" width="100" height="48" rx="7" fill="#e9d5ff" stroke="#a855f7"/><rect x="1200" y="840" width="100" height="48" rx="7" fill="#e9d5ff" stroke="#a855f7"/><rect x="1300" y="840" width="120" height="48" rx="7" fill="#f1f5f9" stroke="#a855f7"/>
+    <text class="mono" x="850" y="870" text-anchor="middle">B</text><text class="mono" x="950" y="870" text-anchor="middle">B</text><text class="mono" x="1050" y="870" text-anchor="middle">B</text><text class="mono" x="1150" y="870" text-anchor="middle">…</text><text class="mono" x="1250" y="870" text-anchor="middle">B</text><text class="mono" x="1360" y="870" text-anchor="middle">tail</text>
+  </g>
+  <text class="small" x="1110" y="912" text-anchor="middle">每层 1000 entries = ceil(1000 / B) pages</text>
+  <text class="label" x="1110" y="955" text-anchor="middle">24 层有效 latent payload ≈ 27.65 MB</text>
+
+  <!-- STEP 4 -->
+  <rect class="panel" x="55" y="1010" width="1490" height="200" rx="22"/>
+  <circle cx="90" cy="1050" r="22" fill="#0f766e"/><text class="step" x="90" y="1057" text-anchor="middle">4</text>
+  <text class="h" x="125" y="1058">Hybrid 管理：两套 Cache 语义，必须在同一个可恢复 prefix 边界汇合</text>
+  <rect class="teal" x="125" y="1100" width="330" height="70" rx="14"/><text class="label" x="290" y="1128" text-anchor="middle">KDA state group</text><text class="small" x="290" y="1154" text-anchor="middle">rolling previous / current</text>
+  <rect class="purple" x="520" y="1100" width="330" height="70" rx="14"/><text class="label" x="685" y="1128" text-anchor="middle">MLA Paged group</text><text class="small" x="685" y="1154" text-anchor="middle">block table / hash / refcount</text>
+  <path class="arrow" d="M455 1135H480V1080H900V1115H940"/><path class="arrow" d="M850 1135H940"/>
+  <rect class="pool" x="940" y="1092" width="300" height="86" rx="16"/><text class="white label" x="1090" y="1127" text-anchor="middle">Hybrid Coordinator</text><text class="white small" x="1090" y="1155" text-anchor="middle">取共同最长 prefix hit</text>
+  <path class="arrow" d="M1240 1135H1325"/>
+  <rect class="amber" x="1325" y="1098" width="170" height="74" rx="14"/><text class="label" x="1410" y="1128" text-anchor="middle">继续 decode</text><text class="small" x="1410" y="1155" text-anchor="middle">边界一致</text>
+
+  <text class="label" x="800" y="1240" text-anchor="middle">核心：KDA state 不是 Paged KV；它与 MLA page 分组保存，由 coordinator 对齐生命周期和 prefix 命中</text>
+</svg>

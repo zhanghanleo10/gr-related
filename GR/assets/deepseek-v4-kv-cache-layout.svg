@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1420" viewBox="0 0 1600 1420" role="img" aria-labelledby="title desc">
+  <title id="title">DeepSeek V4 KV Cache: semantic caches, 1000-token pages, group allocation, and packed GPU backing</title>
+  <desc id="desc">A four-stage engineering diagram showing which caches C4A and C128A layers store, how one thousand tokens map to compressed entries and sliding-window pages, how request-local block tables obtain global block IDs, and how separate cache groups occupy rows of one packed GPU backing.</desc>
+  <defs>
+    <style>
+      .bg{fill:#f8fafc}.panel{fill:#fff;stroke:#cbd5e1;stroke-width:2}.title{font:500 34px Inter,"Noto Sans SC",Arial,sans-serif;fill:#0f172a}.sub{font:400 18px Inter,"Noto Sans SC",Arial,sans-serif;fill:#475569}.step{font:500 20px Inter,"Noto Sans SC",Arial,sans-serif;fill:#fff}.h{font:500 24px Inter,"Noto Sans SC",Arial,sans-serif;fill:#0f172a}.label{font:500 18px Inter,"Noto Sans SC",Arial,sans-serif;fill:#0f172a}.small{font:400 15px Inter,"Noto Sans SC",Arial,sans-serif;fill:#334155}.tiny{font:400 13px Inter,"Noto Sans SC",Arial,sans-serif;fill:#475569}.white{fill:#fff}.blue{fill:#dbeafe;stroke:#3b82f6;stroke-width:2}.green{fill:#dcfce7;stroke:#22c55e;stroke-width:2}.amber{fill:#fef3c7;stroke:#f59e0b;stroke-width:2}.purple{fill:#f3e8ff;stroke:#a855f7;stroke-width:2}.rose{fill:#ffe4e6;stroke:#f43f5e;stroke-width:2}.slate{fill:#e2e8f0;stroke:#64748b;stroke-width:2}.pool{fill:#0f172a}.line{stroke:#64748b;stroke-width:2;fill:none}.arrow{stroke:#334155;stroke-width:2.5;fill:none;marker-end:url(#arrow)}.dash{stroke:#94a3b8;stroke-width:2;stroke-dasharray:8 7;fill:none}.mask{fill:#cbd5e1}.empty{fill:#f1f5f9}.divider{stroke:#cbd5e1;stroke-width:1.5}.mono{font:500 15px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#0f172a}
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#334155"/></marker>
+    <pattern id="diag" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="10" height="10" fill="#e2e8f0"/><line x1="0" y1="0" x2="0" y2="10" stroke="#94a3b8" stroke-width="4"/></pattern>
+  </defs>
+  <rect class="bg" width="1600" height="1420"/>
+  <text class="title" x="70" y="58">DeepSeek V4 · KV Cache 从语义到显存</text>
+  <text class="sub" x="70" y="90">同一种 attention 里存在多类 cache；逻辑上分组，物理上共享全局 block pool / backing</text>
+
+  <!-- STEP 1 -->
+  <rect class="panel" x="55" y="120" width="1490" height="275" rx="22"/>
+  <circle cx="90" cy="160" r="22" fill="#2563eb"/><text class="step" x="90" y="167" text-anchor="middle">1</text>
+  <text class="h" x="125" y="168">单层先分清：到底需要保存哪些 Cache</text>
+  <rect class="pool" x="95" y="210" width="210" height="92" rx="16"/>
+  <text class="white label" x="200" y="246" text-anchor="middle">Attention layer</text><text class="white small" x="200" y="274" text-anchor="middle">按层类型选择 cache spec</text>
+  <path class="arrow" d="M305 246H370"/><path class="arrow" d="M305 280H370"/>
+  <rect class="blue" x="370" y="200" width="170" height="68" rx="14"/><text class="label" x="455" y="242" text-anchor="middle">C4A layer</text>
+  <rect class="purple" x="370" y="294" width="170" height="68" rx="14"/><text class="label" x="455" y="336" text-anchor="middle">C128A layer</text>
+
+  <path class="line" d="M540 234H580V188H615M580 234V228H615M580 234V268H615M580 234V308H615M580 234V348H615"/>
+  <rect class="green" x="615" y="164" width="230" height="48" rx="10"/><text class="small" x="730" y="194" text-anchor="middle">SWA KV · 最近 128 token</text>
+  <rect class="blue" x="615" y="220" width="230" height="48" rx="10"/><text class="small" x="730" y="250" text-anchor="middle">C4 Main KV · L/4 entries</text>
+  <rect class="amber" x="615" y="276" width="230" height="48" rx="10"/><text class="small" x="730" y="306" text-anchor="middle">Main compressor state</text>
+  <rect class="rose" x="615" y="332" width="230" height="48" rx="10"/><text class="small" x="730" y="362" text-anchor="middle">C4 Indexer · L/4 keys</text>
+  <path class="arrow" d="M845 356H870"/>
+  <rect class="amber" x="870" y="332" width="230" height="48" rx="10"/><text class="small" x="985" y="362" text-anchor="middle">Indexer compressor state</text>
+
+  <path class="line" d="M540 328H1145V188H1180M1145 328V248H1180M1145 328V308H1180"/>
+  <rect class="green" x="1180" y="164" width="280" height="48" rx="10"/><text class="small" x="1320" y="194" text-anchor="middle">SWA KV · 最近 128 token</text>
+  <rect class="purple" x="1180" y="224" width="280" height="48" rx="10"/><text class="small" x="1320" y="254" text-anchor="middle">C128 Main KV · L/128 entries</text>
+  <rect class="amber" x="1180" y="284" width="280" height="48" rx="10"/><text class="small" x="1320" y="314" text-anchor="middle">Main compressor state</text>
+  <text class="tiny" x="1320" y="358" text-anchor="middle">C128A 不需要 C4 Indexer</text>
+
+  <!-- STEP 2 -->
+  <rect class="panel" x="55" y="420" width="1490" height="355" rx="22"/>
+  <circle cx="90" cy="460" r="22" fill="#2563eb"/><text class="step" x="90" y="467" text-anchor="middle">2</text>
+  <text class="h" x="125" y="468">1000 token：原始 token 范围 ≠ 物理 entry 数</text>
+  <text class="small" x="115" y="515">原始 token</text>
+  <rect class="slate" x="300" y="488" width="280" height="54" rx="8"/><rect class="slate" x="580" y="488" width="280" height="54" rx="8"/><rect class="slate" x="860" y="488" width="280" height="54" rx="8"/><rect class="slate" x="1140" y="488" width="280" height="54" rx="8"/>
+  <text class="mono" x="440" y="521" text-anchor="middle">0..255</text><text class="mono" x="720" y="521" text-anchor="middle">256..511</text><text class="mono" x="1000" y="521" text-anchor="middle">512..767</text><text class="mono" x="1280" y="521" text-anchor="middle">768..1023*</text>
+
+  <text class="small" x="115" y="592">C4 Main / Indexer</text>
+  <rect class="blue" x="300" y="560" width="280" height="50" rx="8"/><rect class="blue" x="580" y="560" width="280" height="50" rx="8"/><rect class="blue" x="860" y="560" width="280" height="50" rx="8"/><rect class="blue" x="1140" y="560" width="254" height="50" rx="8"/><rect class="empty" x="1394" y="560" width="26" height="50" rx="4"/>
+  <text class="mono" x="440" y="591" text-anchor="middle">64 / 64</text><text class="mono" x="720" y="591" text-anchor="middle">64 / 64</text><text class="mono" x="1000" y="591" text-anchor="middle">64 / 64</text><text class="mono" x="1280" y="591" text-anchor="middle">58 / 64</text>
+
+  <text class="small" x="115" y="658">C128 Main</text>
+  <rect class="purple" x="300" y="626" width="280" height="50" rx="8"/><rect class="purple" x="580" y="626" width="280" height="50" rx="8"/><rect class="purple" x="860" y="626" width="280" height="50" rx="8"/><rect class="purple" x="1140" y="626" width="140" height="50" rx="8"/><rect class="empty" x="1280" y="626" width="140" height="50" rx="4"/>
+  <text class="mono" x="440" y="657" text-anchor="middle">2 / 2</text><text class="mono" x="720" y="657" text-anchor="middle">2 / 2</text><text class="mono" x="1000" y="657" text-anchor="middle">2 / 2</text><text class="mono" x="1280" y="657" text-anchor="middle">1 / 2</text>
+
+  <text class="small" x="115" y="724">SWA window</text>
+  <rect x="760" y="692" width="280" height="52" rx="8" fill="url(#diag)" stroke="#64748b" stroke-width="2"/><rect class="green" x="935" y="692" width="105" height="52" rx="2"/>
+  <rect class="green" x="1040" y="692" width="280" height="52" rx="8"/><rect class="green" x="1320" y="692" width="175" height="52" rx="8"/><rect class="empty" x="1495" y="692" width="25" height="52" rx="4"/>
+  <text class="tiny" x="900" y="723" text-anchor="middle">832..871 mask</text><text class="mono" x="987" y="723" text-anchor="middle">872..895</text><text class="mono" x="1180" y="723" text-anchor="middle">896..959</text><text class="mono" x="1407" y="723" text-anchor="middle">960..999</text>
+
+  <!-- STEP 3 -->
+  <rect class="panel" x="55" y="800" width="1490" height="285" rx="22"/>
+  <circle cx="90" cy="840" r="22" fill="#2563eb"/><text class="step" x="90" y="847" text-anchor="middle">3</text>
+  <text class="h" x="125" y="848">每个 Group 有自己的 Block Table，但都从一个 Global BlockPool 领 ID</text>
+  <text class="label" x="105" y="902">Request A</text>
+  <text class="tiny" x="105" y="932">ID 只表示 backing row 的所有权</text>
+
+  <rect class="blue" x="350" y="880" width="405" height="44" rx="9"/><text class="small" x="370" y="908">C4 Main table</text><text class="mono" x="610" y="908">[17, 23, 35, 72]</text>
+  <rect class="amber" x="350" y="934" width="405" height="44" rx="9"/><text class="small" x="370" y="962">Main state table</text><text class="mono" x="650" y="962">[41]</text>
+  <rect class="rose" x="350" y="988" width="405" height="44" rx="9"/><text class="small" x="370" y="1016">Indexer table</text><text class="mono" x="610" y="1016">[52, 58, 60, 79]</text>
+
+  <path class="arrow" d="M755 902H900"/><path class="arrow" d="M755 956H900"/><path class="arrow" d="M755 1010H900"/>
+  <rect class="pool" x="900" y="872" width="255" height="174" rx="18"/>
+  <text class="white label" x="1028" y="908" text-anchor="middle">Global BlockPool</text>
+  <g class="mono">
+    <rect x="932" y="932" width="44" height="36" rx="6" fill="#dbeafe"/><text x="954" y="956" text-anchor="middle">17</text>
+    <rect x="986" y="932" width="44" height="36" rx="6" fill="#fef3c7"/><text x="1008" y="956" text-anchor="middle">41</text>
+    <rect x="1040" y="932" width="44" height="36" rx="6" fill="#ffe4e6"/><text x="1062" y="956" text-anchor="middle">52</text>
+    <rect x="1094" y="932" width="44" height="36" rx="6" fill="#dcfce7"/><text x="1116" y="956" text-anchor="middle">66</text>
+  </g>
+  <text class="white tiny" x="1028" y="1000" text-anchor="middle">同一 ID 同时只属于一个 group</text>
+  <path class="arrow" d="M1155 958H1240"/>
+  <rect class="slate" x="1240" y="884" width="250" height="150" rx="16"/><text class="label" x="1365" y="920" text-anchor="middle">Coordinator</text><text class="small" x="1365" y="955" text-anchor="middle">统一 refcount / eviction</text><text class="small" x="1365" y="984" text-anchor="middle">统一 prefix 命中边界</text><text class="small" x="1365" y="1013" text-anchor="middle">统一 request 生命周期</text>
+
+  <!-- STEP 4 -->
+  <rect class="panel" x="55" y="1110" width="1490" height="255" rx="22"/>
+  <circle cx="90" cy="1150" r="22" fill="#2563eb"/><text class="step" x="90" y="1157" text-anchor="middle">4</text>
+  <text class="h" x="125" y="1158">物理显存：一个 packed backing；每个 Block ID 占一整行</text>
+  <text class="tiny" x="110" y="1203">block_stride = max(group 内所有 layer page bytes 之和)</text>
+
+  <text class="mono" x="105" y="1252">ID 17</text><rect class="blue" x="185" y="1222" width="320" height="52" rx="6"/><rect class="blue" x="505" y="1222" width="320" height="52" rx="6"/><rect class="blue" x="825" y="1222" width="320" height="52" rx="6"/><rect class="empty" x="1145" y="1222" width="340" height="52" rx="6"/>
+  <text class="small" x="345" y="1254" text-anchor="middle">C4 Main · layer 0 page</text><text class="small" x="665" y="1254" text-anchor="middle">layer 1 page</text><text class="small" x="985" y="1254" text-anchor="middle">… layer N</text><text class="tiny" x="1315" y="1254" text-anchor="middle">padding</text>
+
+  <text class="mono" x="105" y="1322">ID 41</text><rect class="amber" x="185" y="1292" width="205" height="52" rx="6"/><rect class="amber" x="390" y="1292" width="205" height="52" rx="6"/><rect class="amber" x="595" y="1292" width="205" height="52" rx="6"/><rect class="empty" x="800" y="1292" width="685" height="52" rx="6"/>
+  <text class="small" x="287" y="1324" text-anchor="middle">state · layer 0</text><text class="small" x="492" y="1324" text-anchor="middle">layer 1</text><text class="small" x="697" y="1324" text-anchor="middle">… layer N</text><text class="tiny" x="1142" y="1324" text-anchor="middle">unused row bytes / padding</text>
+
+  <rect x="55" y="1384" width="1490" height="2" fill="#cbd5e1"/>
+  <text class="label" x="800" y="1408" text-anchor="middle">核心：State 单独占 Block ID，但不单独建显存池；不同 Group 通过同一个 backing 动态共享容量</text>
+</svg>
