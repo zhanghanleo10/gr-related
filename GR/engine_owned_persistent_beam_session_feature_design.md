@@ -42,8 +42,11 @@ Serving 计算下一步 Beam
 
 ~~~mermaid
 flowchart TB
-    ON["Online Serving Adapter"]
-    OFF["Offline Adapter"]
+    subgraph ENTRY["Peer Frontends"]
+        direction LR
+        ON["Online Serving Adapter"]
+        OFF["Offline API Adapter"]
+    end
     API["Engine Beam API"]
     CTRL["BeamSearchController"]
     SCH["Scheduler + Persistent Request"]
@@ -220,7 +223,7 @@ flowchart LR
 flowchart TB
     subgraph FRONTEND["Frontend"]
         ONLINE["Online Serving Adapter"]
-        OFFLINE["Offline Batch Adapter"]
+        OFFLINE["Offline API Adapter"]
     end
 
     subgraph ENGINE["EngineCore"]
@@ -306,9 +309,107 @@ class EngineBeamAPI:
 
 ---
 
-## 5. 五个核心抽象
+## 5. Online Serving 与 Offline API：同等 Frontend
 
-### 5.1 BeamSearchController：纯算法状态机
+Online Serving 和 Offline API 是两个平级入口。二者都直接调用 EngineBeamAPI，任何一方都不
+通过另一方间接进入 Engine，也不在自己的入口层保存 Beam 主循环。
+
+~~~mermaid
+flowchart TB
+    subgraph ENTRY["Peer Frontends"]
+        ON["Online Serving"]
+        OFF["Offline API"]
+    end
+
+    API["EngineBeamAPI"]
+    CORE["Engine-owned Beam Session"]
+    SCH["Scheduler + Persistent Request"]
+    EXEC["Worker / ModelRunner"]
+
+    ON --> API
+    OFF --> API
+    API --> CORE
+    CORE --> SCH
+    SCH --> EXEC
+~~~
+
+### 5.1 共用内核
+
+| 能力 | Online Serving | Offline API |
+| --- | --- | --- |
+| EngineBeamAPI | 共用 | 共用 |
+| BeamSearchController | 共用 | 共用 |
+| Persistent Request | 共用 | 共用 |
+| Prefix KV lifecycle | 共用 | 共用 |
+| Scheduler continuation | 共用 | 共用 |
+| Constraint registry | 共用 | 共用 |
+| BeamFinalResult | 共用 | 共用 |
+
+### 5.2 入口差异
+
+| 维度 | Online Serving | Offline API |
+| --- | --- | --- |
+| 调用方式 | 动态请求 | 单请求或请求列表 |
+| 优化目标 | P99、取消响应、请求隔离 | 吞吐、批量完成时间 |
+| admission | 按在线到达准入 | 可利用已知 batch 信息 |
+| scheduling policy | 可采用 run-to-completion | 可采用 multi-session cohort |
+| 输出适配 | OpenAI RequestOutput | list、tensor 或 batch result |
+| 失败语义 | 单请求终态 | 单 Session 隔离与 job policy |
+
+这些差异只属于 Adapter 和 SchedulingPolicy，不改变 Session、Controller、Request 或 Worker
+执行协议。
+
+### 5.3 Offline 多 Session
+
+~~~mermaid
+flowchart TB
+    B["Offline request list"]
+    A["Batch admission"]
+    R1["Session A persistent request"]
+    R2["Session B persistent request"]
+    R3["Session C persistent request"]
+    G["Scheduler ready set"]
+    X["Shape-compatible execution batch"]
+    O["Independent final results"]
+
+    B --> A
+    A --> R1
+    A --> R2
+    A --> R3
+    R1 --> G
+    R2 --> G
+    R3 --> G
+    G --> X
+    X --> R1
+    X --> R2
+    X --> R3
+    R1 --> O
+    R2 --> O
+    R3 --> O
+~~~
+
+每个 Session 保持独立的 Controller、Request、Prefix KV、step、epoch 和终态。多个 Session
+可以组成一个物理 execution batch，但不能被合并成一个逻辑 Request。
+
+### 5.4 Policy 接口
+
+~~~python
+class BeamSchedulingPolicy(Protocol):
+    def select_ready_sessions(
+        self,
+        ready: Sequence[PersistentBeamRequestState],
+        budget: BeamExecutionBudget,
+    ) -> Sequence[str]: ...
+~~~
+
+run_to_completion 与 offline_cohort 只改变 Scheduler 如何选择 ready Session，不改变
+EngineBeamAPI、Persistent Request 和 Worker ABI。
+
+---
+
+## 6. 五个核心抽象
+
+### 6.1 BeamSearchController：纯算法状态机
 
 Controller 的职责是把一个 step raw output 变成下一步 decision：
 
@@ -359,7 +460,7 @@ class BeamSearchController:
 - 独立替换 CPU/Numpy 算法；
 - 不改变 Scheduler 主循环。
 
-### 5.2 BeamControllerDecision：算法与调度之间的窄协议
+### 6.2 BeamControllerDecision：算法与调度之间的窄协议
 
 ~~~python
 @dataclass(frozen=True)
@@ -383,7 +484,7 @@ class BeamControllerDecision:
 - finished 后 next_tokens 必须为空；
 - 同一个 completed_step 不能被消费两次。
 
-### 5.3 PersistentBeamRequestState：调度生命周期
+### 6.3 PersistentBeamRequestState：调度生命周期
 
 Controller state 与 Scheduler state 是两套正交状态，不应塞进同一个巨型对象。
 
@@ -412,7 +513,7 @@ class PersistentBeamRequestState:
 - Prefix KV 是否仍被 Session 持有；
 - 终态资源是否已经释放。
 
-### 5.4 Immutable Constraint Resource：跨边界资源
+### 6.4 Immutable Constraint Resource：跨边界资源
 
 Catalog/Trie 不应该跟随每个请求反复发送，也不应该让 Engine 打开 Frontend 的文件路径。
 
@@ -447,7 +548,7 @@ flowchart LR
 
 这不仅解决跨进程问题，也为未来把 Trie 上传到设备侧建立稳定资源 ID。
 
-### 5.5 BeamFinalResult：内部终态协议
+### 6.5 BeamFinalResult：内部终态协议
 
 内部结果与 OpenAI/Offline 输出必须分层：
 
@@ -473,9 +574,9 @@ class BeamFinalResult:
 
 ---
 
-## 6. 双状态机：算法状态与资源状态分离
+## 7. 双状态机：算法状态与资源状态分离
 
-### 6.1 Controller 状态
+### 7.1 Controller 状态
 
 ~~~mermaid
 stateDiagram-v2
@@ -490,7 +591,7 @@ stateDiagram-v2
     FINALIZED --> [*]
 ~~~
 
-### 6.2 Persistent Request 状态
+### 7.2 Persistent Request 状态
 
 ~~~mermaid
 stateDiagram-v2
@@ -515,7 +616,7 @@ PARKED 的语义不是 Request 结束，而是：
 > 当前没有 execution in flight，Prefix KV 和 Request 仍然存活，等待 Controller 提供下一步
 > continuation。
 
-### 6.3 为什么需要两个状态机
+### 7.3 为什么需要两个状态机
 
 Controller 可能已经 COMPLETED，但 Worker teardown 仍未完成；Scheduler 也可能已经进入
 DRAINING，但 FinalResult 已经构造完成。因此：
@@ -529,19 +630,22 @@ DRAINING，但 FinalResult 已经构造完成。因此：
 
 ---
 
-## 7. Online 完整控制流
+## 8. Online 与 Offline 统一控制流
 
 ~~~mermaid
 sequenceDiagram
-    participant C as Client
-    participant S as Serving Adapter
+    participant ON as Online Serving
+    participant OFF as Offline API
     participant E as EngineCore
     participant B as Beam Controller
     participant H as Scheduler
     participant W as Worker
 
-    C->>S: Beam request
-    S->>E: add_beam_request once
+    alt Online request
+        ON->>E: add_beam_request once
+    else Offline request
+        OFF->>E: add_beam_request once
+    end
     E->>B: create controller
     E->>H: admit persistent request
     H->>W: Prefill
@@ -556,11 +660,14 @@ sequenceDiagram
         B-->>E: decision
     end
     E->>H: finalize and drain
-    E-->>S: one BeamFinalResult
-    S-->>C: formatted response
+    alt Online result
+        E-->>ON: one BeamFinalResult
+    else Offline result
+        E-->>OFF: one BeamFinalResult
+    end
 ~~~
 
-Frontend 边界只发生两次业务事件：
+无论入口是 Online 还是 Offline，Frontend 边界都只发生两次业务事件：
 
 1. 单次 submit；
 2. 单次 final。
@@ -569,9 +676,9 @@ Cancel 是第三种控制事件，但不是逐步数据路径。
 
 ---
 
-## 8. Persistent Request 的最大实现难点
+## 9. Persistent Request 的最大实现难点
 
-### 8.1 一个逻辑 Request，不等于一条串行 token 序列
+### 9.1 一个逻辑 Request，不等于一条串行 token 序列
 
 普通生成 Request 的 token history 是：
 
@@ -606,7 +713,7 @@ lane W-1 token
 - KV block allocation；
 - 下一步 request history。
 
-### 8.2 分离三种“长度”
+### 9.2 分离三种“长度”
 
 ~~~mermaid
 flowchart TB
@@ -637,7 +744,7 @@ execution_token_count = execution_width
 active_token_count = active_width
 ~~~
 
-### 8.3 BeamContinuation：不要把 lane metadata 塞进逻辑历史
+### 9.3 BeamContinuation：不要把 lane metadata 塞进逻辑历史
 
 推荐增加 Engine 内部 typed continuation：
 
@@ -665,7 +772,7 @@ class BeamContinuation:
 长期应把 BeamContinuation 变成 SchedulerOutput 的显式扩展，而不是长期依赖通用 streaming
 session 的隐含语义。
 
-### 8.4 Epoch 协议
+### 9.4 Epoch 协议
 
 调度条件必须可以机械验证：
 
@@ -700,9 +807,9 @@ in_flight_epoch = None
 
 ---
 
-## 9. Prefix KV 所有权
+## 10. Prefix KV 所有权
 
-### 9.1 生命周期
+### 10.1 生命周期
 
 ~~~mermaid
 flowchart LR
@@ -728,7 +835,7 @@ flowchart LR
 - Request free、Controller remove、Worker teardown 分别幂等；
 - Prefix block IDs 或等价 binding 在 Session 内保持稳定。
 
-### 9.2 Scheduler 必须保留权威
+### 10.2 Scheduler 必须保留权威
 
 EngineCore 可以驱动 Controller，但不能直接构造 Worker input：
 
@@ -753,9 +860,9 @@ Controller decision
 
 ---
 
-## 10. Constraint Resource 的正确抽象
+## 11. Constraint Resource 的正确抽象
 
-### 10.1 为什么 Catalog 不能是 Request payload
+### 11.1 为什么 Catalog 不能是 Request payload
 
 直接在 Request 中携带 catalog path 或 tokenizer 会引入：
 
@@ -766,7 +873,7 @@ Controller decision
 - 无法建立设备资源缓存；
 - 内容更新和版本语义不明确。
 
-### 10.2 Compile once，register by digest
+### 11.2 Compile once，register by digest
 
 ~~~mermaid
 sequenceDiagram
@@ -798,9 +905,9 @@ sequenceDiagram
 
 ---
 
-## 11. Cancel、错误、迟到结果与清理
+## 12. Cancel、错误、迟到结果与清理
 
-### 11.1 Session 终止不是一个函数调用
+### 12.1 Session 终止不是一个函数调用
 
 一个 Session 可能同时存在于：
 
@@ -840,7 +947,7 @@ flowchart TD
 FinalResult 的发布不必等待设备资源全部回收，否则会把 teardown latency 暴露给用户；但
 Session tombstone 只能在“终态已投递”和“资源已安全回收”两个条件都满足后删除。
 
-### 11.2 迟到结果
+### 12.2 迟到结果
 
 Cancel 后到达的 output 不能：
 
@@ -858,7 +965,7 @@ session_id → terminal reason + last epoch + resource generation
 
 直到确定不会再收到旧 epoch，或 Worker teardown ack 已完成。
 
-### 11.3 错误域
+### 12.3 错误域
 
 推荐错误分类：
 
@@ -876,9 +983,9 @@ Offline batch 中，一个 Session 的合法 session-local failure 不应破坏�
 
 ---
 
-## 12. 输出协议与 Logprobs
+## 13. 输出协议与 Logprobs
 
-### 12.1 Final-only
+### 13.1 Final-only
 
 EngineCore 应拦截 Controller-owned 中间输出，不把它们放入 Frontend 普通 output queue。
 
@@ -893,7 +1000,7 @@ BeamFinalResult
   └─ optional structured error
 ~~~
 
-### 12.2 Logprobs 瘦身
+### 13.2 Logprobs 瘦身
 
 输出成本应由 caller-visible contract 决定：
 
@@ -910,96 +1017,6 @@ BeamFinalResult
 2. 只在最终 top result_width beams 上回溯；
 3. 按 output spec 投影 logprobs；
 4. 最终一次序列化。
-
----
-
-## 13. Online 与 Offline：共用机制，不绑死 policy
-
-### 13.1 共用层
-
-| 能力 | Online | Offline |
-| --- | --- | --- |
-| EngineBeamAPI | 共用 | 共用 |
-| BeamSearchController | 共用 | 共用 |
-| Persistent Request | 共用 | 共用 |
-| Prefix KV lifecycle | 共用 | 共用 |
-| Scheduler continuation | 共用 | 共用 |
-| Constraint registry | 共用 | 共用 |
-| BeamFinalResult | 共用 | 共用 |
-
-### 13.2 差异层
-
-| 维度 | Online | Offline |
-| --- | --- | --- |
-| 入口 | OpenAI/Serving | LLM.generate 或 Offline Engine |
-| 优化目标 | P99、取消响应、隔离 | 吞吐、批量完成时间 |
-| admission | 动态请求 | 已知请求列表或 dataset batch |
-| policy | 初期 run-to-completion | shape-aware multi-session cohort |
-| 输出适配 | OpenAI RequestOutput | list/tensor/batch result |
-| 失败语义 | 单请求终态 | 单 Session 隔离 + job policy |
-
-### 13.3 Offline 多 Session
-
-~~~mermaid
-flowchart TB
-    B["Offline request list"]
-    A["Batch admission"]
-    R1["Session A persistent request"]
-    R2["Session B persistent request"]
-    R3["Session C persistent request"]
-    G["Scheduler ready set"]
-    X["Shape-compatible execution batch"]
-    O["Independent final results"]
-
-    B --> A
-    A --> R1
-    A --> R2
-    A --> R3
-    R1 --> G
-    R2 --> G
-    R3 --> G
-    G --> X
-    X --> R1
-    X --> R2
-    X --> R3
-    R1 --> O
-    R2 --> O
-    R3 --> O
-~~~
-
-每个 Session 必须保持独立：
-
-- session ID；
-- Controller；
-- Request；
-- Prefix KV；
-- current step；
-- epoch；
-- active/execution width；
-- final result；
-- error domain。
-
-多个 Session 可以组成一个物理 batch，但不能被合并成一个逻辑 Request。
-
-### 13.4 Policy 接口
-
-建议把调度策略显式化：
-
-~~~python
-class BeamSchedulingPolicy(Protocol):
-    def select_ready_sessions(
-        self,
-        ready: Sequence[PersistentBeamRequestState],
-        budget: BeamExecutionBudget,
-    ) -> Sequence[str]: ...
-~~~
-
-初始实现：
-
-- run_to_completion：一次选择一个 active Session；
-- offline_cohort：选择 shape compatible 的多个 ready Session。
-
-二者共用 Request lifecycle 和 Worker ABI。这样单 Session policy 不会成为长期架构限制。
 
 ---
 
