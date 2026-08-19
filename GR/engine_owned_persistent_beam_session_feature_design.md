@@ -1,1080 +1,1086 @@
-# vLLM-GR Engine-Owned Persistent Beam Session 大特性方案
+# vLLM-GR Persistent Batch Beam Session 与 Worker-Owned Beam Runtime 总体方案
 
 > 状态：Feature Design  
 > 日期：2026-08-19  
 > 目标仓库：JiusiServe/vllm-gr  
-> 主 RFC：[Serving Beam Controller 下沉与 Persistent Beam Session](https://github.com/zhanghanleo10/vllm-gr/issues/35)  
-> 当前 PoC：[Move the Serving beam controller into EngineCore](https://github.com/JiusiServe/vllm-gr/pull/290)  
-> 范围：Online Serving 与 Offline API 共用的 Engine-owned Beam Controller、Persistent Request、Scheduler Continuation、约束资源、终态协议和生命周期闭环  
-> 非目标：Worker/GPU Beam decision、静态 suffix KV Pool、CUDA/ACL Full Graph、Width Bucket、普通请求混部
+> 背景 RFC：[Serving Beam Controller 下沉与 Persistent Beam Session](https://github.com/zhanghanleo10/vllm-gr/issues/35)  
+> 当前实现参考：[PR #290](https://github.com/JiusiServe/vllm-gr/pull/290)  
+> 文档范围：总体架构、核心抽象、资源所有权和长期演进方向
 
 ---
 
 ## 0. 一页结论
 
-当前 vllm-gr Beam Search 的根本问题，不是某个 Beam helper 慢，也不是一次 IPC 消息太大，而是
-**Beam Session 的控制权放错了位置**：
+这项特性不是简单地把 Serving 中的循环搬进 EngineCore，也不是把现有
+BeamSearchController 原样复制到 Worker。目标是重新建立三条稳定边界：
+
+1. Online Serving 与 Offline API 只是平级入口。
+2. EngineCore 和 Scheduler 负责 Session、Request、调度与资源生命周期。
+3. Worker 负责约束过滤、Beam 选择、Beam 状态和 Beam KV 的完整数据闭环。
+
+业务侧一次提交的 BatchRequest 包含 B 个输入。它在系统内表示为一个
+BatchBeamSession 和 B 个原生 child Requests，而不是一个包含 B 条并行序列的
+原生 vLLM Request。
+
+~~~mermaid
+flowchart TB
+    subgraph FRONTENDS["Peer Frontends"]
+        direction LR
+        ONLINE["Online Serving"]
+        OFFLINE["Offline API"]
+    end
+
+    API["Unified Engine Beam API"]
+    COORD["BatchBeamCoordinator"]
+    CHILD["B Native Child Requests"]
+    SCHED["vLLM Scheduler"]
+    PREFILL["Native Prefill + Paged KV + Prefix Cache"]
+    BARRIER["Prefill Barrier"]
+    RUNTIME["Worker BeamRuntime"]
+    FINAL["One BatchBeamFinalResult"]
+
+    ONLINE --> API
+    OFFLINE --> API
+    API --> COORD
+    COORD --> CHILD
+    CHILD --> SCHED
+    SCHED --> PREFILL
+    PREFILL --> BARRIER
+    BARRIER --> RUNTIME
+    RUNTIME --> SCHED
+    SCHED --> RUNTIME
+    RUNTIME --> FINAL
+    FINAL --> ONLINE
+    FINAL --> OFFLINE
+~~~
+
+约束资源采用模型级加载方式：
 
 ~~~text
-Serving 计算下一步 Beam
-→ 发起一次 Engine 请求
-→ Scheduler / Worker 执行一步
-→ 中间结果返回 Serving
-→ Serving 再计算下一步
+部署配置
+→ Worker.load_model
+→ 加载模型权重
+→ 加载一个默认 Constraint Artifact
+→ 解析为常驻 Host 或 Device Buffer
+→ 显存探测与 KV 分配
+→ Warmup
 ~~~
 
-一个本应在 Engine 内连续存在的 Session，被拆成了多次 Frontend ↔ Engine 往返。由此产生：
+当前只支持一个默认约束资源。内部接口保留 resource_id，但不支持一个模型实例
+运行期加载多张表，也不支持按请求发送或替换完整约束资源。
 
-- Serving 持有 Beam 算法状态和逐步循环；
-- 每一步都可能重建 Request；
-- Prefix KV 所有权与释放时机不稳定；
-- Scheduler 无法成为 step、epoch 和资源生命周期的权威；
-- Online 与 Offline 容易复制两套 Beam 主循环；
-- 后续接入 Worker Beam、独立 BeamKV 和 Full Graph 时还要再次重写控制流。
+---
 
-本方案的核心决策是：
+## 1. 目的与问题定义
 
-> **Serving 和 Offline 只负责入口适配；Beam Session 由 EngineCore 持有；同一个 Session 只
-> admission 一次；Prefill 和所有 Decode step 复用同一个逻辑 Request；每一步仍然经过
-> Scheduler；中间结果留在 Engine 内，Frontend 只接收一次终态。**
+### 1.1 当前问题
 
-目标主链如下：
+传统链路把一个连续 Beam Session 拆成了多个跨层往返：
+
+~~~text
+Serving 计算 Beam decision
+→ EngineCore / Scheduler 执行一步
+→ Worker 返回候选
+→ EngineCore 或 Serving 再计算下一步
+~~~
+
+这会导致：
+
+- Beam 算法状态与 Worker Beam KV 分属不同所有者；
+- W × K 候选、scores 和 parent 信息跨进程传输；
+- EngineCore 需要理解 CPU Trie、候选过滤和 Beam materialization；
+- Online 与 Offline 容易形成不同控制路径；
+- 后续替换 Device Constraint Table 时还要再次移动控制边界；
+- Prefill Prefix KV、Beam suffix KV 和 Session 终态难以形成同一个生命周期。
+
+### 1.2 目标结果
+
+即使移除 Online Serving，Engine 仍应能够独立完成一个业务 BatchRequest：
+
+~~~text
+提交一次
+→ B 个 child Requests 使用原生 Prefill
+→ Worker 完成全部 Beam Decode
+→ 返回一次 Batch Final Result
+~~~
+
+这项特性的核心目标是所有权正确，而不是某一个算子或 IPC 的局部优化。
+
+---
+
+## 2. 已冻结的设计不变量
+
+1. 一个业务 BatchRequest 对应一个稳定的 BatchBeamSession。
+2. BatchBeamSession 包含 B 个 item，并映射为 B 个原生 child Requests。
+3. B 个 child Requests 分别使用原生 Scheduler、Paged KV 和 Prefix Cache。
+4. Prefill 可以独立调度、分块和复用，但进入 Beam Decode 前需要 Batch barrier。
+5. Worker 是 Beam scores、sequence、constraint state、parent 和 Beam KV 的唯一权威。
+6. Constraint filter、candidate select、global Beam select 和 final select 全部位于 Worker。
+7. EngineCore 只保存调度与生命周期所需的协调状态，不保存完整 Beam 算法状态。
+8. 每一次 Prefill 或 Decode execution 仍然由 Scheduler 产生，EngineCore 不直接绕过
+   Scheduler 调用 Worker。
+9. 一个模型实例启动时只加载一个默认约束资源。
+10. 约束资源生命周期与模型一致，当前不涉及热更新、逐出和用户关联 KV。
+11. 当前执行 backend 使用 CPU Trie，后续可以替换成 Device Constraint Table。
+12. Online Serving 与 Offline API 共用相同 Engine、Scheduler 和 Worker Runtime。
+13. Frontend 只接收最终结果，不接收中间 Prefill 或 Decode 候选。
+14. 初始实现可以限制一个 Session 只有一个 in-flight epoch，但不能把该限制写死进
+    Session 数据模型。
+
+### 2.1 当前非目标
+
+- 用户级、租户级或会话级约束资源动态加载；
+- 一个模型实例同时维护多个可选 constraint resource；
+- 约束资源热更新和版本并存；
+- Prefill 用户关联 KV；
+- 将本方案限定为某一种 Full Graph 实现；
+- 在本文中展开具体子任务、Review、回滚、性能或发布验收。
+
+---
+
+## 3. 总体架构与责任边界
 
 ~~~mermaid
 flowchart TB
-    subgraph ENTRY["Peer Frontends"]
-        direction LR
-        ON["Online Serving Adapter"]
-        OFF["Offline API Adapter"]
+    subgraph CONFIG["Deployment Configuration"]
+        CFG["ConstraintHeadConfig"]
+        LOAD["Constraint Artifact Loader"]
     end
-    API["Engine Beam API"]
-    CTRL["BeamSearchController"]
-    SCH["Scheduler + Persistent Request"]
-    WRK["Worker / ModelRunner"]
-    FINAL["BeamFinalResult"]
 
-    ON --> API
-    OFF --> API
-    API --> CTRL
-    API --> SCH
-    SCH --> WRK
-    WRK --> CTRL
-    CTRL --> SCH
-    CTRL --> FINAL
-    FINAL --> ON
-    FINAL --> OFF
-~~~
-
-总体方案由五层组成：
-
-| 层次 | 核心职责 |
-| --- | --- |
-| Frontend Adapter | Online/Offline 参数适配与最终格式化 |
-| Engine Control | Session registry、Controller 与终态路由 |
-| Scheduler Lifecycle | Persistent Request、continuation 与 Prefix KV 所有权 |
-| Shared Resource | Immutable constraint resource 等跨请求资源 |
-| Execution | 继续复用 Scheduler → Worker → ModelRunner 主链 |
-
----
-
-## 1. 这项特性真正要解决什么
-
-### 1.1 当前链路
-
-当前 Serving 不只是协议适配层，它还承担：
-
-- 逐 token Beam 主循环；
-- active/completed beams；
-- parent/child/token routing；
-- candidate extraction 和 constraint filtering；
-- EOS、Top-K 和 parent selection；
-- history 与 logprobs 回溯；
-- 每一步 Engine 请求的创建；
-- 最终排序与输出构造。
-
-~~~mermaid
-sequenceDiagram
-    participant C as Client
-    participant S as Serving
-    participant E as EngineCore
-    participant H as Scheduler
-    participant W as Worker
-
-    C->>S: Beam request
-    S->>E: Prefill request
-    E->>H: schedule
-    H->>W: Prefill
-    W-->>S: raw output
-    loop Every Beam step
-        S->>S: TopK / constraint / parent decision
-        S->>E: step update + new request
-        E->>H: schedule
-        H->>W: one decode step
-        W-->>S: intermediate output
-    end
-    S->>S: sort / history / format
-    S-->>C: final result
-~~~
-
-这条链路看起来可以工作，但它破坏了三个基本边界：
-
-1. **算法边界**：Beam decision 属于推理状态机，不属于 HTTP/OpenAI 协议层。
-2. **资源边界**：Request 和 KV 的生命周期必须由 Scheduler/Engine 负责。
-3. **执行边界**：一个 Session 的中间 step 不应该反复穿过 Frontend 边界。
-
-### 1.2 目标不是“少发几条消息”
-
-仅把多条消息压缩成一条消息，不能解决所有权问题。即使 Serving 和 Engine 在同一进程，只要
-Serving 仍持有 Beam 主循环，以下问题仍然存在：
-
-- Offline 入口必须复制算法；
-- Cancel 与 Engine 资源释放无法原子闭环；
-- Scheduler 看不到完整 Session 进度；
-- Worker Beam 状态与 Controller 生命周期无法绑定；
-- Graph、BeamKV Pool 和 session slot 无法建立稳定 lease。
-
-因此本特性的成功标准不是“IPC 次数下降”，而是：
-
-> **即使删掉 OpenAI Serving，Engine 仍能独立完成一个 Beam Session。**
-
----
-
-## 2. 约束与设计不变量
-
-### 2.1 硬约束
-
-以下约束决定了最小架构：
-
-1. **稳定 Session ID**：一个外部 Beam 请求对应一个稳定的 beam session。
-2. **单次 admission**：同一个 Session 只创建并准入一个逻辑 Request。
-3. **Scheduler 权威**：任何 Prefill/Decode execution 都由 Scheduler 产生。
-4. **单 step in-flight**：同一个 Session 同时最多一个 epoch 在执行。
-5. **Prefix KV 常驻**：Prefill 完成不进入普通 finished/free 路径。
-6. **中间结果内收**：Frontend 不消费 Prefill/Decode 中间输出。
-7. **终态唯一**：FINISHED、ABORTED、FAILED 只发布一次最终结果。
-8. **算法等价**：第一阶段只移动所有权，不改变 Beam 结果。
-9. **Frontend 无关**：Online 与 Offline 调用同一个 Engine Beam API。
-10. **不依赖 Graph**：控制流正确性必须先在 eager 路径成立。
-
-### 2.2 需要挑战的假设
-
-| 常见假设 | 判断 | 原因 |
-| --- | --- | --- |
-| “Controller 下沉后可以直接调用 Worker” | 不成立 | 会绕过 Scheduler 的资源和进度权威 |
-| “每步创建新 Request 更简单” | 局部简单、系统错误 | Prefix KV、身份、取消和释放都变得不稳定 |
-| “active width 个 token 可以追加到 Request history” | 不成立 | 它们是并行 lane，不是串行时间步 |
-| “Online 和 Offline 应完全走同一种 policy” | 不成立 | 二者共享机制，但优化目标不同 |
-| “Constraint catalog path 可以直接发给 Engine” | 不成立 | Engine 不应依赖 Frontend 文件系统和 tokenizer 对象 |
-| “run-to-completion 等于最终 Offline 策略” | 不成立 | 它是第一阶段 policy，不是机制限制 |
-
----
-
-## 3. 特性范围与演进边界
-
-### 3.1 本特性负责
-
-~~~mermaid
-flowchart LR
-    F["Frontend adapters"] --> C["Engine control plane"]
-    C --> S["Scheduler lifecycle"]
-    S --> X["Existing eager execution"]
-    X --> R["One final result"]
-~~~
-
-具体包括：
-
-- 抽取纯 Beam Controller；
-- Controller 在 EngineCore 的注册、路由和清理；
-- per-step Request 过渡路径；
-- Persistent Request 与 Prefix KV 保持；
-- step/epoch/in-flight 协议；
-- immutable Trie 资源注册；
-- final-only 结果协议；
-- Online/Offline 共用 Engine API；
-- Cancel、错误和迟到结果闭环；
-- 可观测性与 parity tests。
-
-### 3.2 本特性不负责
-
-下列能力在此方案之上演进，但不能成为本特性的合入前置：
-
-- Top-K、Beam group select 和 history 全量下沉到 Worker/GPU；
-- 独立 suffix BeamKV Pool；
-- Worker 持久 Beam execution slot；
-- fixed shape、Width Bucket 和 active mask；
-- CUDA/ACL Full Graph；
-- TP/PP Beam decision 广播；
-- 多 Session 矩形 Full Graph；
-- 普通生成请求与 GR 请求混部；
-- PD 分离和 Prefix KV 跨节点传输。
-
-这条边界非常重要：
-
-> 本特性建立“谁拥有 Session、Request 如何持续、何时完成和释放”；BeamKV 与 Graph 方案建立
-> “设备内数据放在哪里、怎样执行得更快”。前者是后者的控制面基础，但两者不应合并成一个 PR。
-
----
-
-## 4. 总体架构
-
-### 4.1 逻辑组件
-
-~~~mermaid
-flowchart TB
-    subgraph FRONTEND["Frontend"]
-        ONLINE["Online Serving Adapter"]
-        OFFLINE["Offline API Adapter"]
+    subgraph FRONTEND["Frontend Layer"]
+        ON["Online Adapter"]
+        OFF["Offline Adapter"]
     end
 
     subgraph ENGINE["EngineCore"]
         API["EngineBeamAPI"]
-        REG["BeamSessionRegistry"]
-        CTRL["BeamSearchController"]
-        CON["ConstraintResourceRegistry"]
-        OUT["FinalResultRouter"]
+        COORD["BatchBeamCoordinator"]
+        ROUTER["FinalResultRouter"]
     end
 
-    subgraph SCHED["Scheduler"]
-        REQ["Persistent Beam Request"]
-        META["BeamContinuation"]
-        KV["Native Prefix KV Lease"]
+    subgraph SCHEDULER["Scheduler"]
+        REQS["B Persistent Child Requests"]
+        PREFIX["Native Prefix KV Ownership"]
+        BUDGET["Token and Capacity Admission"]
     end
 
-    subgraph EXEC["Worker / ModelRunner"]
-        MODEL["Model Forward"]
-        RAW["Step Raw Output"]
+    subgraph WORKER["Worker / ModelRunner"]
+        CRM["ConstraintResourceManager"]
+        CHE["ConstraintHeadExtension"]
+        SESSION["WorkerBatchBeamSession"]
+        SELECT["BeamSelector"]
+        BKV["BeamKVManager"]
     end
 
-    ONLINE --> API
-    OFFLINE --> API
-    API --> REG
-    REG --> CTRL
-    CON --> CTRL
-    API --> REQ
-    REQ --> META
-    META --> MODEL
-    MODEL --> RAW
-    RAW --> CTRL
-    CTRL --> META
-    CTRL --> OUT
-    OUT --> ONLINE
-    OUT --> OFFLINE
-    REQ --> KV
-~~~
-
-### 4.2 责任矩阵
-
-| 组件 | 持有什么 | 不应该持有什么 |
-| --- | --- | --- |
-| Online Adapter | 参数校验、tokenize、Cancel、OpenAI 格式化 | Beam 主循环、active beams、KV |
-| Offline Adapter | 批量提交、离线结果适配、job-level abort | 独立 Controller、逐步 Worker 调用 |
-| EngineBeamAPI | 规范化请求、Session 创建、最终结果 future | HTTP、tokenizer、文件路径 |
-| BeamSessionRegistry | Controller、context、terminal tombstone | Paged KV block 分配 |
-| BeamSearchController | Beam 算法状态、scores、history、constraint state | Scheduler queue、KV allocator |
-| ConstraintResourceRegistry | digest → immutable Trie | tokenizer、catalog path |
-| Scheduler | Request、stage、epoch、budget、Prefix KV | 全量 Beam history 与最终协议 |
-| Worker | 当前 step 的执行输入与 raw output | Frontend callback、Session 终态权威 |
-| FinalResultRouter | 一次性投递、frontend correlation | 下一步 Beam decision |
-
-### 4.3 统一 Engine API
-
-Online 和 Offline 必须收敛到同一个内部入口：
-
-~~~python
-@dataclass(frozen=True)
-class EngineBeamRequest:
-    session_id: str
-    external_request_id: str
-    prompt_token_ids: tuple[int, ...]
-    beam_width: int
-    max_tokens: int
-    eos_token_id: int
-    sampling: BeamSamplingSpec
-    constraint_resource_id: str | None
-    output_spec: BeamOutputSpec
-    frontend_kind: str
-
-class EngineBeamAPI:
-    def add_beam_request(request: EngineBeamRequest) -> BeamResultFuture: ...
-    def cancel_beam_request(session_id: str) -> bool: ...
-~~~
-
-关键点：
-
-- API 接受 token IDs，不接受 tokenizer；
-- API 接受 resource ID，不接受 catalog path；
-- API 返回一个最终结果 future，不暴露每步 raw output；
-- Online 与 Offline 的差异保留在 adapter 和 scheduling policy；
-- Controller、Request、KV 和 final contract 完全共用。
-
----
-
-## 5. Online Serving 与 Offline API：同等 Frontend
-
-Online Serving 和 Offline API 是两个平级入口。二者都直接调用 EngineBeamAPI，任何一方都不
-通过另一方间接进入 Engine，也不在自己的入口层保存 Beam 主循环。
-
-~~~mermaid
-block-beta
-    columns 2
-    ON["Online Serving"]
-    OFF["Offline API"]
-    API["EngineBeamAPI"]:2
-    CORE["Engine-owned Beam Session"]:2
-    SCH["Scheduler + Persistent Request"]:2
-    EXEC["Worker / ModelRunner"]:2
-
+    CFG --> LOAD
+    LOAD --> CRM
     ON --> API
     OFF --> API
-    API --> CORE
-    CORE --> SCH
-    SCH --> EXEC
+    API --> COORD
+    COORD --> REQS
+    REQS --> PREFIX
+    REQS --> BUDGET
+    REQS --> SESSION
+    CRM --> CHE
+    CHE --> SELECT
+    SESSION --> SELECT
+    SELECT --> BKV
+    SELECT --> COORD
+    COORD --> ROUTER
+    ROUTER --> ON
+    ROUTER --> OFF
 ~~~
 
-### 5.1 共用内核
+### 3.1 责任矩阵
 
-| 能力 | Online Serving | Offline API |
+| 组件 | 核心职责 | 不应负责 |
 | --- | --- | --- |
-| EngineBeamAPI | 共用 | 共用 |
-| BeamSearchController | 共用 | 共用 |
-| Persistent Request | 共用 | 共用 |
-| Prefix KV lifecycle | 共用 | 共用 |
-| Scheduler continuation | 共用 | 共用 |
-| Constraint registry | 共用 | 共用 |
-| BeamFinalResult | 共用 | 共用 |
-
-### 5.2 入口差异
-
-| 维度 | Online Serving | Offline API |
-| --- | --- | --- |
-| 调用方式 | 动态请求 | 单请求或请求列表 |
-| 优化目标 | P99、取消响应、请求隔离 | 吞吐、批量完成时间 |
-| admission | 按在线到达准入 | 可利用已知 batch 信息 |
-| scheduling policy | 可采用 run-to-completion | 可采用 multi-session cohort |
-| 输出适配 | OpenAI RequestOutput | list、tensor 或 batch result |
-| 失败语义 | 单请求终态 | 单 Session 隔离与 job policy |
-
-这些差异只属于 Adapter 和 SchedulingPolicy，不改变 Session、Controller、Request 或 Worker
-执行协议。
-
-### 5.3 Offline 多 Session
-
-~~~mermaid
-flowchart TB
-    B["Offline request list"]
-    A["Batch admission"]
-    R1["Session A persistent request"]
-    R2["Session B persistent request"]
-    R3["Session C persistent request"]
-    G["Scheduler ready set"]
-    X["Shape-compatible execution batch"]
-    O["Independent final results"]
-
-    B --> A
-    A --> R1
-    A --> R2
-    A --> R3
-    R1 --> G
-    R2 --> G
-    R3 --> G
-    G --> X
-    X --> R1
-    X --> R2
-    X --> R3
-    R1 --> O
-    R2 --> O
-    R3 --> O
-~~~
-
-每个 Session 保持独立的 Controller、Request、Prefix KV、step、epoch 和终态。多个 Session
-可以组成一个物理 execution batch，但不能被合并成一个逻辑 Request。
-
-### 5.4 Policy 接口
-
-~~~python
-class BeamSchedulingPolicy(Protocol):
-    def select_ready_sessions(
-        self,
-        ready: Sequence[PersistentBeamRequestState],
-        budget: BeamExecutionBudget,
-    ) -> Sequence[str]: ...
-~~~
-
-run_to_completion 与 offline_cohort 只改变 Scheduler 如何选择 ready Session，不改变
-EngineBeamAPI、Persistent Request 和 Worker ABI。
+| Online Adapter | 参数校验、tokenize、cancel、协议格式化 | Beam 主循环、Trie、KV |
+| Offline Adapter | Batch 提交、job 适配、结果组织 | 独立调度器、独立 Beam 算法 |
+| EngineBeamAPI | 请求规范化、Session 创建、最终 future | 文件解析、设备算子 |
+| BatchBeamCoordinator | B 个 child 映射、barrier、epoch、终态协调 | 候选过滤、Beam score、KV reorder |
+| Scheduler | child Request、Prefill、budget、Prefix KV 生命周期 | 完整 Beam sequence 和 constraint state |
+| ConstraintResourceManager | 默认资源加载、校验和常驻 Buffer | 每请求动态资源注册 |
+| ConstraintHeadExtension | 根据约束资源生成合法候选 | Session 生命周期、Frontend 输出 |
+| BeamSelector | 累积分数、global top-W、parent 选择 | Paged KV block 分配 |
+| WorkerBatchBeamSession | B × W 状态、step、mask、终态 | Scheduler queue |
+| BeamKVManager | suffix KV 写入、选择和释放 | Prompt tokenize |
+| FinalResultRouter | 一次性路由内部终态 | 下一步 Beam decision |
 
 ---
 
-## 6. 五个核心抽象
+## 4. 业务 Batch、Session 与原生 Request
 
-### 6.1 BeamSearchController：纯算法状态机
-
-Controller 的职责是把一个 step raw output 变成下一步 decision：
+### 4.1 三个不同概念
 
 ~~~text
-Controller state + StepRawOutput
-              ↓
-      BeamControllerDecision
-              ↓
- next tokens / parents / active width / finished
+业务 BatchRequest
+    ↓ 一次外部调用
+BatchBeamSession
+    ↓ 组织 B 个 item 的生命周期
+B Native Child Requests
+    ↓ 分别进入 vLLM Scheduler
+Physical Execution Batch
+    ↓ 每个 tick 动态组装的实际执行行
 ~~~
 
-推荐接口：
+三者不能合并：
 
-~~~python
-class BeamSearchController:
-    def consume_output(
-        self,
-        output: BeamControllerStepOutput,
-    ) -> BeamControllerDecision: ...
+- BatchBeamSession 是业务和算法生命周期单位；
+- child Request 是 Scheduler 和 Prefix Paged KV 的管理单位；
+- physical batch 是某个调度 tick 的执行单位。
 
-    def cancel(self) -> None: ...
+### 4.2 为什么不能把 B 合成一个原生 Request
 
-    def finalize(self) -> BeamFinalResult: ...
-~~~
+原生 Request 表达一条串行 token history，而业务 Batch 中的 B 个输入是 B 条独立序列。
+如果把它们拼成一个 Request，会破坏：
 
-它持有：
+- 每个 prompt 的 position 和长度；
+- Prefix Cache hash 与 block 命中；
+- chunked prefill 进度；
+- KV block 所有权；
+- 单 item 错误与终态；
+- Scheduler 的 token budget。
 
-- active beams 与 completed beams；
-- cumulative scores；
-- parent/history 信息；
-- current step；
-- constraint node states；
-- EOS/stop/token budget；
-- Beam 算法自身 metrics。
-
-它不持有：
-
-- Scheduler Request；
-- Paged KV block；
-- Worker slot；
-- OpenAI RequestOutput；
-- Engine output queue。
-
-这是整个方案最重要的抽象边界。只有 Controller 足够纯，才能：
-
-- 用旧 Serving 实现做 golden parity；
-- 在 EngineCore、单测或未来 Worker provider 中复用；
-- 独立替换 CPU/Numpy 算法；
-- 不改变 Scheduler 主循环。
-
-### 6.2 BeamControllerDecision：算法与调度之间的窄协议
-
-~~~python
-@dataclass(frozen=True)
-class BeamControllerDecision:
-    completed_step: int
-    next_tokens: tuple[int, ...]
-    parent_beam_indices: tuple[int, ...]
-    active_width: int
-    finished: bool
-    finish_reason: str | None
-    error: BeamError | None
-~~~
-
-该对象表达“下一步做什么”，但不表达“如何分配 KV”或“调用哪个 Worker”。
-
-必须满足：
-
-- next_tokens 长度等于 active_width；
-- parent index 位于上一轮有效 lane 范围；
-- completed_step 与 Scheduler expected step 一致；
-- finished 后 next_tokens 必须为空；
-- 同一个 completed_step 不能被消费两次。
-
-### 6.3 PersistentBeamRequestState：调度生命周期
-
-Controller state 与 Scheduler state 是两套正交状态，不应塞进同一个巨型对象。
+因此采用稳定映射：
 
 ~~~python
 @dataclass
-class PersistentBeamRequestState:
-    session_id: str
-    stage: BeamRequestStage
-    logical_step: int
+class BatchBeamCoordinator:
+    batch_session_id: str
+    child_request_ids: tuple[str, ...]  # 长度 B
+    prefill_ready_mask: tuple[bool, ...]
+    stage: str
     next_epoch: int
     in_flight_epoch: int | None
-    completed_epoch: int | None
-    execution_width: int
-    active_width: int
-    prefix_binding: PrefixKVBinding
-    final_result_sent: bool
-    scheduler_freed: bool
-    worker_teardown_sent: bool
+    worker_session_handle: str | None
 ~~~
 
-它只关心：
+### 4.3 一个 Session 内允许多个物理 batch
 
-- Request 是否可调度；
-- 当前是否已有 step 在执行；
-- 下一次 SchedulerOutput 应带什么 metadata；
-- Prefix KV 是否仍被 Session 持有；
-- 终态资源是否已经释放。
+允许。
 
-### 6.4 Immutable Constraint Resource：跨边界资源
-
-Catalog/Trie 不应该跟随每个请求反复发送，也不应该让 Engine 打开 Frontend 的文件路径。
-
-推荐流程：
+当 B × W 超过一个 execution tick 的预算时，同一个 Session 的一个逻辑 step 可以被拆成
+多个物理 micro-batches：
 
 ~~~mermaid
 flowchart LR
-    CAT["Catalog + Tokenizer"]
-    COMP["Frontend Compiler"]
-    TRIE["Immutable Token-ID Trie"]
-    DIG["Digest"]
-    REG["Engine Registry"]
-    REQ["Beam Request"]
+    STEP["Logical Step e"]
+    M1["Micro-batch 1"]
+    M2["Micro-batch 2"]
+    M3["Micro-batch N"]
+    ACC["Worker StepAccumulator"]
+    SEL["Per-item Global Beam Select"]
+    COMMIT["Atomic Epoch Commit"]
 
-    CAT --> COMP
-    COMP --> TRIE
-    TRIE --> DIG
-    TRIE --> REG
-    DIG --> REQ
-    REQ --> REG
+    STEP --> M1
+    STEP --> M2
+    STEP --> M3
+    M1 --> ACC
+    M2 --> ACC
+    M3 --> ACC
+    ACC --> SEL
+    SEL --> COMMIT
 ~~~
 
-资源必须具备：
+但必须满足：
 
-- token-ID based；
-- immutable；
-- contiguous/validated arrays；
-- versioned wire format；
-- content digest；
-- idempotent registration；
-- unknown digest fail-fast。
+- 一个 item 的 W 个 parent lanes 收集完整后，才能进行该 item 的 global top-W；
+- B 个 item 不互相竞争 Beam，global top-W 在每个 item 内独立执行；
+- 一个 epoch 的状态不能在只收到部分 micro-batch 时提交；
+- row 顺序不能作为身份，必须使用 session、epoch、item 和 beam lane 映射。
 
-这不仅解决跨进程问题，也为未来把 Trie 上传到设备侧建立稳定资源 ID。
-
-### 6.5 BeamFinalResult：内部终态协议
-
-内部结果与 OpenAI/Offline 输出必须分层：
-
-~~~python
-@dataclass(frozen=True)
-class BeamFinalResult:
-    session_id: str
-    external_request_id: str
-    beams: tuple[BeamFinalBeam, ...]
-    finish_reason: str
-    error: BeamError | None
-    metrics: BeamSessionMetrics | None
-~~~
-
-配套的 BeamOutputSpec 决定：
-
-- result width；
-- logprobs = none / selected / top-k；
-- top logprobs 数量；
-- 是否需要 full history。
-
-这样可以避免默认把所有候选、所有 step、所有 logprobs 发送回 Frontend。
+多个独立 Session 未来也可以组成同一个物理 execution batch，但它们仍保持独立的
+Coordinator、Worker Session、Prefix KV、epoch 和终态。
 
 ---
 
-## 7. 双状态机：算法状态与资源状态分离
+## 5. Prefill：完整复用原生 vLLM
 
-### 7.1 Controller 状态
-
-~~~mermaid
-stateDiagram-v2
-    [*] --> RUNNING
-    RUNNING --> RUNNING: consume step
-    RUNNING --> COMPLETED: search finished
-    RUNNING --> CANCELLED: cancel
-    RUNNING --> ERROR: invalid output
-    COMPLETED --> FINALIZED: build final result
-    CANCELLED --> FINALIZED: build cancel result
-    ERROR --> FINALIZED: build error result
-    FINALIZED --> [*]
-~~~
-
-### 7.2 Persistent Request 状态
-
-~~~mermaid
-stateDiagram-v2
-    [*] --> PREFILLING
-    PREFILLING --> PARKED: prefill output consumed
-    PARKED --> BEAM_DECODING: continuation scheduled
-    BEAM_DECODING --> PARKED: epoch completed
-    PARKED --> FINALIZING: controller finished
-    BEAM_DECODING --> FINALIZING: terminal output
-    FINALIZING --> DRAINING: teardown dispatched
-    DRAINING --> FINISHED: scheduler and worker safe
-    FINISHED --> [*]
-    PREFILLING --> FAILED
-    PARKED --> FAILED
-    BEAM_DECODING --> FAILED
-    FINALIZING --> FAILED
-    FAILED --> DRAINING
-~~~
-
-PARKED 的语义不是 Request 结束，而是：
-
-> 当前没有 execution in flight，Prefix KV 和 Request 仍然存活，等待 Controller 提供下一步
-> continuation。
-
-### 7.3 为什么需要两个状态机
-
-Controller 可能已经 COMPLETED，但 Worker teardown 仍未完成；Scheduler 也可能已经进入
-DRAINING，但 FinalResult 已经构造完成。因此：
-
-- Controller terminal 不等于资源已释放；
-- Final result ready 不等于可以删除 tombstone；
-- Scheduler free 不等于 Worker slot 已安全回收；
-- Cancel 不等于可以忽略 in-flight completion。
-
-如果用一个 boolean finished 表达全部状态，就无法正确处理迟到结果与幂等清理。
-
----
-
-## 8. Online 与 Offline 统一控制流
-
-~~~mermaid
-sequenceDiagram
-    participant ON as Online Serving
-    participant OFF as Offline API
-    participant E as EngineCore
-    participant B as Beam Controller
-    participant H as Scheduler
-    participant W as Worker
-
-    alt Online request
-        ON->>E: add_beam_request once
-    else Offline request
-        OFF->>E: add_beam_request once
-    end
-    E->>B: create controller
-    E->>H: admit persistent request
-    H->>W: Prefill
-    W-->>E: raw prefill output
-    E->>B: consume output
-    B-->>E: next decision
-    loop Until terminal
-        E->>H: continue same request
-        H->>W: one Beam decode step
-        W-->>E: raw step output
-        E->>B: consume output
-        B-->>E: decision
-    end
-    E->>H: finalize and drain
-    alt Online result
-        E-->>ON: one BeamFinalResult
-    else Offline result
-        E-->>OFF: one BeamFinalResult
-    end
-~~~
-
-无论入口是 Online 还是 Offline，Frontend 边界都只发生两次业务事件：
-
-1. 单次 submit；
-2. 单次 final。
-
-Cancel 是第三种控制事件，但不是逐步数据路径。
-
----
-
-## 9. Persistent Request 的最大实现难点
-
-### 9.1 一个逻辑 Request，不等于一条串行 token 序列
-
-普通生成 Request 的 token history 是：
-
-~~~text
-t0 → t1 → t2 → t3
-~~~
-
-Beam step 的输入是同一时间步的并行 lane：
-
-~~~text
-step k:
-lane 0 token
-lane 1 token
-lane 2 token
-...
-lane W-1 token
-~~~
-
-因此不能把 active_width 个 lane token 追加成：
-
-~~~text
-... → lane0 → lane1 → lane2
-~~~
-
-否则 Scheduler 会误以为 Request 串行前进了 active_width 个 token，继而污染：
-
-- computed token count；
-- position；
-- block hash；
-- prefix-cache identity；
-- token budget；
-- KV block allocation；
-- 下一步 request history。
-
-### 9.2 分离三种“长度”
-
-~~~mermaid
-flowchart TB
-    L["Logical progress"]
-    E["Execution lanes"]
-    K["KV materialization"]
-
-    L --> A["Beam generation step +1"]
-    E --> B["This forward executes W rows"]
-    K --> C["Prefix KV retained; suffix follows Beam layout"]
-~~~
-
-需要明确区分：
-
-| 概念 | 含义 | 示例 |
-| --- | --- | --- |
-| logical_step | Beam 算法推进次数 | 第 2 个 Decode step |
-| execution_width | 本轮物理执行 lane 数 | 128 rows |
-| active_width | 本轮有效 Beam 数 | 93 beams |
-| prefix_len | 共享 Prompt 有效长度 | 900 tokens |
-| suffix_step | Beam suffix 已物化的时间步 | 2 steps |
-
-推荐调度计量：
-
-~~~text
-logical_step_count = 1
-execution_token_count = execution_width
-active_token_count = active_width
-~~~
-
-### 9.3 BeamContinuation：不要把 lane metadata 塞进逻辑历史
-
-推荐增加 Engine 内部 typed continuation：
-
-~~~python
-@dataclass(frozen=True)
-class BeamContinuation:
-    session_id: str
-    epoch: int
-    completed_step: int
-    lane_token_ids: tuple[int, ...]
-    parent_beam_indices: tuple[int, ...]
-    execution_width: int
-    active_width: int
-~~~
-
-第一阶段可以继续复用上游 StreamingUpdate 来唤醒 PARKED Request，但它只能是兼容适配器：
-
-- 先恢复稳定 prefix view；
-- lane tokens 只进入当前 execution view；
-- 不把 lane tokens 留在串行 prompt history；
-- continuation 后恢复 prefix block hashes；
-- 每轮验证 Request identity 和 Prefix block IDs；
-- 禁止同一个 epoch 重复 schedule。
-
-长期应把 BeamContinuation 变成 SchedulerOutput 的显式扩展，而不是长期依赖通用 streaming
-session 的隐含语义。
-
-### 9.4 Epoch 协议
-
-调度条件必须可以机械验证：
-
-~~~text
-can_dispatch
-  = stage is PARKED
-  and in_flight_epoch is None
-  and completed_epoch == next_epoch - 1
-~~~
-
-下发时：
-
-~~~text
-in_flight_epoch = next_epoch
-next_epoch += 1
-~~~
-
-完成时：
-
-~~~text
-assert output.epoch == in_flight_epoch
-completed_epoch = in_flight_epoch
-in_flight_epoch = None
-~~~
-
-任何 mismatch 都 fail-fast，不允许：
-
-- 静默重试同一步；
-- 丢弃 mismatch 后继续；
-- 回退到 Serving loop；
-- 生成第二个 in-flight step。
-
----
-
-## 10. Prefix KV 所有权
-
-### 10.1 生命周期
-
-~~~mermaid
-flowchart LR
-    A["Request admitted"]
-    P["Prefill allocates Prefix KV"]
-    D["Many Beam decode steps"]
-    T["Terminal state"]
-    F["Free once"]
-
-    A --> P
-    P --> D
-    D --> D
-    D --> T
-    T --> F
-~~~
-
-硬规则：
-
-- PREFILLING → PARKED 不释放；
-- PARKED → BEAM_DECODING 不重新申请；
-- 每个 continuation 使用相同 logical Request；
-- FINISHED、ABORTED、FAILED 才进入最终释放；
-- Request free、Controller remove、Worker teardown 分别幂等；
-- Prefix block IDs 或等价 binding 在 Session 内保持稳定。
-
-### 10.2 Scheduler 必须保留权威
-
-EngineCore 可以驱动 Controller，但不能直接构造 Worker input：
-
-~~~text
-Controller decision
-→ write BeamContinuation
-→ Scheduler.schedule
-→ SchedulerOutput
-→ Worker
-~~~
-
-原因不是代码风格，而是 Scheduler 独占以下事实：
-
-- 请求是否仍然合法；
-- token/KV/sequence budget 是否足够；
-- 当前是否可下发；
-- Request 是否正在被取消；
-- 哪些资源属于本轮；
-- execution 完成后怎样更新和释放。
-
-绕过 Scheduler 会让 Persistent Request 只剩名字，实际资源仍然由两套控制流管理。
-
----
-
-## 11. Constraint Resource 的正确抽象
-
-### 11.1 为什么 Catalog 不能是 Request payload
-
-直接在 Request 中携带 catalog path 或 tokenizer 会引入：
-
-- Frontend/Engine 文件系统不一致；
-- tokenizer Python 对象不可移植；
-- 每个请求重复编译 Trie；
-- 大对象重复序列化；
-- 无法建立设备资源缓存；
-- 内容更新和版本语义不明确。
-
-### 11.2 Compile once，register by digest
+### 5.1 每个 child Request 独立 Prefill
 
 ~~~mermaid
 sequenceDiagram
     participant F as Frontend
-    participant R as Engine Resource Registry
-    participant C as Beam Controller
+    participant E as EngineCore
+    participant S as Scheduler
+    participant W as Worker
+    participant R as Worker BeamRuntime
 
-    F->>F: tokenize and compile catalog
-    F->>F: compute digest
-    F->>R: ensure immutable Trie
-    R-->>F: registered or already exists
-    F->>C: request with resource digest
-    C->>R: require digest
-    R-->>C: immutable Trie view
+    F->>E: submit BatchRequest with B items
+    E->>S: admit B child Requests
+    loop Native continuous scheduling
+        S->>S: prefix lookup and token budget
+        S->>W: schedule child Prefill chunks
+        W-->>S: native Prefill progress
+        S-->>E: child Prefill ready
+    end
+    E->>E: prefill_ready_mask all true
+    E->>R: create BatchBeamSession
+    R-->>E: WorkerSessionHandle
+    E->>S: enter Beam Decode
 ~~~
 
-必须定义：
+每个 child Request 继续使用原生能力：
 
-- resource format version；
-- dtype、shape 与 CSR invariants；
-- edge token 排序；
-- node/child bounds；
-- digest 覆盖全部语义字段；
-- registration 幂等；
-- shutdown 清理；
-- 未知或冲突 digest 直接失败。
+- get_computed_blocks 与 Prefix Cache 命中；
+- Paged KV block 分配和引用计数；
+- chunked prefill；
+- continuous batching；
+- Scheduler token budget；
+- 不同 prompt 长度独立推进。
 
-未来 GPU Trie buffer 可继续复用同一个 digest 和 lease 语义，而不改变 Request API。
+本方案不建立用户关联 KV，也不改变原生 Prefix Cache 的匹配和逐出策略。
+
+### 5.2 Prefill Barrier
+
+早完成的 child 可以先保存 Prefill logits 和 Prefix KV，但整个 BatchBeamSession 只有在
+prefill_ready_mask[B] 全部为真后才能进入共同 Beam Decode。
+
+~~~text
+child 0 ready ─┐
+child 1 ready ─┼─→ Batch Prefill Barrier → initialize B × W Beam state
+...            │
+child B-1 ready┘
+~~~
+
+Worker 可以提前执行单个 item 的初始 constrained selection，但 Batch Session 的 Decode
+不能在其他 item 尚未完成 Prefill 时开始。
+
+### 5.3 Prefix KV 生命周期
+
+每个 child Request 的 Prefix blocks 在 Session 期间保持绑定：
+
+~~~text
+Native Prefill
+→ Prefix Paged KV retained
+→ Beam Decode reads shared Prefix KV
+→ Beam suffix written into dedicated Beam KV
+→ Worker teardown acknowledged
+→ child Requests and Prefix bindings released
+~~~
+
+Scheduler 继续是 Prefix KV 的唯一所有者。Worker 不复制一套 Prompt Paged KV，也不自行
+释放原生 block。
 
 ---
 
-## 12. Cancel、错误、迟到结果与清理
+## 6. Worker-Owned Beam Runtime
 
-### 12.1 Session 终止不是一个函数调用
+### 6.1 为什么整个后处理闭环都要下沉
 
-一个 Session 可能同时存在于：
+约束过滤、Beam select 和 KV reorder 共享同一组数据：
 
-- Controller registry；
-- Scheduler request table；
-- KV manager；
-- Worker Beam session/slot；
-- Engine output correlation table；
-- in-flight device execution；
-- terminal tombstone。
+- logits 和 per-parent candidates；
+- cumulative beam scores；
+- selected token IDs；
+- parent beam indices；
+- constraint node state；
+- sequence history；
+- Beam suffix KV ancestry。
 
-因此终止需要一个有序、幂等的协议：
+如果只把 Trie 过滤放在 Worker，而把 select_token 留在 EngineCore，会形成：
+
+~~~text
+Worker 产生 W × K candidates
+→ EngineCore 选择 token 和 parent
+→ Worker 再执行 constraint state 与 KV reorder
+~~~
+
+这既扩大 IPC，也产生两套状态权威。因此采用一个 Worker 内部原子闭环：
 
 ~~~mermaid
-flowchart TD
-    X["Cancel or failure"]
-    C["Stop Controller decisions"]
-    S["Mark Request terminal"]
-    R["Publish one final result"]
-    I{"Step in flight?"}
-    D["Drain late completion"]
-    W["Dispatch Worker teardown"]
-    K["Free Scheduler / KV once"]
-    Z["Remove tombstone after both complete"]
+flowchart LR
+    LOGITS["Logits"]
+    FILTER["Constraint Candidate Select"]
+    LOCAL["Per-parent Top-K"]
+    SCORE["Add Cumulative Beam Score"]
+    GLOBAL["Global Top-W"]
+    PARENT["Token IDs + Parent IDs"]
+    STATE["Sequence + Constraint State"]
+    KV["Beam KV Reorder"]
+    DONE["Epoch Commit"]
 
-    X --> C --> S
-    S --> R
-    S --> I
-    I -->|Yes| D
-    I -->|No| W
-    D --> W
-    W --> K
-    R --> Z
-    K --> Z
+    LOGITS --> FILTER
+    FILTER --> LOCAL
+    LOCAL --> SCORE
+    SCORE --> GLOBAL
+    GLOBAL --> PARENT
+    PARENT --> STATE
+    STATE --> KV
+    KV --> DONE
 ~~~
 
-FinalResult 的发布不必等待设备资源全部回收，否则会把 teardown latency 暴露给用户；但
-Session tombstone 只能在“终态已投递”和“资源已安全回收”两个条件都满足后删除。
+这里的 select_token 应拆成三个清晰操作：
 
-### 12.2 迟到结果
-
-Cancel 后到达的 output 不能：
-
-- 恢复 Controller；
-- 产生下一 decision；
-- 再次发布终态；
-- 重新创建 Request；
-- 释放已经复用给其他 Session 的 slot。
-
-需要保留有界 tombstone：
-
-~~~text
-session_id → terminal reason + last epoch + resource generation
-~~~
-
-直到确定不会再收到旧 epoch，或 Worker teardown ack 已完成。
-
-### 12.3 错误域
-
-推荐错误分类：
-
-| 错误 | 处理 |
-| --- | --- |
-| 参数或资源 ID 无效 | admission 前拒绝 |
-| Controller invariant 失败 | 当前 Session FAILED |
-| step/epoch mismatch | 当前 Session fail-fast |
-| Worker session-local error | 当前 Session FAILED |
-| Scheduler 全局不变量损坏 | Engine fatal |
-| 未知 active session output | 记录并隔离，必要时 Engine fatal |
-| 已终止 Session 的迟到 output | tombstone 校验后丢弃 |
-
-Offline batch 中，一个 Session 的合法 session-local failure 不应破坏其他 Session。
-
----
-
-## 13. 输出协议与 Logprobs
-
-### 13.1 Final-only
-
-EngineCore 应拦截 Controller-owned 中间输出，不把它们放入 Frontend 普通 output queue。
-
-Frontend 只看到：
-
-~~~text
-BeamFinalResult
-  ├─ beams
-  ├─ scores
-  ├─ finish reason
-  ├─ optional logprobs
-  └─ optional structured error
-~~~
-
-### 13.2 Logprobs 瘦身
-
-输出成本应由 caller-visible contract 决定：
-
-| 模式 | 返回内容 | 适用场景 |
+| 操作 | 含义 | 所有者 |
 | --- | --- | --- |
-| none | token、score、finish reason | 默认 Serving/Offline |
-| selected | 最终选中 token 的 logprob | 评估与调试 |
-| top-k | 每步有限候选 | 深度诊断 |
-| full internal | 仅测试/开发 | 不作为默认公网协议 |
+| candidate_select | 在约束集合中为每个 parent 选择候选 | ConstraintHeadExtension |
+| beam_select | 在 W × K 中为每个 item 选择新的 top-W | BeamSelector |
+| final_select | 最后一步选择 result_width 个结果 | BeamSelector |
 
-不要在每一步复制完整 history 和候选 logprobs。推荐：
+三个操作都位于 Worker 边界内。
 
-1. Controller 内保存 parent pointer；
-2. 只在最终 top result_width beams 上回溯；
-3. 按 output spec 投影 logprobs；
-4. 最终一次序列化。
+### 6.2 Worker Session 状态
+
+~~~python
+@dataclass
+class WorkerBatchBeamSession:
+    batch_session_id: str
+    child_request_ids: tuple[str, ...]  # B
+    item_slots: tuple[int, ...]         # B
+    resource_handle: str
+
+    step: int
+    epoch: int
+    beam_scores: Tensor                 # [B, W]
+    sequence: Tensor                    # [B, W, S]
+    constraint_state: Tensor            # [B, W]
+    active_mask: Tensor                 # [B, W]
+    terminal_mask: Tensor               # [B]
+~~~
+
+Worker 是这些字段的唯一权威。EngineCore 不保存可独立重建另一套 Beam decision 的
+scores、Trie node 或 sequence。
+
+### 6.3 Worker 返回协议
+
+Worker 只返回调度和最终路由需要的紧凑结果：
+
+~~~python
+@dataclass(frozen=True)
+class WorkerBeamStepResult:
+    batch_session_id: str
+    step: int
+    epoch: int
+    selected_token_ids: Tensor   # [B, W]
+    parent_indices: Tensor       # [B, W]
+    active_mask: Tensor          # [B, W]
+    terminal_mask: Tensor        # [B]
+    finished: bool
+    error: str | None
+~~~
+
+当结果返回 EngineCore 时，Worker 已完成 constraint state、sequence 和 Beam KV 的实际提交。
+parent_indices 可以用于观测和 Scheduler 投影，但 EngineCore 不再重新执行选择。
 
 ---
 
-## 14. 与后续执行优化的关系
+## 7. 默认 Constraint Resource：模型级辅助产物
 
-本方案解决的是控制权、Request 生命周期与前后端边界。后续可以在不改变这些上层契约的
-前提下继续演进执行层：
+### 7.1 冻结决策
+
+一个模型实例启动时只加载一个默认约束资源：
+
+- 配置只声明一个 artifact；
+- Worker 启动时加载一次；
+- 所有 BatchBeamSession 共享同一个 immutable ResourceHandle；
+- 请求可以省略 resource_id，由 Engine 注入默认 ID；
+- 如果请求显式携带非默认 ID，admission 直接失败；
+- 当前不支持运行期注册第二张表；
+- 当前不支持逐出、热更新和按用户覆盖。
+
+保留 resource_id 的目的，是稳定内部 ABI，而不是在当前版本开放多资源能力。
+
+### 7.2 配置模型
+
+推荐在 GR 的 VllmConfig 扩展中增加强类型 ConstraintHeadConfig。YAML 是输入形式，
+Worker 不直接解析任意 YAML。
+
+~~~yaml
+constraint_head:
+  enabled: true
+  resource_id: default
+
+  artifact:
+    uri: /models/openonerec/constraint/trie.npz
+    format: trie_csr_v1
+    sha256: "<artifact-digest>"
+    tokenizer_digest: "<tokenizer-digest>"
+    vocab_size: "<model-vocab-size>"
+
+  runtime:
+    backend: cpu_trie
+    placement: host
+    required: true
+~~~
+
+内部配置：
+
+~~~python
+@dataclass(frozen=True)
+class ConstraintArtifactSpec:
+    uri: str
+    format: str
+    sha256: str
+    tokenizer_digest: str
+    vocab_size: int
+
+
+@dataclass(frozen=True)
+class ConstraintRuntimeConfig:
+    backend: str
+    placement: str
+    required: bool
+
+
+@dataclass(frozen=True)
+class ConstraintHeadConfig:
+    enabled: bool
+    resource_id: str
+    artifact: ConstraintArtifactSpec
+    runtime: ConstraintRuntimeConfig
+~~~
+
+必须区分：
+
+| 字段 | 表达什么 | 示例 |
+| --- | --- | --- |
+| format | 磁盘序列化格式 | trie_csr_v1、prefix_table_v1 |
+| backend | 运行时执行器 | cpu_trie、cuda_table、npu_table |
+| placement | 常驻位置 | host、device、hybrid |
+| resource_id | 模型实例内部稳定标识 | default |
+
+同一种 artifact format 可以被不同 backend 物化，避免文件格式与设备实现绑定。
+
+### 7.3 加载时机
+
+资源生命周期像权重，但不进入模型 state_dict：
 
 ~~~mermaid
 flowchart TB
-    C["Engine-owned Beam Session"]
-    S["Persistent Scheduler Contract"]
-    W["Worker-owned Beam State"]
-    K["Dedicated BeamKV Pool"]
-    G["CUDA / ACL Full Graph"]
+    YAML["YAML or Deployment Config"]
+    TYPED["Typed ConstraintHeadConfig"]
+    INIT["Worker.init_device"]
+    MODEL["Load Model Weights"]
+    HOST["Load and Validate Host Resource"]
+    DEVICE["Optional Device Materialization"]
+    BEAM["Initialize Beam Runtime Capacity"]
+    PROFILE["Determine Available Memory"]
+    KV["Allocate Native Paged KV"]
+    WARM["Warmup and Graph Capture"]
 
-    C --> S
-    S --> W
-    W --> K
-    K --> G
+    YAML --> TYPED
+    TYPED --> INIT
+    INIT --> MODEL
+    MODEL --> HOST
+    HOST --> DEVICE
+    DEVICE --> BEAM
+    BEAM --> PROFILE
+    PROFILE --> KV
+    KV --> WARM
 ~~~
 
-- Controller 可以从 EngineCore CPU 实现替换为 Worker/GPU decision；
-- Prefix KV 仍由 Scheduler Request 持有；
-- suffix BeamKV 可以迁移到固定 Pool；
-- BeamContinuation 可以映射到固定地址的 device metadata；
-- Full Graph 只改变一步怎样执行，不改变 Session 如何开始、继续和结束。
+推荐调用关系：
 
-因此，Worker Beam、BeamKV 与 Graph 都是本方案之上的执行优化，而不是重新设计
-Online/Offline 入口或 Scheduler 生命周期。
+~~~python
+def Worker.load_model(self):
+    self.model_runner.load_model()
+    self.model_runner.load_constraint_head(
+        self.vllm_config.constraint_head_config
+    )
+    self.model_runner.initialize_beam_runtime(
+        self.vllm_config.beam_runtime_config
+    )
+~~~
+
+逻辑上三者都属于 Worker 启动阶段，但资源类型仍然分开：
+
+- 模型参数属于 Weight Loader；
+- Constraint Artifact 属于 Constraint Resource Loader；
+- Beam KV 属于 Beam Runtime Pool。
+
+如果 Device Constraint Buffer 或 Beam Pool 在显存探测后才创建，原生 Paged KV 可能已经
+占用全部可用显存。因此所有常驻设备资源必须在 determine_available_memory 之前物化或预留。
+
+### 7.4 Resource Manager 与 Buffer
+
+~~~python
+class ConstraintResourceManager:
+    def load(
+        self,
+        config: ConstraintHeadConfig,
+        model_meta: ModelMeta,
+        device: Device,
+    ) -> ConstraintResourceHandle:
+        ...
+
+    def get_default(self) -> ConstraintResourceHandle:
+        ...
+
+    def close(self) -> None:
+        ...
+~~~
+
+~~~python
+@dataclass(frozen=True)
+class ConstraintResourceHandle:
+    resource_id: str
+    artifact_format: str
+    backend: str
+    digest: str
+    host_resource: object | None
+    device_resource: object | None
+~~~
+
+当前 CPU Trie：
+
+~~~text
+Host Resource
+├─ node_offsets
+├─ edge_token_ids
+├─ edge_child_nodes
+└─ terminal_nodes
+
+Device Resource = None
+~~~
+
+未来 Device Table：
+
+~~~text
+Host Resource
+└─ Manifest or mmap source
+
+Device Resource
+├─ token IDs
+├─ offsets
+├─ values
+└─ backend metadata
+~~~
+
+Buffer 是 immutable persistent resource，不是可逐出的 request cache。它只在 Worker
+shutdown、模型 unload 或显式重新加载模型时释放。
+
+设备 Tensor 可以由 ResourceManager 直接持有，也可以在 ConstraintHeadExtension 中使用
+non-persistent module buffer；无论哪种方式，都不能被写入模型 state_dict。
+
+### 7.5 启动校验
+
+以下任一条件失败都应终止 Worker 启动：
+
+- artifact 不存在或不可读；
+- format version 不支持；
+- artifact digest 不匹配；
+- tokenizer digest 不匹配；
+- vocab_size 与 LM Head logits 宽度不匹配；
+- CSR 或 table shape 不合法；
+- TP/PP 相关 rank 得到不同资源版本；
+- required resource 无法完成对应 placement 的物化。
+
+不允许在配置声明 required 时静默回退到无约束生成。
 
 ---
 
-## 15. 最终设计决策
+## 8. Scheduler 与 BatchBeamCoordinator
 
-1. Beam Search 是 Engine 内部的长生命周期 Session，而不是 Serving coroutine。
-2. BeamSearchController 首先以纯 CPU 算法对象形式下沉，行为与旧路径严格对齐。
-3. EngineCore 驱动 Controller，但所有 model execution 仍经过 Scheduler。
-4. Prefill 与 Decode 复用同一个逻辑 Request，Prefix KV 持有到 Session 终态。
-5. Beam 并行 lane 与串行 token history 必须在数据模型中分离。
-6. 每个 Session 同时最多一个 in-flight epoch，step/epoch mismatch fail-fast。
-7. Constraint 以 immutable token-ID resource 注册，Request 只携带 digest。
-8. 中间结果留在 Engine，Frontend 只接收一次 BeamFinalResult。
-9. Cancel、错误、迟到 output、Scheduler free 与 Worker teardown 使用幂等闭环。
-10. Online 与 Offline 共用 Engine API、Controller、Request 和资源生命周期。
-11. Online 与 Offline 可以使用不同 SchedulingPolicy。
-12. 当前 run-to-completion 和单 active slot 是可替换 policy，不是长期架构边界。
-13. Output 与 Logprobs 使用独立内部协议，不侵入 Controller 和 Scheduler 生命周期。
-14. Worker/GPU Beam decision、BeamKV 和 Graph 在该控制面之上独立演进。
+### 8.1 EngineCore 保存协调状态，不保存 Beam 算法状态
+
+~~~python
+@dataclass
+class BatchBeamCoordinator:
+    batch_session_id: str
+    child_request_ids: tuple[str, ...]
+    stage: str
+    prefill_ready_mask: tuple[bool, ...]
+    next_epoch: int
+    in_flight_epoch: int | None
+    completed_epoch: int | None
+    worker_session_handle: str | None
+    final_result_sent: bool
+~~~
+
+它负责：
+
+- 创建和回收 B 个 child Requests；
+- 汇总 Prefill readiness；
+- 将一个逻辑 step 拆成可执行 micro-batches；
+- 检查 step 和 epoch；
+- 处理 cancel、error 和 late output；
+- 向 Frontend 投递一次终态。
+
+它不负责：
+
+- 读取 Trie；
+- 计算 candidate scores；
+- global top-W；
+- 更新 Beam sequence；
+- 执行 Beam KV reorder。
+
+### 8.2 Decode continuation
+
+Beam 的 W 个 lane 是同一逻辑时间步的并行行，不能追加为 child Request 的串行 token
+history。Scheduler 需要显式 Beam continuation metadata：
+
+~~~python
+@dataclass(frozen=True)
+class BeamContinuation:
+    batch_session_id: str
+    child_request_id: str
+    item_index: int
+    epoch: int
+    step: int
+    lane_token_ids: tuple[int, ...]
+    parent_indices: tuple[int, ...]
+    active_width: int
+~~~
+
+child Request 的 Scheduler 视图继续用于 Prefix KV 和 admission；真正的 Beam lane history
+位于 Worker Session。
+
+### 8.3 每一步仍经过 Scheduler
+
+~~~text
+Worker Step Result
+→ BatchBeamCoordinator validates epoch
+→ write next BeamContinuation
+→ Scheduler.schedule
+→ SchedulerOutput
+→ Worker executes next step
+~~~
+
+Scheduler 继续负责：
+
+- token budget；
+- Prefix KV binding；
+- ready/waiting 队列；
+- physical batch composition；
+- cancel 与 Request free；
+- 执行是否能够下发。
+
+### 8.4 调度计量
+
+需要区分：
+
+~~~text
+logical_step_count = 1
+execution_token_count = sum of scheduled active lanes
+active_item_count = number of scheduled items
+~~~
+
+对固定 W 的场景，一个完整 Decode step 的理论执行行数为 B × W；如果 active mask
+收缩或分 micro-batch，下发计量必须使用本轮真实 scheduled lanes。
 
 ---
 
-## 16. 相关设计
+## 9. Prefix Paged KV 与 Beam Suffix KV
 
-### 16.1 背景
+### 9.1 两类 KV 的职责
+
+~~~mermaid
+flowchart LR
+    PROMPT["Prompt Tokens"]
+    NATIVE["Native Paged Prefix KV"]
+    SHARE["Shared by W Beams"]
+    DECODE["Beam Decode Tokens"]
+    SUFFIX["Dedicated Beam Suffix KV"]
+    SELECT["Parent-based KV Reorder"]
+
+    PROMPT --> NATIVE
+    NATIVE --> SHARE
+    SHARE --> DECODE
+    DECODE --> SUFFIX
+    SUFFIX --> SELECT
+    SELECT --> DECODE
+~~~
+
+| KV 类型 | 所有者 | 组织方式 | 生命周期 |
+| --- | --- | --- | --- |
+| Prefix KV | Scheduler / native KV manager | Paged KV | child Prefill 到 Session teardown |
+| Beam suffix KV | Worker BeamKVManager | 固定容量或专用 Pool | Worker Session create 到 release |
+
+Prefill Prefix 只保存一份，不为 W 个 Beam 复制。Beam 分叉只发生在 suffix。
+
+### 9.2 容量与显存预算
+
+所有持久和峰值内存必须满足：
+
+~~~text
+M_weights
++ M_constraint
++ M_nativeKV
++ M_beamKV
++ M_beamState
++ M_graph
++ M_workspace
++ M_temporary
++ M_fragmentation
+<= M_usable
+~~~
+
+Beam runtime 配置至少描述：
+
+~~~yaml
+beam_runtime:
+  max_active_beam_items: "<deployment-capacity>"
+  max_beam_width: "<deployment-capacity>"
+  max_decode_steps: "<deployment-capacity>"
+  max_active_sessions: "<deployment-policy>"
+~~~
+
+这些值是资源 envelope，也是 Scheduler admission 的依据。不能在首个请求到达后按照请求
+大小临时创建或扩容 Beam KV Pool。
+
+CPU Trie 只占 Host 内存；未来 Device Table 会占设备常驻内存。一个模型实例只加载一个
+默认资源，使这一部分显存可在启动期准确预算。
+
+---
+
+## 10. Session 状态、Epoch 与资源释放
+
+### 10.1 Batch Session 状态机
+
+~~~mermaid
+stateDiagram-v2
+    [*] --> WAITING
+    WAITING --> PREFILLING: admit B child Requests
+    PREFILLING --> PREFILL_READY: all items ready
+    PREFILL_READY --> DECODING: Worker Session created
+    DECODING --> DECODING: epoch committed
+    DECODING --> FINALIZING: Worker reports terminal
+    FINALIZING --> DRAINING: stop scheduling and teardown
+    DRAINING --> FINISHED: Worker ack and child free
+    FINISHED --> [*]
+
+    WAITING --> ABORTED
+    PREFILLING --> ABORTED
+    PREFILL_READY --> ABORTED
+    DECODING --> ABORTED
+    WAITING --> FAILED
+    PREFILLING --> FAILED
+    PREFILL_READY --> FAILED
+    DECODING --> FAILED
+    ABORTED --> DRAINING
+    FAILED --> DRAINING
+~~~
+
+### 10.2 Epoch 协议
+
+每个 Session 初始最多一个 in-flight epoch：
+
+~~~text
+dispatch:
+  require in_flight_epoch is None
+  in_flight_epoch = next_epoch
+  next_epoch += 1
+
+complete:
+  require result.epoch == in_flight_epoch
+  completed_epoch = in_flight_epoch
+  in_flight_epoch = None
+~~~
+
+如果一个 epoch 被拆成多个 micro-batches，in_flight_epoch 在全部分片被 Worker
+StepAccumulator 接收并原子提交之前不能清空。
+
+### 10.3 Cancel、错误和 teardown
+
+资源释放顺序：
+
+~~~mermaid
+flowchart TD
+    TERM["Terminal, Cancel or Failure"]
+    STOP["Stop New Scheduling"]
+    LATE{"Epoch In Flight?"}
+    DRAIN["Drain or Fence Late Result"]
+    FINAL["Publish One Final Result"]
+    WFREE["Worker Releases Session and Beam KV"]
+    ACK["Worker ReleaseAck"]
+    CFREE["Scheduler Frees B Child Requests"]
+    PFREE["Release Prefix KV Bindings"]
+    REMOVE["Remove Coordinator Tombstone"]
+
+    TERM --> STOP
+    STOP --> LATE
+    LATE -->|Yes| DRAIN
+    LATE -->|No| WFREE
+    DRAIN --> WFREE
+    STOP --> FINAL
+    WFREE --> ACK
+    ACK --> CFREE
+    CFREE --> PFREE
+    FINAL --> REMOVE
+    PFREE --> REMOVE
+~~~
+
+最终结果可以先于物理资源释放返回，但 Coordinator tombstone 必须保留到：
+
+- final result 已投递；
+- Worker session 已释放；
+- B 个 child Requests 已 free；
+- Prefix KV binding 已解除。
+
+约束资源不随 Session teardown 释放，它继续作为模型实例的常驻资源。
+
+---
+
+## 11. Online Serving 与 Offline API
+
+Online 与 Offline 是两个平级 Frontend：
+
+~~~mermaid
+flowchart TB
+    subgraph FRONTENDS["Peer Frontends"]
+        direction LR
+        ONLINE["Online Serving"]
+        OFFLINE["Offline API"]
+    end
+
+    API["EngineBeamAPI"]
+    CORE["BatchBeamCoordinator + Scheduler"]
+    WORKER["Worker BeamRuntime"]
+
+    ONLINE --> API
+    OFFLINE --> API
+    API --> CORE
+    CORE --> WORKER
+~~~
+
+两者共用：
+
+- BatchBeamSession；
+- B child Request 模型；
+- 原生 Prefill 与 Prefix KV；
+- Worker Constraint Resource；
+- BeamRuntime 与 BeamKV；
+- Scheduler continuation；
+- final-only 内部协议。
+
+入口差异只体现在：
+
+| 维度 | Online Serving | Offline API |
+| --- | --- | --- |
+| 到达方式 | 动态请求 | 业务可提前组好 B |
+| 优化目标 | 延迟与取消响应 | 吞吐与 batch 完成时间 |
+| admission policy | 按到达和容量 | 可利用已知 batch 信息 |
+| 输出适配 | OpenAI 或 RequestOutput | list、tensor 或 batch result |
+
+Offline 不建立另一套 Beam 主循环，也不采用“先把所有全局 Prefill 做完，再统一 Decode”的
+独立执行器。它仍然使用同一个 Scheduler，只是提交时已经知道完整业务 Batch。
+
+---
+
+## 12. TP、PP 与 DP 下的资源和选择
+
+约束资源在逻辑上只有一个默认版本，但在分布式模型中可能存在多个物理副本。
+
+### 12.1 Selector Rank
+
+推荐由拥有完整 logits 的 selector rank 执行：
+
+- Constraint candidate select；
+- global Beam select；
+- final select。
+
+随后广播：
+
+~~~text
+selected_token_ids
+parent_indices
+active_mask
+terminal_mask
+~~~
+
+所有持有 Beam suffix KV 的 TP/PP ranks 根据相同 parent_indices 执行 KV reorder。
+
+### 12.2 Resource Placement
+
+- 所有相关 Worker 校验相同 artifact digest；
+- CPU Trie 可以只在 selector rank 常驻；
+- Device Table 只在执行约束算子的 rank 物化，除非算子本身是分布式实现；
+- 每个 DP replica 拥有本地物理副本；
+- BatchBeamSession 必须对 DP replica 保持粘性，不能在 Decode 中途迁移。
+
+---
+
+## 13. CPU Trie 到 Device Table 的演进
+
+上层只依赖统一 ConstraintExecutor：
+
+~~~python
+class ConstraintExecutor:
+    def select_candidates(
+        self,
+        logits: Tensor,
+        constraint_state: Tensor,
+        resource: ConstraintResourceHandle,
+        top_k: int,
+    ) -> ConstraintSelection:
+        ...
+~~~
+
+### 13.1 当前 backend
+
+~~~text
+artifact format = trie_csr_v1
+runtime backend = cpu_trie
+placement = host
+~~~
+
+CPU Trie 作为 Worker 内部实现继续使用。即使发生 Device 到 Host 的候选同步，也不再把
+候选发送到 EngineCore。
+
+### 13.2 后续 backend
+
+~~~text
+artifact format = trie_csr_v1 or prefix_table_v1
+runtime backend = cuda_table or npu_table
+placement = device
+~~~
+
+替换后：
+
+- Config、ResourceHandle 和 Session ABI 保持稳定；
+- Scheduler 不感知 Trie 或 Device Table；
+- EngineCore 不重新获得 candidate decision；
+- BeamSelector 和 BeamKVManager 继续使用相同 selected token 与 parent 协议；
+- 常驻 Buffer 地址可以纳入后续 graph capture。
+
+### 13.3 多资源能力的重访条件
+
+当前不实现多个 resource_id。只有出现以下明确需求时再扩展：
+
+- 同一模型实例必须同时服务多个独立 catalog；
+- 重启模型切换 catalog 的成本不可接受；
+- 多资源带来的额外 Host/Device 内存有明确预算；
+- Session 能够绑定资源 generation，并完成并发版本释放。
+
+扩展时可以把单个 default handle 演进为只读 registry，而不改变 Request 中预留的
+resource_id 字段。
+
+---
+
+## 14. 最终设计决策
+
+1. Online Serving 与 Offline API 是平级入口，共用一套 Engine 和 Worker Runtime。
+2. 一个业务 BatchRequest 对应一个 BatchBeamSession。
+3. 一个 BatchBeamSession 由 B 个原生 child Requests 支撑，不合成一个原生 Request。
+4. B 个 child Requests 独立使用原生 Scheduler、Paged KV、Prefix Cache 和 chunked
+   prefill。
+5. Batch Prefill barrier 完成后进入共同 Beam Decode。
+6. Prefix KV 继续由 Scheduler 持有，Beam suffix KV 由 Worker BeamKVManager 持有。
+7. EngineCore 的算法 Controller 收敛为 BatchBeamCoordinator，只保留生命周期与调度状态。
+8. Worker 是 Beam score、sequence、constraint state 和 Beam KV 的唯一权威。
+9. candidate_select、beam_select、select_token、final_select 和 KV reorder 全部位于 Worker。
+10. 一个逻辑 step 可以拆成多个物理 micro-batches，但只能原子提交一次 epoch。
+11. 每个 Decode execution 继续经过 Scheduler，EngineCore 不绕过 Scheduler 调用 Worker。
+12. 一个模型实例只加载一个默认约束资源，内部保留 resource_id。
+13. 约束资源由 ConstraintHeadConfig 声明，在 Worker 模型加载阶段解析并常驻。
+14. 约束资源不进入 state_dict，不随 Request 发送，不参与 Session 逐出。
+15. 当前采用 CPU Trie backend，未来通过相同接口替换为 Device Table。
+16. Device Constraint Buffer 和 Beam Pool 在原生 KV 显存探测前完成物化或预留。
+17. Frontend 只接收一次 BatchBeamFinalResult，不消费中间候选。
+18. 当前不涉及用户关联 KV、约束资源热更新和多资源 registry。
+
+---
+
+## 15. 相关设计
+
+### 15.1 背景
 
 - [#35：Serving Beam Controller 下沉与 Persistent Beam Session](https://github.com/zhanghanleo10/vllm-gr/issues/35)
 - [PR #290：Engine-owned Controller PoC](https://github.com/JiusiServe/vllm-gr/pull/290)
 
-### 16.2 本仓库相关文档
+### 15.2 本仓库相关文档
 
 - [Beam 增量 Decode 统一架构](./beam_incremental_decode_unified_architecture_design.md)
 - [BeamKV Cache 架构与调度](./beam_kv_cache_architecture_and_scheduling_design.md)
