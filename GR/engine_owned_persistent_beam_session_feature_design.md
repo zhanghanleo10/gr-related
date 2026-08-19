@@ -315,16 +315,14 @@ Online Serving 和 Offline API 是两个平级入口。二者都直接调用 Eng
 通过另一方间接进入 Engine，也不在自己的入口层保存 Beam 主循环。
 
 ~~~mermaid
-flowchart TB
-    subgraph ENTRY["Peer Frontends"]
-        ON["Online Serving"]
-        OFF["Offline API"]
-    end
-
-    API["EngineBeamAPI"]
-    CORE["Engine-owned Beam Session"]
-    SCH["Scheduler + Persistent Request"]
-    EXEC["Worker / ModelRunner"]
+block-beta
+    columns 2
+    ON["Online Serving"]
+    OFF["Offline API"]
+    API["EngineBeamAPI"]:2
+    CORE["Engine-owned Beam Session"]:2
+    SCH["Scheduler + Persistent Request"]:2
+    EXEC["Worker / ModelRunner"]:2
 
     ON --> API
     OFF --> API
