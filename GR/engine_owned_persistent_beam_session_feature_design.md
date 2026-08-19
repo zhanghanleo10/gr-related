@@ -142,54 +142,64 @@ Serving 计算 Beam decision
 
 ~~~mermaid
 flowchart TB
-    subgraph CONFIG["Deployment Configuration"]
-        CFG["ConstraintHeadConfig"]
-        LOAD["Constraint Artifact Loader"]
-    end
-
-    subgraph FRONTEND["Frontend Layer"]
+    subgraph FRONTEND["① Serving / API Layer"]
         ON["Online Adapter"]
         OFF["Offline Adapter"]
     end
 
-    subgraph ENGINE["EngineCore"]
+    subgraph ENGINE["② EngineCore"]
+        direction TB
         API["EngineBeamAPI"]
         COORD["BatchBeamCoordinator"]
         ROUTER["FinalResultRouter"]
+
+        subgraph SCHEDULER["Scheduler"]
+            direction LR
+            REQS["B Persistent Child Requests"]
+            PREFIX["Native Prefix KV Ownership"]
+            BUDGET["Token and Capacity Admission"]
+
+            REQS --> PREFIX
+            REQS --> BUDGET
+        end
+
+        API --> COORD
+        COORD --> REQS
+        COORD --> ROUTER
     end
 
-    subgraph SCHEDULER["Scheduler"]
-        REQS["B Persistent Child Requests"]
-        PREFIX["Native Prefix KV Ownership"]
-        BUDGET["Token and Capacity Admission"]
-    end
-
-    subgraph WORKER["Worker / ModelRunner"]
+    subgraph WORKER["③ Worker / ModelRunner"]
+        direction TB
+        LOAD["ConstraintHeadConfig + Default Artifact"]
         CRM["ConstraintResourceManager"]
         CHE["ConstraintHeadExtension"]
         SESSION["WorkerBatchBeamSession"]
         SELECT["BeamSelector"]
         BKV["BeamKVManager"]
+
+        LOAD --> CRM
+        CRM --> CHE
+        SESSION --> CHE
+        CHE --> SELECT
+        SELECT --> BKV
     end
 
-    CFG --> LOAD
-    LOAD --> CRM
     ON --> API
     OFF --> API
-    API --> COORD
-    COORD --> REQS
-    REQS --> PREFIX
-    REQS --> BUDGET
     REQS --> SESSION
-    CRM --> CHE
-    CHE --> SELECT
-    SESSION --> SELECT
-    SELECT --> BKV
-    SELECT --> COORD
-    COORD --> ROUTER
-    ROUTER --> ON
-    ROUTER --> OFF
 ~~~
+
+主图只表达自顶向下的所有权与下行执行链：
+
+~~~text
+Serving / Offline
+→ EngineCore
+→ Scheduler
+→ Worker / ModelRunner
+~~~
+
+WorkerBeamStepResult 沿相同边界返回 BatchBeamCoordinator；最终结果由
+FinalResultRouter 返回对应 Frontend。返回路径没有再画入主图，避免反向箭头破坏层次关系。
 
 ### 3.1 责任矩阵
 
