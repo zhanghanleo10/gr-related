@@ -1,9 +1,9 @@
-# Batch Beam：Serving 到 EngineCore 入口层设计
+# Batch Beam：Online / Offline Frontend 到 EngineCore 入口层设计
 
 > 状态：Design / Frozen for discussion  
 > 日期：2026-08-20  
 > 关联 RFC：[Dual Prefill Barrier 与 Worker Run-to-Completion Decode](https://github.com/zhanghanleo10/vllm-gr/issues/35)  
-> 范围：只定义 `Serving → EngineBeamAPI / AsyncLLM → EngineCore` 的输入、协议、身份、输出注册和取消边界；不展开 Scheduler、Prefill Barrier、ModelRunner 或 Worker Decode 的内部实现。
+> 范围：定义 Online Serving 与 Offline `GRLLM/LLM` 如何通过统一的 Batch Beam Frontend 进入 EngineCore，包括输入、协议、身份、结果收集和取消边界；不展开 Scheduler、Prefill Barrier、ModelRunner 或 Worker Decode 的内部实现。
 
 ---
 
@@ -11,15 +11,17 @@
 
 入口层冻结为：
 
-> **一个业务 Batch Beam 请求，只向 EngineCore 发送一条组级 `ADD_BATCH_BEAM` 消息。**
+> **Online 和 Offline 共用同一个 Session 协议；每个 Batch Beam Session 只向 EngineCore 提交一条组级 `ADD_BATCH_BEAM`。**
 
-Serving 不能把 B 个 item 拆成 B 次普通 `ADD`，也不能把一次 Beam Decode 拆成多次 `max_tokens=1` 请求。
+Online Serving 和 Offline `GRLLM` 都不能把 B 个 item 拆成 B 次普通 `ADD`，也不能把一次 Beam Decode 拆成多次 `max_tokens=1` 请求。
 
 ```mermaid
 flowchart LR
-    HTTP[HTTP / Offline Input]
-    SERVING[Serving Adapter]
-    API[EngineBeamAPI / AsyncLLM]
+    HTTP[HTTP Request]
+    OFFCALL[GRLLM.beam_search<br/>N prompts]
+    SERVING[Online Serving Adapter]
+    OFFLINE[Offline Adapter<br/>partition N into Session groups]
+    API[Shared BatchBeam Frontend API]
     CLIENT[EngineCoreClient]
     WIRE[One ADD_BATCH_BEAM]
     ENTRY[EngineCore Beam Entry]
@@ -27,7 +29,9 @@ flowchart LR
     CHILD[B Native Child Requests]
 
     HTTP --> SERVING
+    OFFCALL --> OFFLINE
     SERVING --> API
+    OFFLINE --> API
     API --> CLIENT
     CLIENT --> WIRE
     WIRE --> ENTRY
@@ -35,26 +39,28 @@ flowchart LR
     ENTRY --> CHILD
 ```
 
-三层职责：
+分层职责：
 
 | 层 | 核心职责 |
 | --- | --- |
-| Serving Adapter | 外部协议、render/tokenize、参数映射、最终输出格式化 |
-| EngineBeamAPI / AsyncLLM | 创建内部身份、复用 InputProcessor、注册独立 Session final collector、组装原子 envelope |
+| Online Serving Adapter | HTTP/OpenAI 协议、render/tokenize、在线取消与响应格式化 |
+| Offline GRLLM Adapter | 同步调用、N→Session 分组、结果顺序恢复、异常/中断清理 |
+| Shared BatchBeam Frontend API | 创建内部身份、复用 InputProcessor、注册 Session result sink、组装同一个原子 envelope |
 | EngineCore Beam Entry | authoritative validation、冻结部署模式、创建 Coordinator、原子注册 B child、交给 Scheduler admission |
 
 必须区分两种规模：
 
 ```text
-入口层：B 个业务 item = B 个 native child Request
+Offline API call：N 个输入（可能包含多个 Session）
+单个 Session：B 个业务 item = B 个 native child Request
 Worker：B × W 个 Beam row
 ```
 
-入口层不能把 W 个 Beam 分支膨胀成 W 个普通 Request；`B × W` 只作为部署 envelope/capacity gate，真正的 Beam row 在 Worker Bootstrap 后产生。
+`N`、`B`、`W` 不能混淆：Offline 一次调用的 N 个输入可按容量分为多个 B-sized Session；入口层不能把 W 个 Beam 分支膨胀成 W 个普通 Request。`B × W` 只作为部署 envelope/capacity gate，真正的 Beam row 在 Worker Bootstrap 后产生。
 
 明确不在该边界发生：
 
-- Serving 端 Beam loop；
+- Online Serving / Offline GRLLM 端 Beam loop；
 - Catalog/Trie/constraint candidate filtering；
 - Top-W、parent、EOS completion 或 final select；
 - Prefill Barrier、Prefix Cache lookup、PromptKV/BeamKV 分配；
@@ -65,7 +71,7 @@ Worker：B × W 个 Beam row
 
 ## 1. 为什么不能继续使用当前 `ADD_BATCH`
 
-当前 vllm-gr 的优化路径是：
+当前 vllm-gr Online 优化路径是：
 
 ```text
 Serving Beam loop
@@ -90,47 +96,65 @@ Serving Beam loop
 
 因此新入口不是在 `ADD_BATCH` 上补几个 optional 字段，而是新增一个独立的组级消息类型。
 
+当前 Offline `GRLLM.beam_search()` 也存在同一个结构性问题，只是调用方式由异步 HTTP 变成同步 engine pump：
+
+```text
+GRLLM.beam_search(prompts, concurrency_limit)
+→ 将 prompts 切成 instances_batch
+→ 每个 token step 构造 EngineCoreRequest / BeamRequestStepUpdate
+→ add_requests(force_batch=True)
+→ 反复 llm_engine.step() 等待本 step 全部输出
+→ Python 做 Catalog/EOS/Top-W/parent 选择
+→ 下一 token step
+```
+
+其中 `instances_batch` 目前只是一次 `ADD_BATCH` 的传输/执行集合，每个 prompt 仍拥有独立 session ID；它不是具有 B-item Barrier 与 all-or-none admission 的 Batch Beam Session。
+
+因此 Offline 不能继续保留另一套 host-side Beam loop。正确目标是：**Online/Offline 只保留不同的调用与结果适配，共用同一个 Session envelope、EngineCore handler 和 Worker run-to-completion。**
+
 ### 1.1 当前可复用与必须替换的部分
 
 可复用：
 
 - Serving 的 chat template / render；
+- Offline `LLM._preprocess_cmpl()` 与同步结果格式；
 - upstream `InputProcessor.process_inputs()`；
 - tokenizer、LoRA、MM input、cache salt、priority 等通用输入处理；
-- OutputProcessor “先注册 collector，再发送请求”的顺序；
+- “先注册 Session result sink，再发送请求”的竞态规避顺序；
 - EngineCoreClient 的 msgspec/ZMQ transport、client index 与 DP routing 基础设施。
 
 必须替换：
 
 - Serving 中的 per-step Beam loop；
+- Offline `GRLLM.beam_search()` 中的 per-step `generate()/llm_engine.step()` Beam loop；
 - `SamplingParams(max_tokens=1, logprobs=W)` 对 Beam 的模拟；
 - `ADD_BATCH(list[EngineCoreRequest])` 作为 Beam Session 入口；
 - `BEAM_REQUEST_STEP_UPDATE`；
 - B 个普通 output collectors；
-- Serving 端 candidate/beam/final select。
+- Serving 端 candidate/beam/final select；
+- Offline 端 candidate/beam/final select。
 
 ---
 
 ## 2. 目标调用链
 
+### 2.1 共享 Core 路径
+
 ```mermaid
 sequenceDiagram
-    participant U as User / Offline Caller
-    participant S as Serving Adapter
-    participant A as EngineBeamAPI / AsyncLLM
-    participant O as Batch OutputProcessor
+    participant F as Online or Offline Adapter
+    participant A as Shared BatchBeam Frontend
+    participant R as Session Result Registry
     participant C as EngineCoreClient
     participant E as EngineCore Beam Entry
     participant B as BatchBeamCoordinator
 
-    U->>S: one external request with B inputs
-    S->>S: schema validation + render/tokenize
-    S->>A: normalized prompts + Beam parameters
+    F->>A: one Session group with B normalized inputs
     A->>A: create session generation and child IDs
     A->>A: InputProcessor.process_inputs x B (no ID reassignment)
-    A->>O: register one Session final-only collector
-    A->>C: add_batch_beam_async(envelope)
-    C->>E: one ADD_BATCH_BEAM frame
+    A->>R: register one Session result sink
+    A->>C: submit one ADD_BATCH_BEAM envelope
+    C->>E: MP frame or Inproc call, same typed contract
     E->>E: authoritative contract validation
     E->>E: freeze Engine config and DP binding
     E->>B: create BatchBeamCoordinator
@@ -140,15 +164,47 @@ sequenceDiagram
 
 只有最后一个步骤完成后，Session 才能进入 Scheduler admission。任何入口错误都必须在“无 child 可见”或“全部 child rollback”状态下结束。
 
+### 2.2 Online 调用
+
+```text
+HTTP/OpenAI request(B items)
+→ Online Serving Adapter
+→ submit_batch_beam_async()
+→ AsyncSessionResultSink
+→ await Final / handle disconnect with group abort
+→ HTTP response
+```
+
+Online 的特有职责是 request/response 协议、异步等待、disconnect 与超时；它不拥有 Beam 算法状态。
+
+### 2.3 Offline 调用
+
+```text
+GRLLM.beam_search(N prompts, concurrency_limit)
+→ _preprocess_cmpl(N)
+→ partition into one or more Session groups, each size B
+→ submit_batch_beam_sync() once per Session
+→ SyncSessionResultSink
+→ llm_engine.step() only pumps Engine until Session terminal
+→ restore original input order
+→ list[BeamSearchOutput] length N
+```
+
+Offline 的同步 `llm_engine.step()` 仍可保留为 Engine 驱动器，但不再按 token step 返回控制权给 Python：一次 Session submission 后只等待 `Accepted/Rejected/Final`，Decode 的 D 个 round 不增加 Frontend→EngineCore 消息数。
+
+### 2.4 xLLM OneRec 的参考边界
+
+xLLM OneRec 的 Online RPC 与 Offline C API 最终都进入同一个 RecMaster/FixedStepsScheduler/RecEngine 主链路，差异停留在外部 adapter。这验证了“调用形态不同，不应复制 Engine 内部协议”的方向。vllm-GR 借鉴的是统一内部链路，不照搬 xLLM 的具体 FixedSteps admission 或无 chunk 策略。
+
 ---
 
-## 3. Serving Adapter 职责
+## 3. Online / Offline Frontend Adapter 职责
 
-Serving 只理解用户协议，不拥有 Engine 内部 Session 状态。
+Frontend Adapter 只理解调用协议，不拥有 Engine 内部 Session 状态。
 
 ### 3.1 输入规范化
 
-Serving 接收一个逻辑请求，其中包含 B 个业务输入：
+Online Serving 接收一个逻辑请求，其中包含 B 个业务输入：
 
 ```python
 class PublicBatchBeamRequest:
@@ -163,6 +219,20 @@ class PublicBatchBeamRequest:
     logprobs: bool | int | None
     include_scores: bool
     include_parent_lineage: bool
+```
+
+Offline 保留用户熟悉的同步批量接口：
+
+```python
+def beam_search(
+    prompts: Sequence[PromptType],          # N inputs in this Python call
+    params: BeamSearchParams,
+    lora_request: Sequence[LoRARequest] | LoRARequest | None = None,
+    *,
+    use_tqdm: bool = False,
+    concurrency_limit: int | None = None,   # max items B in one Session group
+) -> list[BeamSearchOutput]:                # ordered by original input index
+    ...
 ```
 
 外部协议可以来自：
@@ -197,9 +267,11 @@ temperature is finite and >= 0
 
 当前把 `n` 直接解释成 `beam_width` 的行为必须停止。`n` 是返回多少条结果，不应隐式改变内部搜索宽度。
 
+Offline `BeamSearchParams` 当前没有 Online `n` 语义，V1 为兼容现有返回值默认 `result_width = beam_width`；未来若增加显式 `result_width`，也必须满足 `0 < result_width <= beam_width`。`concurrency_limit` 与 `use_tqdm` 都是 Offline adapter policy，不进入 EngineCore wire；进度条按完成的 item/Session 更新，不再按 token step 更新。
+
 ### 3.3 Token 与模型语义
 
-Serving 负责：
+Online/Offline Frontend 共同负责：
 
 - chat template / render；
 - tokenizer 编码；
@@ -207,11 +279,11 @@ Serving 负责：
 - tokenizer vocabulary 范围校验；
 - 模型支持的 input 类型校验；
 - stop/EOS 的外部语义规范化；
-- tokenization failure 转为用户可理解的 4xx 错误。
+- tokenization failure 由 Adapter 转为 Online 4xx 或 Offline Python validation exception。
 
 EngineCore 不接收 raw chat messages、tokenizer 对象或 token 字符串。
 
-### 3.4 Serving 不得决定的字段
+### 3.4 Frontend 不得决定的字段
 
 以下字段来自部署/Engine 配置，不属于用户请求：
 
@@ -224,17 +296,56 @@ EngineCore 不接收 raw chat messages、tokenizer 对象或 token 字符串。
 
 当前只支持模型级 default Constraint Resource。外部请求不需要携带 `resource_id`；如果兼容协议允许传入，V1 只能接受缺省值或 `"default"`。
 
+### 3.5 Offline 的 N→B Session 分组
+
+Offline 一次 Python 调用中的 N 个 prompts 是 **submission batch**，不自动等于一个原子 Session。MVP 沿用 `concurrency_limit` 的用户语义，但把它重新定义为单个 Session 的最大 item 数：
+
+```text
+B = min(concurrency_limit or N, deployment.max_batch_beam_items)
+sessions = contiguous_partition(prompts, max_size=B)
+```
+
+概念上可在 Offline Frontend 内维护一个 `OfflineBatchBeamJob`，保存 N 个 source indices、G 个 Session keys 和输出槽位；该 Job 不是 EngineCore 对象，`job_id` 不进入 wire。
+
+每个 `instances_batch` 对应一个独立 `ADD_BATCH_BEAM`，而不是整个 N 永远绑定成一个巨型 Session。这样：
+
+- 单个 Session 仍保持 B-item all-or-none；
+- 任意长的 Offline 输入列表不会扩大一次原子失败与资源预留范围；
+- `item_index` 是 Session 内索引，另保留 `call_index` 用于最终恢复全局顺序；
+- MVP 可以顺序执行这些 Session，避免引入尚未冻结的 Worker multi-session batching。
+
+如果 `concurrency_limit=None` 且 N 不超过部署上限，则 N 个输入形成一个 Session，与当前默认“全部并发”的用户感知一致。
+
+`concurrency_limit` 这个名字容易同时被理解为“Session B”和“在途 Session 数”。兼容期将它仅映射为 `session_batch_size`；MVP 的 `max_in_flight_sessions` 固定为 1。未来若确需并发多个 Session，再新增独立配置，不能复用同一个字段表达两种含义。
+
+如果调用者提供的是不可拆分的业务 Group，应使用显式的单组 API（例如 `generate_batch_beam_group(inputs)`）：全部 inputs 构成一个 Session，超过部署容量时直接拒绝，不能静默拆分。兼容 `beam_search(prompts, concurrency_limit)` 则是 dataset-style flat API，允许按上述规则形成多个 Session。
+
+### 3.6 Online 与 Offline 只在适配层不同
+
+| 维度 | Online | Offline |
+| --- | --- | --- |
+| 调用单位 | 一个 HTTP/GR request | 一次 Python 调用，可能拆成多个 Session |
+| 等待方式 | async await / queue | 同步 engine pump / result slots |
+| 用户身份 | `external_request_id` | `call_index` / 原输入顺序 |
+| 取消来源 | disconnect、timeout、explicit cancel | exception、KeyboardInterrupt、shutdown |
+| 返回格式 | HTTP/OpenAI response | `list[BeamSearchOutput]` |
+| EngineCore envelope | `EngineCoreBatchBeamRequestV1` | 完全相同 |
+| Beam/Barrier/Worker 逻辑 | 共享 | 共享 |
+
 ---
 
-## 4. EngineBeamAPI / AsyncLLM 职责
+## 4. Shared BatchBeam Frontend API 职责
 
-EngineBeamAPI 是 Serving 与 EngineCore 之间的内部 Engine frontend。它可以与 Serving 位于同一进程，但责任上不属于 HTTP 协议层。
+Shared BatchBeam Frontend 是 Online/Offline Adapter 与 EngineCore 之间的内部入口。Online 可由 `AsyncLLM` 承载，Offline 可由同步 `LLMEngine` facade 承载，但两者必须调用相同的 prepare、Session registry 与 CoreClient contract。
 
 ### 4.1 三层身份与 generation
 
 ```text
 external_request_id
-    用户/Serving 看到的请求身份；只保存在 Frontend collector 映射
+    Online 用户看到的请求身份；只保存在 Frontend result 映射
+
+offline_call_index
+    Offline 输入在原始 prompts 列表中的位置；只保存在同步 result slots
 
 (batch_session_id, session_generation)
     Engine 内唯一的业务 Batch Session incarnation 身份
@@ -253,9 +364,9 @@ child_request_id = f"{batch_session_id}:{item_index}"
 
 规则：
 
-- 用户只能控制 `external_request_id`，不能注入 Session 或 child ID；
+- Online 用户只能控制 `external_request_id`；Offline 用户只提供输入顺序，二者都不能注入 Session 或 child ID；
 - `external_request_id` 不进入 EngineCore wire，由 Frontend 以 `(session_id, generation) -> external_request_id` 映射持有；
-- `(batch_session_id, session_generation)` 在发送前产生，用于 collector、cancel、DP sticky 和 final routing；
+- `(batch_session_id, session_generation)` 在发送前产生，用于 result sink、cancel、DP sticky 和 final routing；
 - item index 必须唯一且连续覆盖 `[0, B)`；
 - child ID 必须由 EngineBeamAPI 确定性生成；
 - child ID 生成后不得再经过 upstream `assign_request_id()`，否则会被随机化并破坏 Session mapping；
@@ -310,18 +421,14 @@ MVP 要求同一组 B 个 child 使用相同：
 
 不满足时应拆为不同 Batch Session 或直接拒绝，不能让 WorkerRun 内部出现多套模型执行配置。
 
-### 4.4 Final-only collector
+### 4.4 Final-only Session Result Registry
 
-EngineBeamAPI 只注册一个独立的 Session 级 collector：
+每个 Session 只注册一个独立的 result sink；Online/Offline 仅 sink 类型不同：
 
 ```python
-collector_registry[(batch_session_id, session_generation)] = (
-    BatchBeamOutputCollector(
-    external_request_id=external_request_id,
-    batch_session_id=batch_session_id,
-    session_generation=session_generation,
-    output_spec=output_spec,
-    )
+session_result_registry[key] = (
+    AsyncSessionResultSink(external_request_id, output_spec)  # Online
+    | SyncSessionResultSink(call_indices, output_spec)        # Offline
 )
 ```
 
@@ -330,21 +437,43 @@ collector_registry[(batch_session_id, session_generation)] = (
 ```text
 prepare all B children
 → validate local envelope
-→ register one collector
+→ register one Session result sink
 → send ADD_BATCH_BEAM
 ```
 
-不能先发送再注册，否则 EngineCore 快速失败或快速完成时，结果可能先于 collector 到达。
+不能先发送再注册，否则 EngineCore 快速失败或快速完成时，结果可能先于 result sink 到达。
 
-B 个 child 不注册 B 个普通 `RequestOutputCollector`，也不向 Serving 暴露中间 child output。这个 registry 不能通过原生 `OutputProcessor.add_request()` 伪装成普通请求；Batch Final 的 payload 和状态机不同，必须由独立 demux/registry 接管。
+B 个 child 不注册 B 个普通 `RequestOutputCollector`，也不向任何 Frontend 暴露中间 child output。这个 registry 不能通过原生 `OutputProcessor.add_request()` 伪装成普通请求；Batch Final 的 payload 和状态机不同，必须由独立 demux/registry 接管。
+
+Offline sink 在 Final 到达时将 Session-local `item_index` 映射回全局 `call_index`。即使不同 Session 完成顺序不同，公开返回值也必须与输入 prompts 顺序一致。
 
 ### 4.5 本地失败的事务语义
 
 - B 个 item 中任一 render/tokenize/InputProcessor 失败：不发送任何 EngineCore 消息；
-- collector 注册失败：不发送；
-- 发送前 validation 失败：注销 collector 并返回一个 batch-level error；
-- send 明确失败且请求确认未进入 transport：注销 collector；
-- send 结果不确定：保留 collector 与 Session route，best-effort 发送带相同 `(session_id, generation)` 的 abort，并等待终态或有界超时回收；不能重新生成新 Session 自动重试。
+- result sink 注册失败：不发送；
+- 发送前 validation 失败：注销 result sink 并返回一个 batch-level error；
+- send 明确失败且请求确认未进入 transport：注销 result sink；
+- send 结果不确定：保留 result sink 与 Session route，best-effort 发送带相同 `(session_id, generation)` 的 abort，并等待终态或有界超时回收；不能重新生成新 Session 自动重试。
+
+### 4.6 同步与异步 API
+
+```python
+async def submit_batch_beam_async(
+    inputs: Sequence[EngineInput],
+    beam_params: BeamRuntimeParamsV1,
+    output_spec: BeamOutputSpecV1,
+) -> AsyncSessionResultSink: ...
+
+
+def submit_batch_beam_sync(
+    inputs: Sequence[EngineInput],
+    beam_params: BeamRuntimeParamsV1,
+    output_spec: BeamOutputSpecV1,
+    call_indices: Sequence[int],
+) -> SyncSessionResultSink: ...
+```
+
+两者共享 `prepare_batch_beam_request()`，最终生成完全相同的 `EngineCoreBatchBeamRequestV1`。区别仅是等待机制：Online await queue/future；Offline 调用 `llm_engine.step()` 推进 Engine，直到 sink terminal。Inproc 可以跳过字节序列化，但不能跳过同一 typed contract、validation 和 EngineCore handler。
 
 ---
 
@@ -377,7 +506,7 @@ ADD_BATCH(list[EngineCoreRequest])
 BEAM_REQUEST_STEP_UPDATE
 ```
 
-`ADD_BATCH_BEAM` 是一条逻辑命令和一个原子 admission envelope；它不是多条 `ADD` 的打包。
+`ADD_BATCH_BEAM` 是一条逻辑命令和一个原子 admission envelope；它不是多条 `ADD` 的打包。Online 一个请求默认产生一条；Offline 一次 N-input 调用若分为 G 个 Session，则产生 G 条，仍然满足“每 Session 一条”。
 
 ### 5.2 Beam 参数协议
 
@@ -430,6 +559,8 @@ class EngineCoreBatchBeamRequestV1(msgspec.Struct, frozen=True):
 
 外部 `external_request_id` 不进入该 envelope；Frontend 只凭 `(batch_session_id, session_generation)` 将 Accepted/Rejected/Final 映射回用户身份。
 
+协议中同样不增加 `frontend_kind=online/offline`、Offline call ID、全局 prompt index 或 `concurrency_limit`。EngineCore 不应感知调用来源；这些全部是 Frontend 本地适配状态。
+
 `EngineCoreRequest` 内已有：
 
 - internal/external request identity；
@@ -449,6 +580,7 @@ class EngineCoreBatchBeamRequestV1(msgspec.Struct, frozen=True):
 - `ADD_BATCH_BEAM` 使用专用 typed `MsgpackDecoder(EngineCoreBatchBeamRequestV1, oob_tensor_provider=...)`，不走 generic/raw-list decoder；
 - `client_index/current_wave` 由 EngineCoreClient 注入，不接受用户控制；
 - envelope 中的 B 个 child 必须路由到同一个 EngineCore / DP replica；
+- AsyncMP、SyncMP 使用同一个 request type/codec；Inproc 直接调用时也传同一个 Struct 并进入同一个 Core handler；
 - transport 不携带 tokenizer、Trie、Constraint Artifact、Worker handle、KV block ID 或 device tensor；
 - 大型 prompt embeds / MM tensor 继续复用 upstream MsgpackEncoder、Tensor IPC 与 OOB tensor provider，不能在新协议中退化为复制大 payload；
 - 发送端必须持有 envelope/backing tensor，直到 ZMQ `MessageTracker` 标记发送完成，不能让 backing buffer 提前释放；
@@ -477,7 +609,7 @@ class BatchBeamRejectedV1(msgspec.Struct, frozen=True):
     failed_item_index: int | None = None
 ```
 
-`Accepted` 是 EngineCore 原子 commit 的确认，不是容量准入成功，也不承诺立即执行。Frontend 在收到 Accepted 前发生 timeout/disconnect 时仍保留 collector/route，并用同一个 key 发送幂等 abort；不能把 ZMQ send 完成当作 EngineCore commit。
+`Accepted` 是 EngineCore 原子 commit 的确认，不是容量准入成功，也不承诺立即执行。Frontend 在收到 Accepted 前发生 timeout/disconnect 时仍保留 result sink/route，并用同一个 key 发送幂等 abort；不能把 ZMQ send 完成当作 EngineCore commit。
 
 ---
 
@@ -495,7 +627,7 @@ def add_batch_beam_request(
 
 ### 6.1 Authoritative validation
 
-EngineCore 必须重新验证，而不能信任 Serving：
+EngineCore 必须重新验证，而不能信任任一 Frontend Adapter：
 
 #### Envelope
 
@@ -581,7 +713,7 @@ MVP 建议：
 - 相同 Session incarnation + 相同 digest 的重复 START：返回现有 Session/Accepted 状态，不重复创建；
 - 相同 Session incarnation + 不同 digest：协议冲突，fail closed；
 - terminal tombstone 存在时的 late START：返回既有终态或拒绝，不能复活；
-- 一个 session 只绑定一个 output collector owner/client index。
+- 一个 session 只绑定一个 result sink owner/client index。
 
 如果初版不实现同 payload 的幂等重放，也必须至少拒绝所有 duplicate session ID，不能创建第二份工作。
 
@@ -598,7 +730,7 @@ EngineCoreClient chooses one DP target for the envelope
 → cancel/final/late message use the same binding
 ```
 
-Serving 不应通过公共请求指定 `data_parallel_rank`。选择发生在 EngineCoreClient / DP load balancer：
+Online/Offline Frontend 都不应通过公共请求指定 `data_parallel_rank`。选择发生在 EngineCoreClient / DP load balancer：
 
 - 以整个 Batch 为负载单位；
 - 不能对 B 个 child 分别调用普通 load balancing；
@@ -609,6 +741,8 @@ Serving 不应通过公共请求指定 `data_parallel_rank`。选择发生在 En
 DP load accounting 必须按这次 Session 实际提交的 B 个 Scheduler children 记账，不能沿用“只把第一个 child 算入负载”的旧批量路径。
 
 发送失败时，不能把同一个 Session 的部分 child 重路由到另一 replica。
+
+Offline 一次 N-input 调用拆出的 G 个 Session 是独立路由单位：同一 Session 内 B 个 child 必须 sticky，但不同 Session 无需绑定同一 DP replica。公开结果顺序由 Offline result slots 恢复，不能依赖完成或路由顺序。
 
 ---
 
@@ -632,7 +766,15 @@ BatchBeamFailure
 - Barrier ready mask；
 - WorkerStepResult。
 
-所有控制与终态消息都携带 `(batch_session_id, session_generation)`。`Accepted` 只表示 EngineCore 已完成原子注册，不表示已获得 Scheduler/KV/Worker 运行容量。Final result 通过该键找到一个 collector，再映射回 `external_request_id`。
+所有控制与终态消息都携带 `(batch_session_id, session_generation)`。`Accepted` 只表示 EngineCore 已完成原子注册，不表示已获得 Scheduler/KV/Worker 运行容量。
+
+```python
+class BatchBeamFinalResultV1(msgspec.Struct, frozen=True):
+    key: BatchBeamSessionKeyV1
+    items: tuple[BatchBeamItemFinalResultV1, ...]
+```
+
+`items` 必须按 Session-local `item_index` 排序，恰好覆盖 `0..B-1`，且每项包含 `result_width` 条最终序列或明确的 item 终态。Online sink 将 key 映射回 `external_request_id`；Offline sink 根据本地 `source_indices` 回填 `outputs[N]`，所有 Session 终态后按原 prompts 顺序返回。
 
 ### 8.2 Group cancel
 
@@ -648,47 +790,60 @@ class AbortBatchBeamRequestV1(msgspec.Struct, frozen=True):
 
 语义：
 
-- 外部 disconnect/cancel 只发送一次 group abort；
+- Online disconnect/timeout/explicit cancel 对当前 Session 只发送一次 group abort；
+- Offline caller-side exception、`KeyboardInterrupt`、Engine-fatal 或 `GRLLM.shutdown()` 停止提交后续 Session，并对所有已提交但未终态 Session 分别发送 group abort；
 - MVP 不支持单 item cancel；
 - duplicate cancel 幂等，unknown/terminal Session 为安全 no-op 或返回已有终态；
 - cancel 与 START/FINAL 并发由 EngineCore Coordinator 线性化；
-- Serving 不需要知道 B 个 child IDs；
+- Online/Offline Adapter 都不需要知道 B 个 child IDs；
 - EngineCore 将 group abort 展开为 child stop/drain/teardown。
 
-MP 模式下，abort 要同时进入 eager abort 通道和有序 input 通道，复用原生 ABORT 的竞态处理原则：前者尽快停止工作，后者保证相对于 ADD 的有序生命周期记录。终态只能向 Session collector 投递一次。
+MP 模式下，abort 要同时进入 eager abort 通道和有序 input 通道，复用原生 ABORT 的竞态处理原则：前者尽快停止工作，后者保证相对于 ADD 的有序生命周期记录。终态只能向 Session result sink 投递一次。
+
+### 8.3 Offline 多 Session 失败语义
+
+一个 Offline Python 调用可能对应 G 个独立 Session，因此“Session 原子”不等于“整个调用原子”。MVP 采用独立 Session、调用级聚合的语义：
+
+1. 在提交第一个 Session 前先完成 N 个输入的本地 preprocess，尽量让输入错误变成零发送；
+2. 某个 Session Rejected/Failed 只记录该 Session outcome，不回滚已完成组，也不自动取消无关组；
+3. `max_in_flight_sessions=1` 时继续顺序处理其余组；未来并发窗口下则等待已提交组终态；
+4. 全部组 drain 后，如存在失败，抛出 `BatchBeamJobError`，其中包含有序 outcomes、partial results 与 failures；
+5. 兼容 `beam_search()` 不静默返回半填充的 `list[BeamSearchOutput]`，V1 暂不增加 `return_exceptions`。
+
+只有 caller cancel、Engine-fatal、KeyboardInterrupt 或 shutdown 才停止后续提交并 abort active Session。这不要求 EngineCore 增加跨 Session 事务；Job 聚合完全属于 Offline Adapter。
 
 ---
 
 ## 9. Validation 所有权
 
-| 检查 | Serving | EngineBeamAPI | EngineCore |
-| --- | --- | --- | --- |
-| HTTP/OpenAI schema | authoritative | - | - |
-| chat template/tokenize | authoritative | 可复用 InputProcessor | 不处理 raw text |
-| B/W/D/result-width 基础关系 | early reject | validate | authoritative revalidate |
-| begin/end token 字符串 | 转 token ID | validate IDs | validate integer/range contract |
-| child ID | 不接触 | 生成 | authoritative validate |
-| session/generation | 不接触内部 ID | 生成/注册独立 collector | reserve/duplicate/tombstone gate |
-| barrier mode | 不允许传 | 不允许覆盖 | 从 Engine config 冻结 |
-| Prefix/Beam KV capacity | 不检查 | 不检查 | 后续 admission owner |
-| DP target | 不指定 | EngineCoreClient 选择 | 冻结/校验 |
-| LoRA/MM/task 同质性 | 可 early reject | validate | authoritative revalidate |
-| constraint resource | 缺省/default | 注入内部 default | authoritative default binding |
-| final output formatting | authoritative | collector/routing | 只返回内部 FinalResult |
+| 检查 | Online Serving | Offline GRLLM | Shared Frontend | EngineCore |
+| --- | --- | --- | --- | --- |
+| HTTP/OpenAI schema | authoritative | - | - | - |
+| prompts/concurrency/use_tqdm | - | authoritative | 接收分组后的 B items | 不感知 Offline policy |
+| chat template/tokenize | authoritative | `_preprocess_cmpl()` | 复用 InputProcessor | 不处理 raw text |
+| B/W/D/result-width 基础关系 | early reject | early reject | validate | authoritative revalidate |
+| begin/end token 字符串 | 转 token ID | 转 token ID | validate IDs | validate integer/range contract |
+| child ID | 不接触 | 不接触 | 生成 | authoritative validate |
+| session/generation | 不接触内部 ID | 不接触内部 ID | 生成/注册 result sink | reserve/duplicate/tombstone gate |
+| barrier mode | 不允许传 | 不允许传 | 不允许覆盖 | 从 Engine config 冻结 |
+| Prefix/Beam KV capacity | 不检查 | 不检查 | 不检查 | 后续 admission owner |
+| DP target | 不指定 | 不指定 | EngineCoreClient 选择 | 冻结/校验 |
+| LoRA/MM/task 同质性 | 可 early reject | 可 early reject | validate | authoritative revalidate |
+| constraint resource | 缺省/default | 模型 default | 注入内部 default | authoritative default binding |
+| output ordering/format | HTTP response | 原 prompts 顺序 | Session demux/routing | 只返回内部 FinalResult |
 
-两次校验不是重复浪费：Serving 提供快速用户错误；EngineCore 保护跨进程信任边界和运行时配置。
+Frontend 与 EngineCore 的两次校验不是重复浪费：Online/Offline Adapter 提供快速用户错误；EngineCore 保护进程/方法调用信任边界和运行时配置。
 
 ---
 
 ## 10. 当前代码迁移
 
-### 10.1 Serving
+### 10.1 Online Serving
 
 当前相关文件：
 
 - `vllm_gr/entrypoints/openai/serving_engine.py`
 - `vllm_gr/entrypoints/openai/protocol.py`
-- `vllm_gr/entrypoints/gr.py`
 
 调整：
 
@@ -696,10 +851,35 @@ MP 模式下，abort 要同时进入 eager abort 通道和有序 input 通道，
 - 删除 Serving per-step candidate/beam/final selection；
 - 新增 `prepare_batch_beam_request()`；
 - 明确 `beam_width` 与 `n/result_width`；
-- Online/Offline 复用同一个 `EngineBeamAPI.add_batch_beam_request()`；
+- Online 调用共享 `submit_batch_beam_async()`；
 - Serving 只适配 final result。
 
-### 10.2 AsyncLLM / EngineBeamAPI
+### 10.2 Offline GRLLM
+
+当前相关文件：
+
+- `vllm_gr/entrypoints/gr.py`
+- `tests/test_offline_beam_search.py`
+
+调整：
+
+- 保留 `GRLLM.beam_search(prompts, params, lora_request, use_tqdm, concurrency_limit)` 公共 API；
+- 保留 `_preprocess_cmpl()`、LoRA normalization 和 `list[BeamSearchOutput]` 输出兼容；
+- 将 N 个输入按 `concurrency_limit`/部署上限切成 Session groups；
+- 每组调用一次共享 `submit_batch_beam_sync()`；
+- `llm_engine.step()` 只负责推进 Engine并等待 Session Final；
+- 按本地 `source_indices` 恢复输入顺序，`use_tqdm` 按完成 item/group 更新；
+- caller cancel/KeyboardInterrupt/Engine-fatal/shutdown 统一 abort active Session；单组失败由 Job 聚合，不取消无关组。
+
+目标路径停用/删除：
+
+- `_custom_beam_search_batch()` 的 token loop；
+- `_prepare_beam_step_requests()`；
+- `_step_engine_and_collect_outputs()` 的 per-token barrier；
+- fallback 中每 token 调用 `self.generate(max_tokens=1)`；
+- Offline `BeamRequestStepUpdate` 与 `_beam_request_cleanup()`。
+
+### 10.3 Shared Frontend / AsyncLLM / Sync LLMEngine
 
 当前相关文件：
 
@@ -713,11 +893,15 @@ prepare_batch_beam_request
 add_batch_beam_request
 register_batch_beam_output（独立 registry，不复用普通 OutputProcessor）
 abort_batch_beam_request
+submit_batch_beam_sync
+submit_batch_beam_async
 ```
 
-复用 InputProcessor，但不注册 B 个普通 collectors。
+同步与异步路径复用 InputProcessor、Session registry、envelope builder 和 result demux，但不注册 B 个普通 collectors。
 
-### 10.3 Core client / codec / wire
+`LLMEngine.step()` / SyncMP output demux 需要识别新的 Session Accepted/Rejected/Final 事件并路由到 `SyncSessionResultSink`；不能把 Batch Final 强塞进只认识普通 `EngineCoreOutputs` 的原生单请求 OutputProcessor。
+
+### 10.4 Core client / codec / wire
 
 当前相关文件：
 
@@ -737,12 +921,14 @@ EngineCoreBatchBeamRequestV1 decoder
 AbortBatchBeamRequestV1 decoder
 add_batch_beam_async
 abort_batch_beam_async
+add_batch_beam
+abort_batch_beam
 session_routes[(session_id, generation)]
 ```
 
-新 wire value 先与旧 `ADD_BATCH/BEAM_REQUEST_STEP_UPDATE` 并存；删除目标路径对旧消息的依赖后，再单独安排 legacy 清理。CoreClient 负责 Session 级 DP affinity、按 B 更新负载，并在 MessageTracker 完成前保留 OOB backing resources。
+新 wire value 先与旧 `ADD_BATCH/BEAM_REQUEST_STEP_UPDATE` 并存；删除目标路径对旧消息的依赖后，再单独安排 legacy 清理。AsyncMP、SyncMP 和 Inproc 各提供薄适配，但必须汇入相同 Core handler。CoreClient 负责 Session 级 DP affinity、按 B 更新负载，并在 MessageTracker 完成前保留 OOB backing resources。
 
-### 10.4 EngineCore entry
+### 10.5 EngineCore entry
 
 当前相关文件：
 
@@ -763,7 +949,7 @@ Accepted / Rejected demux
 
 当前 `ADD_BATCH` 逐条转换为普通 `ADD` 的路径不能复用为新的 Session admission。
 
-### 10.5 PR #292 Contract 调整
+### 10.6 PR #292 Contract 调整
 
 保留：
 
@@ -778,15 +964,15 @@ Accepted / Rejected demux
 - EngineCore wire 使用 `EngineCoreBatchBeamRequestV1`；
 - Prompt 以 native child `EngineCoreRequest` 为唯一权威；
 - `child_request_id` 由 EngineBeamAPI 生成，不由用户协议提供；
-- 删除 Serving/EngineCore 稳态中的 continuation、fragment、step result。
+- 删除 Frontend/EngineCore 稳态中的 continuation、fragment、step result。
 
-### 10.6 推荐实施顺序
+### 10.7 推荐实施顺序
 
 1. **Contract / codec**：落 V1 types、新 wire values、专用 decoder、OOB round-trip 测试；旧 `0x06/0x07` 保持不变。
 2. **EngineCore entry**：实现 prepare-all / commit-once、Session tombstone、Accepted/Rejected 和 fake group admission。
-3. **CoreClient / Frontend registry**：实现一次 DP route、Session affinity、独立 final collector、group abort。
-4. **Serving cut流**：Online/Offline 都只调用 `add_batch_beam_request()`，停止发送 step update。
-5. **Legacy cleanup**：在消息计数和端到端测试证明新流量不再依赖旧路径后，再弃用 Serving Beam loop 与 `BEAM_REQUEST_STEP_UPDATE`。
+3. **CoreClient / Frontend registry**：实现一次 DP route、Session affinity、Async/Sync result sink、group abort。
+4. **Frontend cut流**：Online 调 async facade；Offline 调 sync facade 并保序，两端都停止发送 step update。
+5. **Legacy cleanup**：在消息计数和端到端测试证明新流量不再依赖旧路径后，再弃用 Online/Offline host Beam loop 与 `BEAM_REQUEST_STEP_UPDATE`。
 
 该顺序允许先用 fake Scheduler 验证入口原子性，不必等待 Prefill Barrier 和 Worker Decode 全部完成。
 
@@ -798,12 +984,13 @@ Accepted / Rejected demux
 
 | 阶段 | 示例 | 结果 |
 | --- | --- | --- |
-| Serving | tokenization、非法 begin/end、参数关系错误 | 4xx / Offline validation error；不发送 |
-| EngineBeamAPI | item prepare 失败、collector 注册失败 | 本地 batch failure；不发送 |
+| Online Serving | tokenization、非法 begin/end、参数关系错误 | 4xx；不发送 |
+| Offline GRLLM | preprocess、concurrency、参数关系错误 | `ValueError/VLLMValidationError`；对应 Session 不发送 |
+| Shared Frontend | item prepare 失败、result sink 注册失败 | 本地 Session failure；不发送 |
 | Wire | schema/version/decode 失败 | EngineCore batch reject；零 child 可见 |
 | EngineCore validation | duplicate ID、超 envelope、LoRA/DP mismatch | batch reject；零 child 可见 |
 | Atomic registration | child 构造中途失败 | 全部 rollback；一个 failure |
-| Send outcome unknown | timeout/connection interruption | 保留 collector；按 session query/abort，不自动重发新 ID |
+| Send outcome unknown | timeout/connection interruption | 保留 result sink；按 session abort/terminal timeout，不自动重发新 ID |
 
 错误输出至少包含：
 
@@ -848,14 +1035,14 @@ class BatchBeamEntryFailureV1:
 
 ### 12.3 Output / Cancel
 
-- collector 注册严格早于 send；
-- collector 使用独立 Session registry，而非原生单请求 OutputProcessor；
+- result sink 注册严格早于 send；
+- result sink 使用独立 Session registry，而非原生单请求 OutputProcessor；
 - B 个 child 不产生普通 frontend outputs；
 - 一个 Session 只发布一次 final/failure；
-- disconnect 只发送一次 `ABORT_BATCH_BEAM`；
+- Online disconnect 只发送一次 `ABORT_BATCH_BEAM`；
 - duplicate cancel 幂等；
 - cancel 与 fast reject / final 并发时不丢失、不双投递；
-- late result 不复活终态 collector。
+- late result 不复活终态 result sink。
 
 ### 12.4 DP / Transport
 
@@ -867,12 +1054,26 @@ class BatchBeamEntryFailureV1:
 - OOB tensor/large MM input 不退化为 inline copy；
 - spawn/MP/inproc 三种 client 路径协议一致。
 
-### 12.5 Legacy Removal
+### 12.5 Offline Semantics
+
+- N=1 形成一个 Session；
+- N>B 时形成 `G=ceil(N/B)` 个 Session，START 消息数严格等于 G；
+- `concurrency_limit`、`use_tqdm`、global call index 不进入 wire；
+- Offline 默认 `result_width=beam_width`；
+- 多 Session 乱序完成后仍按原 prompts 顺序返回；
+- Online/Offline 同样输入规范化后的 envelope 除 ID/arrival/route 外语义等价；
+- SyncMP 与 Inproc 都进入相同 EngineCore handler；
+- caller cancel/KeyboardInterrupt/Engine-fatal/shutdown abort active Session，并停止提交后续组；
+- 单个 Session failure 不取消无关组；最终 `BatchBeamJobError` 保留 ordered outcomes/partial results；
+- `llm_engine.step()` 只 pump Final，不形成 per-token host barrier；
+- 整个 Offline 调用失败时不静默返回半填充 output list。
+
+### 12.6 Legacy Removal
 
 - 新入口不调用 `_beam_request_step()`；
 - 新入口不发送 `BEAM_REQUEST_STEP_UPDATE`；
 - 不构造 `max_tokens=1, logprobs=W` 的 Beam 模拟请求；
-- Serving 不执行 catalog filter、Top-W 或 final select；
+- Online Serving 和 Offline GRLLM 都不执行 catalog filter、Top-W 或 final select；
 - EngineCore 输入消息数：每 Session 一个 START，而不是每 step / 每 item 一个 ADD。
 
 ---
@@ -891,6 +1092,7 @@ class BatchBeamEntryFailureV1:
 - TP/PP Worker 内 collective；
 - Decode 运行中的 cancel flag；
 - multi-session Worker batch；
+- Offline `max_in_flight_sessions > 1` 的并发窗口策略；
 - Decode micro-batch。
 
 入口层只保证下游获得一个完整、稳定、可取消、可关联输出的 Batch Session admission 对象。
@@ -899,28 +1101,40 @@ class BatchBeamEntryFailureV1:
 
 ## 14. 最终冻结决策
 
-1. 一个业务 Batch Beam 请求只发送一条 `ADD_BATCH_BEAM`。
-2. Serving 只负责外部协议、render/tokenize、参数映射与最终格式化。
-3. EngineBeamAPI 创建 `(batch_session_id, session_generation)` 和 child IDs，并复用 native InputProcessor；child ID 不再经 `assign_request_id()` 改写。
-4. B 个 child 只注册一个 final-only collector。
-5. Prompt 与 LoRA/MM/cache/priority 等通用字段以 native `EngineCoreRequest` 为唯一权威。
-6. Beam 搜索语义由独立 `BeamRuntimeParamsV1` / `BeamOutputSpecV1` 表达，不借用 `SamplingParams.n`。
-7. `prefill_barrier_mode` 来自 Engine 配置，不允许请求覆盖。
-8. EngineCore authoritative validation 后原子创建 Coordinator 和 B child；失败全部 rollback。
-9. 一个 Session 固定一个 DP replica，Serving 不指定 rank。
-10. Cancel 只以 `(batch_session_id, session_generation)` 为单位；MVP 不支持单 item cancel。
-11. 入口不传输 Trie、Constraint Artifact、Worker handle、KV metadata、logits 或 per-step Beam state。
-12. 当前 `ADD_BATCH` 与 `BEAM_REQUEST_STEP_UPDATE` 不作为新架构入口协议。
+1. 一个 Engine admission group / Batch Beam Session 只发送一条 `ADD_BATCH_BEAM`；一次 Offline 调用可映射为 G 个 Session。
+2. Online 与 Offline 共用同一个 envelope、Session identity、CoreClient contract、EngineCore handler 和 Final schema；wire 不区分调用来源。
+3. Online Serving 只负责 HTTP/async/cancel/response；Offline GRLLM 只负责同步调用、N→B 分组、Engine pump、保序与异常清理。
+4. Shared Frontend 创建 `(batch_session_id, session_generation)` 和 child IDs，并复用 native InputProcessor；child ID 不再经 `assign_request_id()` 改写。
+5. B 个 child 只注册一个 final-only Session result sink；Online/Offline 仅 sink 和等待机制不同。
+6. Prompt 与 LoRA/MM/cache/priority 等通用字段以 native `EngineCoreRequest` 为唯一权威。
+7. Beam 搜索语义由独立 `BeamRuntimeParamsV1` / `BeamOutputSpecV1` 表达，不借用 `SamplingParams.n`。
+8. `prefill_barrier_mode` 来自 Engine 配置，不允许请求覆盖。
+9. EngineCore authoritative validation 后原子创建 Coordinator 和 B child；失败全部 rollback。
+10. 一个 Session 固定一个 DP replica，Frontend 不指定 rank；不同 Offline Session 可独立路由。
+11. Cancel 只以 `(batch_session_id, session_generation)` 为单位；MVP 不支持单 item cancel。
+12. Offline `concurrency_limit` 只控制 Session group size，不进入 wire，也不是 Decode micro-batch。
+13. 入口不传输 Trie、Constraint Artifact、Worker handle、KV metadata、logits 或 per-step Beam state。
+14. 当前 `ADD_BATCH` 与 `BEAM_REQUEST_STEP_UPDATE` 不作为新架构入口协议；Online/Offline host Beam loop 都退出目标路径。
 
 ---
 
 ## 15. 代码依据
 
+- [当前 Offline `GRLLM.beam_search()` 公共入口](https://github.com/JiusiServe/vllm-gr/blob/975cb95f7890cc9c0614ca27a4bd093d0bba7c91/vllm_gr/entrypoints/gr.py#L503-L522)
+- [Offline preprocess 与 `concurrency_limit` 分组](https://github.com/JiusiServe/vllm-gr/blob/975cb95f7890cc9c0614ca27a4bd093d0bba7c91/vllm_gr/entrypoints/gr.py#L584-L672)
+- [Offline CUSTOM host Beam loop 与批量 ADD](https://github.com/JiusiServe/vllm-gr/blob/975cb95f7890cc9c0614ca27a4bd093d0bba7c91/vllm_gr/entrypoints/gr.py#L329-L456)
+- [Offline 同步 `llm_engine.step()` 等待本 step 输出](https://github.com/JiusiServe/vllm-gr/blob/975cb95f7890cc9c0614ca27a4bd093d0bba7c91/vllm_gr/entrypoints/gr.py#L213-L236)
+- [Offline fallback 每 token 调用 `generate()`](https://github.com/JiusiServe/vllm-gr/blob/975cb95f7890cc9c0614ca27a4bd093d0bba7c91/vllm_gr/entrypoints/gr.py#L674-L701)
 - [当前 GR Serving Beam loop](https://github.com/JiusiServe/vllm-gr/blob/975cb95f7890cc9c0614ca27a4bd093d0bba7c91/vllm_gr/entrypoints/openai/serving_engine.py#L196-L410)
 - [当前 GR `_add_batch_step`](https://github.com/JiusiServe/vllm-gr/blob/975cb95f7890cc9c0614ca27a4bd093d0bba7c91/vllm_gr/entrypoints/openai/serving_engine.py#L61-L93)
 - [当前 GR AsyncLLM `prepare_request`](https://github.com/JiusiServe/vllm-gr/blob/975cb95f7890cc9c0614ca27a4bd093d0bba7c91/vllm_gr/v1/engine/async_llm.py#L21-L100)
 - [当前 GR `ADD_BATCH` codec](https://github.com/JiusiServe/vllm-gr/blob/975cb95f7890cc9c0614ca27a4bd093d0bba7c91/vllm_gr/v1/engine/codec.py#L25-L50)
 - [当前 PR #292 Batch contract](https://github.com/JiusiServe/vllm-gr/blob/638f8c672fe1caecade350390ad9726d54d81c95/vllm_gr/v1/beam/contracts.py#L69-L102)
 - [upstream vLLM AsyncLLM request preparation](https://github.com/vllm-project/vllm/blob/v0.22.1/vllm/v1/engine/async_llm.py#L280-L412)
+- [upstream Offline `LLM` 创建同步 `LLMEngine`](https://github.com/vllm-project/vllm/blob/v0.22.1/vllm/entrypoints/llm.py#L305-L364)
+- [upstream EngineCoreClient：Inproc / SyncMP / AsyncMP 选择](https://github.com/vllm-project/vllm/blob/v0.22.1/vllm/v1/engine/core_client.py#L70-L104)
+- [upstream 同步 `LLMEngine.step()`](https://github.com/vllm-project/vllm/blob/v0.22.1/vllm/v1/engine/llm_engine.py#L287-L325)
+- [xLLM OneRec Online RPC 进入 RecMaster](https://github.com/xLLM-AI/xllm/blob/78aa2a8583b7a85c21cd369a995f2bf2c431ffb0/xllm/api_service/rec_completion_service_impl.cpp#L269-L367)
+- [xLLM OneRec Offline C API 进入同一 Master](https://github.com/xLLM-AI/xllm/blob/78aa2a8583b7a85c21cd369a995f2bf2c431ffb0/xllm/c_api/internal/helper.cpp#L323-L441)
 - [upstream vLLM EngineCoreRequest](https://github.com/vllm-project/vllm/blob/v0.22.1/vllm/v1/engine/__init__.py#L77-L137)
 - [upstream vLLM EngineCore add request entry](https://github.com/vllm-project/vllm/blob/v0.22.1/vllm/v1/engine/core.py#L337-L373)
