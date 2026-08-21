@@ -31,31 +31,18 @@ Full Prefill → Beam 初始化 → Decode Loop → Final Result
 
 ```mermaid
 flowchart LR
-    INPUT[BeamBatchRequest]
-    ENGINE[EngineCore]
-    BATCH[BeamBatch<br/>B native children]
-    WAITING[Native Scheduler.waiting<br/>Batch-level FCFS]
-    ADMIT[Batch all-or-none admission]
-    PLAN[One BeamBatchExecutionPlan]
+    CORE[EngineCore<br/>BeamBatch]
+    WAIT[Scheduler.waiting<br/>Native FCFS]
+    ADMIT[Batch Admission<br/>all-or-none]
+    PLAN[Execution Plan]
+    WORKER[Worker<br/>run-to-completion]
+    RESULT[Final Result]
 
-    subgraph WORKER[One Worker invocation]
-        PREFILL[Full Prefill<br/>B native children]
-        INIT[Beam initialization<br/>1 to W]
-        DECODE[Decode loop<br/>run-to-completion]
-        CLEAN[Materialize result<br/>cleanup]
-        PREFILL --> INIT --> DECODE --> CLEAN
-    end
-
-    RESULT[One BeamBatchExecutionResult]
-
-    INPUT --> ENGINE
-    ENGINE --> BATCH
-    BATCH --> WAITING
-    WAITING --> ADMIT
+    CORE --> WAIT
+    WAIT --> ADMIT
     ADMIT --> PLAN
-    PLAN --> PREFILL
-    CLEAN --> RESULT
-    RESULT --> ENGINE
+    PLAN --> WORKER
+    WORKER --> RESULT
 ```
 
 冻结结论：
