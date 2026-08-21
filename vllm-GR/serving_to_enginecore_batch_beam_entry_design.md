@@ -15,24 +15,18 @@
 
 ```mermaid
 flowchart LR
-    ONLINE[Online Serving]
-    OFFLINE[Offline API]
-    ADAPTER[BeamRequestManager<br/>统一输入适配]
-    WIRE[One BeamBatchRequest]
-    CORE[EngineCore<br/>构造一个 BeamBatch]
-    WAITING[Scheduler.waiting<br/>原生 FCFS]
-    RUNNING[One Running BeamBatch]
-    WORKER[Worker<br/>Full Prefill → Beam 初始化 → Decode]
-    FINAL[One Final Result]
+    SOURCE[Online / Offline API]
+    ENTRY[BeamRequestManager<br/>BeamBatchRequest]
+    CORE[EngineCore<br/>BeamBatch]
+    WAIT[Scheduler.waiting<br/>Native FCFS]
+    ADMIT[Batch Admission<br/>all-or-none]
+    WORKER[Worker Execution<br/>Final Result]
 
-    ONLINE --> ADAPTER
-    OFFLINE --> ADAPTER
-    ADAPTER --> WIRE
-    WIRE --> CORE
-    CORE -->|add once| WAITING
-    WAITING --> RUNNING
-    RUNNING -->|dispatch once| WORKER
-    WORKER --> FINAL
+    SOURCE --> ENTRY
+    ENTRY --> CORE
+    CORE --> WAIT
+    WAIT --> ADMIT
+    ADMIT --> WORKER
 ```
 
 一个业务 Batch 在各层始终只有一个顶层对象：
