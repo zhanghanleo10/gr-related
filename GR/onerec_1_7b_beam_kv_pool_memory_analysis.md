@@ -79,8 +79,9 @@ unshared_value: [B, W, Hkv, S, D]
 | `D` | Head Dimension | 128 |
 
 ```mermaid
-flowchart LR
-    T["单层 K 或 V Tensor"] --> B["B = 1：Session Slot"]
+flowchart TB
+    T["单层 K 或 V Tensor"]
+    T --> B["B = 1：Session Slot"]
     B --> W["W = 128：Beam Capacity"]
     W --> H["Hkv = 8：KV Heads"]
     H --> S["S = 3：Decode Steps"]
@@ -100,18 +101,18 @@ OneRec-1.7B 模型配置中与 Beam KV Pool 相关的参数为：
 
 | 模型参数 | 符号 | 数值 |
 |---|---:|---:|
-| Transformer 层数 | \(L\) | 28 |
-| KV Heads | \(H_{kv}\) | 8 |
-| Head Dimension | \(D\) | 128 |
-| DType 字节数 | \(E\) | 2 bytes |
+| Transformer 层数 | `L` | 28 |
+| KV Heads | `Hkv` | 8 |
+| Head Dimension | `D` | 128 |
+| DType 字节数 | `E` | 2 bytes |
 
 Pool 配置为：
 
 | Pool 参数 | 符号 | 数值 |
 |---|---:|---:|
-| 最大 Session slots | \(B\) | 1 |
-| 最大 Beam Width | \(W\) | 128 |
-| 最大 Decode Steps | \(S\) | 3 |
+| 最大 Session slots | `B` | 1 |
+| 最大 Beam Width | `W` | 128 |
+| 最大 Decode Steps | `S` | 3 |
 
 注意，容量计算使用的是 `num_key_value_heads=8`，不是 `num_attention_heads=16`。
 
@@ -121,29 +122,20 @@ Pool 配置为：
 
 单层包含一份 K 和一份 V，因此：
 
-\[
-M_{layer}
-=2_{K,V}
-\times B
-\times W
-\times H_{kv}
-\times S
-\times D
-\times E
-\]
+```text
+M_layer = 2(K/V) × B × W × Hkv × S × D × E
+```
 
 代入：
 
-\[
-M_{layer}
-=2\times1\times128\times8\times3\times128\times2
-\]
+```text
+M_layer = 2 × 1 × 128 × 8 × 3 × 128 × 2
+```
 
-\[
-M_{layer}
-=1{,}572{,}864\ \text{bytes}
-=1.5\ \text{MiB}
-\]
+```text
+M_layer = 1,572,864 bytes
+        = 1.5 MiB
+```
 
 所以：
 
@@ -155,13 +147,11 @@ M_{layer}
 
 OneRec-1.7B 有 28 层，每层一个 Pool：
 
-\[
-M_{main}=L\times M_{layer}
-\]
-
-\[
-M_{main}=28\times1.5=42\ \text{MiB}
-\]
+```text
+M_main = L × M_layer
+       = 28 × 1.5 MiB
+       = 42 MiB
+```
 
 ```mermaid
 flowchart LR
@@ -173,9 +163,9 @@ flowchart LR
 
 因此：
 
-\[
-\boxed{M_{main}=42\ \text{MiB}}
-\]
+```text
+核心 Beam KV Pool = 42 MiB
+```
 
 ### 4.3 Suffix Buffer：1.5 MiB
 
@@ -188,9 +178,9 @@ suffix_v_buf: [B × W × S, Hkv, D]
 
 其元素数量与一层 Pool 的 K/V 总量相同，因此：
 
-\[
-M_{suffix}=1.5\ \text{MiB}
-\]
+```text
+M_suffix = 1.5 MiB
+```
 
 ### 4.4 Aux Buffer：1.5 MiB
 
@@ -203,9 +193,9 @@ aux_value_buf: [W, Hkv, S, D]
 
 当前 `B=1`，其大小同样等于一个单层 Pool：
 
-\[
-M_{aux}=1.5\ \text{MiB}
-\]
+```text
+M_aux = 1.5 MiB
+```
 
 Aux Buffer 被 28 层串行复用，没有为每层分别分配一组。
 
@@ -221,56 +211,46 @@ Beam KV 相关 Context       45.0 MiB
 
 即：
 
-\[
-M_{context}=42+1.5+1.5=45\ \text{MiB}
-\]
+```text
+M_context = 42 + 1.5 + 1.5
+          = 45 MiB
+```
 
 ## 5. 通用公式
 
 ### 5.1 核心 Beam KV Pool
 
-\[
-\boxed{
-M_{main}
-=2\times L\times B\times W\times H_{kv}\times S\times D\times E
-}
-\]
+```text
+M_main = 2 × L × B × W × Hkv × S × D × E
+```
 
 ### 5.2 完整 Beam KV 相关 Context
 
 定义一层、单 Session 的 K/V 容量：
 
-\[
-P=2\times W\times H_{kv}\times S\times D\times E
-\]
+```text
+P = 2 × W × Hkv × S × D × E
+```
 
 则：
 
-\[
-M_{main}=L\times B\times P
-\]
-
-\[
-M_{suffix}=B\times P
-\]
-
-\[
-M_{aux}=P
-\]
+```text
+M_main   = L × B × P
+M_suffix = B × P
+M_aux    = P
+```
 
 所以：
 
-\[
-\boxed{
-M_{context}=((L+1)B+1)P
-}
-\]
+```text
+M_context = ((L + 1) × B + 1) × P
+```
 
-当前 \(B=1\) 时：
+当前 `B=1` 时：
 
-\[
-M_{context}=(L+2)P
-\]
+```text
+M_context = (L + 2) × P
+```
 
 ## 6. 不同 Beam Width 下的大小
 
