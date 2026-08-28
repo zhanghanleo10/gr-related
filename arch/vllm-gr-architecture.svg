@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1120" viewBox="0 0 1440 1120">
+<defs><filter id="s"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-opacity=".12"/></filter><marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#64748b"/></marker></defs>
+<style>.t{font-family:Arial,sans-serif;fill:#172033}.h{font-size:30px;font-weight:700}.sub{font-size:16px;fill:#64748b}.lh{font-size:18px;font-weight:700;fill:#fff}.n{font-size:15px;font-weight:600}.sm{font-size:12px;fill:#64748b}.box{rx:8;filter:url(#s);stroke-width:2}.imp{fill:#dbeafe;stroke:#60a5fa}.mod{fill:#fef3c7;stroke:#fbbf24}.new{fill:#fee2e2;stroke:#f87171}.panel{rx:12;stroke:#d9e2ef;stroke-width:1.5}.rail{fill:#172033;rx:10}.head{fill:#263247;rx:7}.arr{stroke:#64748b;stroke-width:2;fill:none;marker-end:url(#a)}</style>
+<rect width="1440" height="1120" fill="#fff"/>
+<text x="720" y="48" text-anchor="middle" class="t h">vLLM-GR Architecture</text><text x="720" y="75" text-anchor="middle" class="t sub">Asynchronous Beam scheduling · GPU / NPU unified architecture</text>
+<!-- API -->
+<rect x="30" y="105" width="160" height="180" class="rail"/><text x="110" y="202" text-anchor="middle" class="lh">API Layer</text>
+<rect x="210" y="105" width="1200" height="180" fill="#eff6ff" class="panel"/><rect x="230" y="122" width="240" height="34" class="head"/><text x="350" y="145" text-anchor="middle" class="lh">Frontend / API Process</text>
+<rect x="250" y="185" width="190" height="62" class="box new"/><text x="345" y="211" text-anchor="middle" class="t n">BeamSearch Serving</text><text x="345" y="231" text-anchor="middle" class="sm">Online API</text>
+<path d="M440 216 H490" class="arr"/><rect x="500" y="185" width="150" height="62" class="box new"/><text x="575" y="213" text-anchor="middle" class="t n">GRLLM</text><text x="575" y="232" text-anchor="middle" class="sm">Offline API</text>
+<path d="M650 216 H700" class="arr"/><rect x="710" y="185" width="230" height="62" class="box imp"/><text x="825" y="221" text-anchor="middle" class="t n">AsyncLLM / LLMEngine</text>
+<path d="M940 216 H990" class="arr"/><rect x="1000" y="185" width="210" height="62" class="box imp"/><text x="1105" y="221" text-anchor="middle" class="t n">EngineCoreClient</text>
+<path d="M810 285 V320" class="arr"/><text x="830" y="307" class="sm">request / result wire</text>
+<!-- Engine -->
+<rect x="30" y="330" width="160" height="270" class="rail"/><text x="110" y="470" text-anchor="middle" class="lh">Engine Layer</text>
+<rect x="210" y="330" width="1200" height="270" fill="#fffbeb" class="panel"/><rect x="230" y="347" width="220" height="34" class="head"/><text x="340" y="370" text-anchor="middle" class="lh">EngineCore Process</text>
+<rect x="245" y="410" width="180" height="65" class="box mod"/><text x="335" y="435" text-anchor="middle" class="t n">EngineCore</text><text x="335" y="456" text-anchor="middle" class="sm">Beam lifecycle</text>
+<path d="M425 442 H470" class="arr"/><rect x="480" y="410" width="210" height="65" class="box new"/><text x="585" y="435" text-anchor="middle" class="t n">Async Beam Loop</text><text x="585" y="456" text-anchor="middle" class="sm">step_with_batch_queue</text>
+<path d="M690 442 H735" class="arr"/><rect x="745" y="410" width="210" height="65" class="box mod"/><text x="850" y="435" text-anchor="middle" class="t n">vLLM Scheduler</text><text x="850" y="456" text-anchor="middle" class="sm">schedule every step</text>
+<path d="M955 442 H1000" class="arr"/><rect x="1010" y="410" width="170" height="65" class="box imp"/><text x="1095" y="448" text-anchor="middle" class="t n">Executor</text>
+<rect x="350" y="510" width="240" height="58" class="box imp"/><text x="470" y="535" text-anchor="middle" class="t n">KV Cache Manager</text><text x="470" y="554" text-anchor="middle" class="sm">Prefix block ownership</text>
+<rect x="650" y="510" width="220" height="58" class="box new"/><text x="760" y="535" text-anchor="middle" class="t n">Batch Queue</text><text x="760" y="554" text-anchor="middle" class="sm">next-step preparation</text>
+<text x="930" y="540" class="t n">CPU schedule N+1  ⇄  Device execute N</text>
+<path d="M810 600 V635" class="arr"/><text x="830" y="622" class="sm">executor dispatch</text>
+<!-- Worker -->
+<rect x="30" y="645" width="160" height="245" class="rail"/><text x="110" y="772" text-anchor="middle" class="lh">Execution Layer</text>
+<rect x="210" y="645" width="1200" height="245" fill="#f0fdf4" class="panel"/><rect x="230" y="662" width="290" height="34" class="head"/><text x="375" y="685" text-anchor="middle" class="lh">GPU / NPU Worker Process</text>
+<rect x="260" y="725" width="190" height="62" class="box imp"/><text x="355" y="762" text-anchor="middle" class="t n">GPU / NPU Worker</text>
+<path d="M450 756 H495" class="arr"/><rect x="505" y="725" width="205" height="62" class="box mod"/><text x="608" y="750" text-anchor="middle" class="t n">ModelRunner</text><text x="608" y="770" text-anchor="middle" class="sm">Graph capture / dispatch</text>
+<path d="M710 756 H755" class="arr"/><rect x="765" y="725" width="220" height="62" class="box new"/><text x="875" y="750" text-anchor="middle" class="t n">BeamSearchContext</text><text x="875" y="770" text-anchor="middle" class="sm">Beam step state</text>
+<rect x="250" y="815" width="215" height="50" class="box new"/><text x="357" y="846" text-anchor="middle" class="t n">BeamSearchBufferPool</text>
+<rect x="485" y="815" width="200" height="50" class="box new"/><text x="585" y="846" text-anchor="middle" class="t n">Beam Suffix KV Pool</text>
+<rect x="705" y="815" width="205" height="50" class="box new"/><text x="807" y="846" text-anchor="middle" class="t n">KV Reorder Workspace</text>
+<rect x="930" y="815" width="180" height="50" class="box imp"/><text x="1020" y="846" text-anchor="middle" class="t n">Model Forward</text>
+<path d="M810 890 V925" class="arr"/><text x="830" y="912" class="sm">raw logits</text>
+<!-- Ops -->
+<rect x="30" y="935" width="160" height="145" class="rail"/><text x="110" y="1012" text-anchor="middle" class="lh">Operator Layer</text>
+<rect x="210" y="935" width="1200" height="145" fill="#faf5ff" class="panel"/><rect x="230" y="950" width="355" height="34" class="head"/><text x="407" y="973" text-anchor="middle" class="lh">Beam Attention &amp; Device PostProcess</text>
+<rect x="245" y="1005" width="125" height="48" class="box new"/><text x="307" y="1035" text-anchor="middle" class="t n">BeamAttn</text>
+<rect x="390" y="1005" width="205" height="48" class="box new"/><text x="492" y="1035" text-anchor="middle" class="t n">RecConstrainedTopK</text>
+<path d="M595 1029 H625" class="arr"/><rect x="635" y="1005" width="170" height="48" class="box new"/><text x="720" y="1035" text-anchor="middle" class="t n">Last-step?</text>
+<path d="M805 1029 H835" class="arr"/><rect x="845" y="990" width="205" height="48" class="box new"/><text x="947" y="1020" text-anchor="middle" class="t n">BeamSearchGroup</text><rect x="845" y="1042" width="205" height="48" class="box new"/><text x="947" y="1072" text-anchor="middle" class="t n">FinalSelect</text>
+<path d="M1050 1014 H1080" class="arr"/><rect x="1090" y="990" width="205" height="48" class="box new"/><text x="1192" y="1020" text-anchor="middle" class="t n">SelectUnsharedKV</text><rect x="1090" y="1042" width="205" height="48" class="box new"/><text x="1192" y="1072" text-anchor="middle" class="t n">O(W) Beam Result</text>
+<!-- legend -->
+<circle cx="545" cy="1105" r="6" fill="#60a5fa"/><text x="558" y="1110" class="sm">imported</text><circle cx="665" cy="1105" r="6" fill="#fbbf24"/><text x="678" y="1110" class="sm">modified</text><circle cx="790" cy="1105" r="6" fill="#f87171"/><text x="803" y="1110" class="sm">new</text>
+</svg>
