@@ -274,23 +274,58 @@ flowchart TD
 
 ### 4.2 索引公式与实际内容
 
-固定宽度下：
+**本节固定 `W=4`，且当前步与所有历史步的宽度相同。** 以下的 `I[d, j]` 是送入 Attention 的展平 BeamKV 中的 **token slot 编号**，不是显存字节地址，也不是 `indices` 数组自身的存储位置。
 
-$$
-I[d,j]=dW+\operatorname{ancestor}(j,d)
-$$
-
-`d` 是历史 step，`j` 是当前 query beam。上例忽略 batch/head 维度后：
+为避免公式渲染差异，直接用代码形式写出计算规则：
 
 ```python
-# 每一行是一个历史 step，每一列是一条当前 query beam。
-indices = [
-    [2, 0, 2, 1],  # step 0：沿 parent 找到历史 slot
-    [4, 5, 6, 7],  # step 1：当前 beam 自己的新 KV
-]
+# 统一使用 [历史 step, 当前 query beam] 的维度顺序。
+I[d, j] = d * W + beam_at_step[d, j]
 ```
 
-**`topk_indices` 这个名字容易误导：它是 BeamKV 的地址表，不是筛选“Attention 分数最高的几个 token”。** 所有有效前缀 token 和该 beam 路径上的有效历史 token 仍然参与 Attention。[索引构造][indices]
+| 符号 | 含义 |
+| --- | --- |
+| `t` | 本次 Attention 的有效 decode 历史步数，包含当前步 |
+| `d` | 被读取的历史 step，范围为 `0..t-1` |
+| `j` | 当前 query beam 编号，范围为 `0..W-1` |
+| `beam_at_step[d, j]` | 当前 query `j` 在 step `d` 对应的局部 beam slot 编号 |
+| `d * W` | step `d` 在展平历史中的起始 slot 编号 |
+| `I[d, j]` | step 起点加局部 slot，得到实际要读的 flat slot 编号 |
+
+**旧步沿 parent 回溯，当前步读取自己。** 因此在当前步 `d=t-1`，`beam_at_step[d, j]=j`；不能把 parent 数组直接用于当前步。
+
+上例正在执行 step 1 的 Attention，当前步 K/V 已写入，因此 `t=2`。局部 beam 编号、step 起点和最终索引依次为：
+
+| 历史 step `d` | 对应的局部 beam 编号，按 query 0–3 排列 | step 起点 `d * W` | 最终 flat slot，按 query 0–3 排列 |
+| --- | --- | ---: | --- |
+| 0：旧历史 | `[2, 0, 2, 1]`，来自 parent | 0 | `[2, 0, 2, 1]` |
+| 1：当前步 | `[0, 1, 2, 3]`，各读自己 | 4 | `[4, 5, 6, 7]` |
+
+例如当前 query beam 0：
+
+| 要读取的 KV | 计算 | flat slot |
+| --- | --- | ---: |
+| step 0 的祖先 A2 | `0 * 4 + 2` | 2 |
+| step 1 的自身 B0 | `1 * 4 + 0` | 4 |
+
+因此二维索引表为：
+
+```python
+# shape = [t, W] = [2, 4]
+# 行是历史 step，列是当前 query beam。
+indices = [
+    [2, 0, 2, 1],  # step 0：读取各自的祖先
+    [4, 5, 6, 7],  # step 1：读取当前步自己的 KV
+]
+# query 0 读取这一列：[2, 4]
+# query 2 读取这一列：[2, 6]，与 query 0 共享旧 slot 2
+```
+
+内核的完整索引形状为 `[B, 1, Hq, t, W]`。上表对应固定 batch 与 head 后的 `topk_indices[b, 0, h, :, :]`；读取某个 head 的 K/V 时，还需要按 tensor stride 和 head 映射计算实际地址。
+
+**动态 BeamWidth 不能简单把式中的 `W` 换成当前 `W_t`。** 当前 NVIDIA 适配器先将有效历史切片/reshape 成 `[B, t * W_t, Hkv, D]`，此时 `d * W_t` 对应的是整理后历史的 slot 起点；祖先超出有效范围时还可能需要 4.5 节的 compaction。若设计成直接读取固定容量的原始 arena，物理 step 跨度通常按 `W_max` 计算，需要相应修改接口与寻址逻辑，不能与本例混用。
+
+**`topk_indices` 这个名字容易误导：它是 BeamKV 的寻址索引表，不是筛选“Attention 分数最高的几个 token”。** 所有有效前缀 token 和该 beam 路径上的有效历史 token 仍然参与 Attention。[索引构造][indices]
 
 ### 4.3 再走一步：parent 需要组合，不能只记最后一跳
 
@@ -311,11 +346,14 @@ indices = [
 下面给出等价语义的伪代码，帮助理解状态转移；它不是对当前 GPU 实现的逐字描述：
 
 ```python
-# old_ancestry[j, d]：旧 query j 在历史 step d 的物理地址
-# parents[new_j]：新 query 来自哪个旧 query
-new_ancestry[:, :t] = old_ancestry[parents, :t]
-new_ancestry[:, t] = t * W + arange(W)
-# 这里只更新整数地址；不移动历史 K/V。
+# 与 4.2 一致：索引表按 [历史 step, 当前 query beam] 排列。
+# old_indices.shape = [t, W]；new_indices.shape = [t + 1, W]
+# t 在这里表示旧表已有的历史步数，新追加的 step 编号也是 t。
+# parents[new_j]：新 query 来自哪个旧 query。
+new_indices[:t, :] = old_indices[:, parents]
+new_indices[t, :] = t * W + arange(W)
+# 新表最后一行描述下一次 Attention 前将写入的当前步 KV。
+# 这里只更新整数 slot 索引，不移动历史 K/V；两张索引表使用独立缓冲。
 ```
 
 当前通用索引构造路径仍包含 Python 回溯和 tensor 构造；“KV 不搬”并不自动意味着“索引维护零 CPU 开销”。[索引构造][indices]
