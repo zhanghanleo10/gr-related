@@ -45,7 +45,12 @@
 
 同一个请求中的所有 beam 都看过相同的输入上下文，但生成的短后缀逐渐不同。
 
-```mermaid
+![图 1：共享前缀与 beam 分叉](./assets/sid-gr-decode-guide/figure-01.png)
+
+<details>
+<summary>查看图 1 的 Mermaid 源码</summary>
+
+```text
 flowchart TD
     P["共同输入上下文"] --> A["首个 SID：A"]
     P --> B["首个 SID：B"]
@@ -63,6 +68,8 @@ flowchart TD
     class S select;
 ```
 
+</details>
+
 **图 1：同一父路径可以产生多个入选的子路径。** 图中省略未入选候选；分支节点表示逻辑路径，不代表复制了一整份 KV。
 
 长前缀可能有数千 token，而每条路径的生成历史通常只有几个 token。这两部分的长度和访问模式明显不同，适合分开存储和计算。
@@ -71,7 +78,12 @@ flowchart TD
 
 先看执行顺序，再看物理布局。
 
-```mermaid
+![图 2：单步 decode 的 KV 读写顺序](./assets/sid-gr-decode-guide/figure-02.png)
+
+<details>
+<summary>查看图 2 的 Mermaid 源码</summary>
+
+```text
 sequenceDiagram
     participant R as Decode Runtime
     participant M as Model Layer
@@ -89,6 +101,8 @@ sequenceDiagram
     S-->>R: 下一组 token、parent、score
 ```
 
+</details>
+
 **图 2：新 K/V 的写入发生在本层 Attention 之前；beam 选择发生在整个模型 forward 之后。**
 
 在所查 Qwen3 实现的 `forward_decode` 中：
@@ -105,7 +119,12 @@ sequenceDiagram
 
 ### 3.1 先看职责
 
-```mermaid
+![图 3：ContextKV、BeamKV 与路径信息的职责](./assets/sid-gr-decode-guide/figure-03.png)
+
+<details>
+<summary>查看图 3 的 Mermaid 源码</summary>
+
+```text
 flowchart TD
     P["Prefill"] --> C["ContextKV：共同长前缀"]
     D["当前步 QKV 投影"] --> B["BeamKV：按步追加短历史"]
@@ -124,6 +143,8 @@ flowchart TD
     class I index;
     class A compute;
 ```
+
+</details>
 
 **图 3：数据与路径分离。** 箭头表示数据依赖；选择结果更新的是供下一轮使用的路径信息。
 
@@ -205,7 +226,12 @@ parents = [2, 0, 2, 1]
 
 含义是“新 beam 0 来自旧 beam 2，新 beam 1 来自旧 beam 0……”。
 
-```mermaid
+![图 4：四条 beam 的祖先引用关系](./assets/sid-gr-decode-guide/figure-04.png)
+
+<details>
+<summary>查看图 4 的 Mermaid 源码</summary>
+
+```text
 flowchart TD
     subgraph OLD["step 0：历史 KV 保持原位"]
         A0["slot 0：A0"]
@@ -230,6 +256,8 @@ flowchart TD
     class A3 unused;
     class B0,B1,B2,B3 current;
 ```
+
+</details>
 
 **图 4：箭头表示祖先引用，不表示 KV copy。** 节点按引用关系排布，物理地址以 slot 编号为准。旧 slot 3 在当前入选路径中不再被引用，但固定 pool 不必立即回收这个单独槽位。
 
@@ -326,7 +354,12 @@ $$
 
 拆分的是计算与存储组织，不是改变哪些 token 可见。
 
-```mermaid
+![图 5：两部分 Attention 与 LSE 合并](./assets/sid-gr-decode-guide/figure-05.png)
+
+<details>
+<summary>查看图 5 的 Mermaid 源码</summary>
+
+```text
 flowchart TD
     Q["当前 beam queries"] --> C["Context Attention：共享长前缀"]
     Q --> B["Beam Attention：短生成历史"]
@@ -344,6 +377,8 @@ flowchart TD
     class M merge;
 ```
 
+</details>
+
 **图 5：逻辑上的两部分 Attention。** 分开 launch 时通过 LSE 合并；融合时在同一个 kernel 内更新共同的 softmax 状态。
 
 ### 5.2 Context Attention：把多条 beam 变成一个 query tile
@@ -358,7 +393,12 @@ flowchart TD
 
 kernel 将 `[B, 1, W, Hq, D]` 的 Q 视为 `[B, W, Hq, D]`，沿 beam 维度切 query tile。于是同一块 ContextKV 可以在 tile 内服务多条 beam，形成适合 Tensor Core MMA 的矩阵运算。
 
-```mermaid
+![图 6：多条 beam 组成 query tile](./assets/sid-gr-decode-guide/figure-06.png)
+
+<details>
+<summary>查看图 6 的 Mermaid 源码</summary>
+
+```text
 flowchart TD
     Q0["beam 0 到 127 的 Q"] --> T0["Query tile 0"]
     Q1["beam 128 到 255 的 Q"] --> T1["Query tile 1"]
@@ -371,6 +411,8 @@ flowchart TD
     class K context;
     class T0,T1 compute;
 ```
+
+</details>
 
 **图 6：示意 `W=256、tile_m=128` 时的 query 分组。** 每个 tile 内的多条 query 复用 KV；图不是“整段前缀全 GPU 只加载一次”的承诺。
 
@@ -437,7 +479,12 @@ LSE 让这个合并在数值上保持稳定。数学等价不保证低精度浮�
 
 小 batch 下，如果 query tile 数量不足，部分 SM 可能没有足够任务。沿长 ContextKV 再切分，可以增加并行工作；代价是 partial buffers 和 combine。
 
-```mermaid
+![图 7：split-KV 与融合 Beam Attention](./assets/sid-gr-decode-guide/figure-07.png)
+
+<details>
+<summary>查看图 7 的 Mermaid 源码</summary>
+
+```text
 flowchart TD
     Q["同一个 query tile"] --> S0["Context split 0"]
     Q --> S1["Context split 1"]
@@ -456,6 +503,8 @@ flowchart TD
     class B beam;
     class M merge;
 ```
+
+</details>
 
 **图 7：融合路径示意。只有最后一个 split 加入 BeamKV，避免历史被重复计入 softmax。** `ns=1` 时这个唯一 split 也就是最后一个 split。[split 分派][interface] · [SM80 融合条件][sm80]
 
@@ -497,7 +546,12 @@ Pool 是预先分配并复用的显存。请求得到一个 slot 的使用权，
 
 ### 7.2 Graph 直接绑定 pool view
 
-```mermaid
+![图 8：KV pool 与 CUDA Graph 的数据流](./assets/sid-gr-decode-guide/figure-08.png)
+
+<details>
+<summary>查看图 8 的 Mermaid 源码</summary>
+
+```text
 flowchart TD
     C["Context pool slice"] --> G["已捕获的 Decode Graph"]
     B["Beam pool slice"] --> G
@@ -516,6 +570,8 @@ flowchart TD
     class I,U index;
     class G replay;
 ```
+
+</details>
 
 **图 8：符合条件的 direct pool-view 路径。** 每轮更新小输入，Graph 直接读写已绑定的 KV slice，避免反复复制整段 KV 到独立 graph 输入区。
 
