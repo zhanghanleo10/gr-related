@@ -198,9 +198,10 @@ history = history.reshape(B, t * W, Hkv, D)
 
 令每个元素占 `e` 字节，则 KV 预留容量为：
 
-$$
-M_{\mathrm{KV}}=2LBH_{kv}De\left(S+T_{\max}W_{\max}\right)
-$$
+```python
+# KV 预留容量，单位：字节；e 为每个元素的字节数。
+M_KV = 2 * L * B * Hkv * D * e * (S + T_max * W_max)
+```
 
 前面的 `2` 对应 K 与 V。仅作为算术示例，设 `L=28、B=1、Hkv=8、D=128、BF16、S=4096、T_max=3、W_max=128`：
 
@@ -384,11 +385,26 @@ new_indices[t, :] = t * W + arange(W)
 
 `共同前缀 KV + 祖先路径 KV + 当前 token KV`。
 
-整体计算仍遵循：
+以下固定一个请求、一条当前 query 和一个 query head，用普通代码表达完整 Attention：
 
-$$
-O=\operatorname{softmax}\left(QK^\top/\sqrt{D}\right)V
-$$
+```python
+# N 是这条 query 可见的 token 总数：前缀 + 路径历史 + 当前 token。
+# K、V 已按该 query 的有效路径逻辑组织，并选取其对应的 KV head。
+scores = (q @ K.T) / sqrt(D)   # [N]：对每个可见位置打分
+weights = softmax(scores)      # [N]：沿可见 token 维度归一化
+out = weights @ V             # [D]：对 V 加权求和
+```
+
+| 符号 | 形状 | 含义 |
+| --- | --- | --- |
+| `q` | `[D]` | 当前 query 的向量 |
+| `K`、`V` | `[N, D]` | 该 query 可见位置的 K/V |
+| `K.T` | `[D, N]` | K 的转置；`@` 表示矩阵/向量乘法 |
+| `scores` | `[N]` | 缩放后的 Attention 分数 |
+| `weights` | `[N]` | softmax 权重，总和为 1 |
+| `out` | `[D]` | 完整 Attention 输出 |
+
+这是解释计算语义的参考写法，**不要求实现先把 ContextKV 与 BeamKV 物理拼接成一个 tensor**。专用 kernel 可以从两块存储分别读取。
 
 拆分的是计算与存储组织，不是改变哪些 token 可见。
 
@@ -485,15 +501,26 @@ SM80 实现的短历史阶段执行：
 
 ### 5.4 两个 softmax 输出不能直接相加
 
-假设两部分分别得到归一化输出 `Oc、Ob`，以及各自分数的 log-sum-exp `Lc、Lb`。正确合并为：
+以下仍固定一条 query 和一个 head。Context 与 Beam 两部分分别得到归一化输出 `Oc`、`Ob`，并保留各自分数的 log-sum-exp（简称 LSE）：
 
-$$
-L=\operatorname{logaddexp}(L_c,L_b)
-$$
+| 符号 | 含义 |
+| --- | --- |
+| `Oc`、`Ob` | 两部分各自完成 softmax 后的输出向量，形状为 `[D]` |
+| `Lc` | Context 部分的 `logsumexp(scores_context)` |
+| `Lb` | Beam 部分的 `logsumexp(scores_beam)`，包含当前 token |
+| `L` | 合并后的整体 LSE |
+| `wc`、`wb` | 两部分在整体输出中的权重，二者之和为 1 |
 
-$$
-O=e^{L_c-L}O_c+e^{L_b-L}O_b
-$$
+这里 `scores_context` 和 `scores_beam` 已包含 5.1 节的缩放，并且只考虑有效位置。使用自然对数表示时，正确合并为：
+
+```python
+L = logaddexp(Lc, Lb)  # 稳定计算 log(exp(Lc) + exp(Lb))
+wc = exp(Lc - L)
+wb = exp(Lb - L)
+out = wc * Oc + wb * Ob
+```
+
+`logsumexp(scores)` 表示“对分数取指数后求和，再取对数”，实际实现使用数值稳定算法。`Lc`、`Lb` 保留的是各部分的归一化分母信息；仅保留 `Oc`、`Ob`，无法恢复正确的整体权重。
 
 直观例子：前缀部分未归一化权重和为 9，beam 部分为 1，则最终输出应是 `0.9 × Oc + 0.1 × Ob`，而非 `Oc + Ob`，也不是各占一半。
 
