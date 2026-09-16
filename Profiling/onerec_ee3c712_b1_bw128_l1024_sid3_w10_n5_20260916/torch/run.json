@@ -1,0 +1,5359 @@
+{
+  "revision": "ee3c7129a47f9db688880f163dd810206e8e9b9d",
+  "engine_config": {
+    "model": "/home/z00469465/OneRec/OneRec-1.7B",
+    "dtype": "bfloat16",
+    "seed": 0,
+    "async_scheduling": true,
+    "trust_remote_code": true,
+    "max_logprobs": 128,
+    "max_num_seqs": 1,
+    "max_model_len": 8192,
+    "enable_prefix_caching": true,
+    "gpu_memory_utilization": 0.7,
+    "profiler_config": {
+      "profiler": "torch",
+      "torch_profiler_dir": "/home/z00469465/PROJECT/vllm-gr/trace/onerec_ee3c712_b1_bw128_l1024_sid3_w10_n5_20260916/torch",
+      "torch_profiler_with_stack": true,
+      "torch_profiler_record_shapes": true,
+      "torch_profiler_with_memory": true,
+      "torch_profiler_use_gzip": false,
+      "torch_profiler_dump_cuda_time_total": true,
+      "ignore_frontend": true
+    },
+    "vllm_gr_config": {
+      "schema_version": 1,
+      "attention_backend": "CUSTOM",
+      "beam": {
+        "execution_mode": "v1",
+        "graph_enabled": true,
+        "max_width": 128,
+        "max_decode_steps": 3,
+        "worker_decision": true
+      },
+      "constraint_table": {
+        "enabled": true,
+        "backend": "cuda",
+        "max_top_k": 128,
+        "path": "/home/z00469465/PROJECT/vllm-gr/trace/onerec_ee3c712_b1_bw128_l1024_sid3_w10_n5_20260916/video_constraint_table.safetensors",
+        "format": "constraint_table_v1",
+        "artifact_digest": "sha256:227a21a0501562bdcef39b229b6167e2b0c11e9b570944b2d809bec1c2b0ffcc",
+        "tokenizer_digest": "sha256:00119100fcd12439532a0530a884baa2b5641c362a02be3bff7aeba38a716023"
+      }
+    }
+  },
+  "init_seconds": 162.30002225306816,
+  "effective_engine_config": "model='/home/z00469465/OneRec/OneRec-1.7B', speculative_config=None, tokenizer='/home/z00469465/OneRec/OneRec-1.7B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=8192, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=None, quantization_config=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=/home/z00469465/OneRec/OneRec-1.7B, enable_prefix_caching=True, enable_chunked_prefill=False, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['none'], 'ir_enable_torch_wrap': True, 'splitting_ops': ['vllm::unified_attention_with_output', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::qwen_gdn_attention_core', 'vllm::gdn_attention_core_xpu', 'vllm::olmo_hybrid_gdn_full_forward', 'vllm::kda_attention', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::deepseek_v4_attention', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update'], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'size_asserts': False, 'alignment_asserts': False, 'scalar_asserts': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False}, 'max_cudagraph_capture_size': 2, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native']), enable_flashinfer_autotune=True, moe_backend='auto', linear_backend='auto')",
+  "versions": {
+    "python": "3.12.3 (main, Nov  6 2025, 13:44:16) [GCC 13.3.0]",
+    "torch": "2.11.0+cu130",
+    "vllm": "0.22.1"
+  },
+  "source": {
+    "vllm": "/usr/local/lib/python3.12/dist-packages/vllm/__init__.py",
+    "vllm_gr": "/home/z00469465/PROJECT/vllm-gr/vllm_gr/__init__.py"
+  },
+  "contract": {
+    "batch_size": 1,
+    "beam_width": 128,
+    "sid_steps": 3,
+    "submitted_prompt_tokens": 1023,
+    "model_input_tokens": 1024,
+    "warmups": 10,
+    "profiled_requests": 5,
+    "multiprocessing": true,
+    "async_scheduling": true,
+    "prefix_cache_reset_before_every_request": true,
+    "explicit_per_request_cuda_synchronize": false,
+    "output_validation_outside_capture": true
+  },
+  "test_only_final_result_adapter": true,
+  "final_result_adapter_scope": "TEST_ONLY_FINAL_RESULT_ADAPTER",
+  "environment": {
+    "VLLM_ENABLE_PREFILL_CUDAGRAPH": "1",
+    "VLLM_USE_V2_MODEL_RUNNER": "0",
+    "TORCHINDUCTOR_LOOP_ORDERING_AFTER_FUSION": "0",
+    "ONEREC_V1_TRACE_ADAPTER": "1",
+    "CUDA_ARCH_LIST": "7.5 8.0 8.6 9.0 10.0 12.0",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "VLLM_ENABLE_V1_MULTIPROCESSING": "1",
+    "CUDA_VERSION": "13.1.0.036",
+    "CUDA_VISIBLE_DEVICES": "0",
+    "CUDA_BINARY_LOADER_THREAD_COUNT": "8",
+    "CUDA_COMPONENT_LIST": "cccl crt nvrtc driver-dev culibos-dev cudart cudart-dev nvcc",
+    "TORCHINDUCTOR_COMPILE_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "CUDA_DRIVER_VERSION": "590.44.01",
+    "CUDA_HOME": "/usr/local/cuda",
+    "CUDA_MODULE_LOADING": "LAZY",
+    "TORCHINDUCTOR_CACHE_DIR": "/tmp/torchinductor_root",
+    "VLLM_CUSTOM_SCOPES_FOR_PROFILING": "1",
+    "VLLM_NVTX_SCOPES_FOR_PROFILING": "0",
+    "ONEREC_TRACE_BEGIN_ID": "176245",
+    "ONEREC_TRACE_END_ID": "176246"
+  },
+  "weights": [
+    {
+      "name": "model-00000-of-00001.safetensors",
+      "bytes": 4263793656
+    }
+  ],
+  "prompt_sha256": "7a8e6518e1301e06ea61dda62df2d4d60410bb13cce2da833bb11d847bf2f189",
+  "warmups": [
+    {
+      "call_ms": 52380.681929,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2"
+    },
+    {
+      "call_ms": 75.832997,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2"
+    },
+    {
+      "call_ms": 70.231678,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2"
+    },
+    {
+      "call_ms": 71.983584,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2"
+    },
+    {
+      "call_ms": 73.319829,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2"
+    },
+    {
+      "call_ms": 72.772644,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2"
+    },
+    {
+      "call_ms": 73.280824,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2"
+    },
+    {
+      "call_ms": 68.563769,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2"
+    },
+    {
+      "call_ms": 71.07538,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2"
+    },
+    {
+      "call_ms": 69.449719,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2"
+    }
+  ],
+  "samples": [
+    {
+      "request": 1,
+      "call_ms": 116.003892
+    },
+    {
+      "request": 2,
+      "call_ms": 99.166404
+    },
+    {
+      "request": 3,
+      "call_ms": 99.239218
+    },
+    {
+      "request": 4,
+      "call_ms": 100.708493
+    },
+    {
+      "request": 5,
+      "call_ms": 100.159815
+    }
+  ],
+  "validation": [
+    {
+      "beam_count": 128,
+      "catalog_legal": true,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2",
+      "rows": [
+        {
+          "sid_token_ids": [
+            156597,
+            165559,
+            168909
+          ],
+          "score": -5.408905029296875
+        },
+        {
+          "sid_token_ids": [
+            152284,
+            162766,
+            174634
+          ],
+          "score": -5.9812774658203125
+        },
+        {
+          "sid_token_ids": [
+            159607,
+            163300,
+            171866
+          ],
+          "score": -6.363405227661133
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            163993,
+            174706
+          ],
+          "score": -6.482383728027344
+        },
+        {
+          "sid_token_ids": [
+            154278,
+            165501,
+            175025
+          ],
+          "score": -6.492189407348633
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            164618,
+            173885
+          ],
+          "score": -6.509958267211914
+        },
+        {
+          "sid_token_ids": [
+            159236,
+            167114,
+            171980
+          ],
+          "score": -6.646003723144531
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            159896,
+            170315
+          ],
+          "score": -6.7195892333984375
+        },
+        {
+          "sid_token_ids": [
+            152827,
+            163471,
+            169885
+          ],
+          "score": -6.722570419311523
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            167759,
+            171440
+          ],
+          "score": -6.780849456787109
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            160614,
+            174832
+          ],
+          "score": -6.7918243408203125
+        },
+        {
+          "sid_token_ids": [
+            152292,
+            163278,
+            170588
+          ],
+          "score": -6.843685150146484
+        },
+        {
+          "sid_token_ids": [
+            156062,
+            160237,
+            172981
+          ],
+          "score": -6.869836807250977
+        },
+        {
+          "sid_token_ids": [
+            157120,
+            161470,
+            175498
+          ],
+          "score": -6.912710189819336
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            163166,
+            174186
+          ],
+          "score": -7.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            163993,
+            176217
+          ],
+          "score": -7.107383728027344
+        },
+        {
+          "sid_token_ids": [
+            157831,
+            165126,
+            172423
+          ],
+          "score": -7.1602630615234375
+        },
+        {
+          "sid_token_ids": [
+            155831,
+            162881,
+            174960
+          ],
+          "score": -7.181037902832031
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            164131,
+            173546
+          ],
+          "score": -7.182491302490234
+        },
+        {
+          "sid_token_ids": [
+            154367,
+            165748,
+            172671
+          ],
+          "score": -7.187051773071289
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            161482,
+            169150
+          ],
+          "score": -7.209587097167969
+        },
+        {
+          "sid_token_ids": [
+            159261,
+            163951,
+            168259
+          ],
+          "score": -7.236177444458008
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            162128,
+            170572
+          ],
+          "score": -7.266229629516602
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            160969,
+            175419
+          ],
+          "score": -7.275745391845703
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162293,
+            171675
+          ],
+          "score": -7.279008865356445
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            165559,
+            174768
+          ],
+          "score": -7.283905029296875
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            163300,
+            175164
+          ],
+          "score": -7.285221099853516
+        },
+        {
+          "sid_token_ids": [
+            154982,
+            167607,
+            170709
+          ],
+          "score": -7.298360824584961
+        },
+        {
+          "sid_token_ids": [
+            158390,
+            167761,
+            175204
+          ],
+          "score": -7.304328918457031
+        },
+        {
+          "sid_token_ids": [
+            152907,
+            163461,
+            170911
+          ],
+          "score": -7.308013916015625
+        },
+        {
+          "sid_token_ids": [
+            159261,
+            163951,
+            168921
+          ],
+          "score": -7.361177444458008
+        },
+        {
+          "sid_token_ids": [
+            157521,
+            165126,
+            168595
+          ],
+          "score": -7.373468399047852
+        },
+        {
+          "sid_token_ids": [
+            159401,
+            165126,
+            171838
+          ],
+          "score": -7.382938385009766
+        },
+        {
+          "sid_token_ids": [
+            154731,
+            163278,
+            169844
+          ],
+          "score": -7.384849548339844
+        },
+        {
+          "sid_token_ids": [
+            157338,
+            160374,
+            174661
+          ],
+          "score": -7.416444778442383
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            162426,
+            175113
+          ],
+          "score": -7.417942047119141
+        },
+        {
+          "sid_token_ids": [
+            159024,
+            165558,
+            175422
+          ],
+          "score": -7.425312042236328
+        },
+        {
+          "sid_token_ids": [
+            155658,
+            161474,
+            173448
+          ],
+          "score": -7.426597595214844
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164018,
+            171961
+          ],
+          "score": -7.435512542724609
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            162426,
+            174768
+          ],
+          "score": -7.459142684936523
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            163908,
+            174960
+          ],
+          "score": -7.4695892333984375
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            166146,
+            168066
+          ],
+          "score": -7.471059799194336
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167114,
+            174702
+          ],
+          "score": -7.486194610595703
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            163278,
+            171980
+          ],
+          "score": -7.493349075317383
+        },
+        {
+          "sid_token_ids": [
+            156731,
+            164258,
+            168779
+          ],
+          "score": -7.501802444458008
+        },
+        {
+          "sid_token_ids": [
+            156731,
+            167254,
+            170542
+          ],
+          "score": -7.501802444458008
+        },
+        {
+          "sid_token_ids": [
+            153356,
+            166293,
+            170383
+          ],
+          "score": -7.523094177246094
+        },
+        {
+          "sid_token_ids": [
+            157125,
+            160485,
+            175164
+          ],
+          "score": -7.524873733520508
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            161096,
+            175850
+          ],
+          "score": -7.557477951049805
+        },
+        {
+          "sid_token_ids": [
+            158391,
+            167467,
+            175556
+          ],
+          "score": -7.561010360717773
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161482,
+            168451
+          ],
+          "score": -7.56230354309082
+        },
+        {
+          "sid_token_ids": [
+            157482,
+            164018,
+            173051
+          ],
+          "score": -7.598142623901367
+        },
+        {
+          "sid_token_ids": [
+            157350,
+            165582,
+            170538
+          ],
+          "score": -7.599729537963867
+        },
+        {
+          "sid_token_ids": [
+            158100,
+            163823,
+            168425
+          ],
+          "score": -7.628227233886719
+        },
+        {
+          "sid_token_ids": [
+            153890,
+            164652,
+            174171
+          ],
+          "score": -7.648557662963867
+        },
+        {
+          "sid_token_ids": [
+            154144,
+            167365,
+            175376
+          ],
+          "score": -7.667123794555664
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            164618,
+            173095
+          ],
+          "score": -7.667942047119141
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            167507,
+            172223
+          ],
+          "score": -7.677715301513672
+        },
+        {
+          "sid_token_ids": [
+            155497,
+            163040,
+            170538
+          ],
+          "score": -7.680902481079102
+        },
+        {
+          "sid_token_ids": [
+            156274,
+            167277,
+            170911
+          ],
+          "score": -7.6950531005859375
+        },
+        {
+          "sid_token_ids": [
+            153459,
+            163951,
+            169263
+          ],
+          "score": -7.699865341186523
+        },
+        {
+          "sid_token_ids": [
+            152014,
+            163920,
+            168543
+          ],
+          "score": -7.703832626342773
+        },
+        {
+          "sid_token_ids": [
+            157039,
+            163028,
+            173037
+          ],
+          "score": -7.70513916015625
+        },
+        {
+          "sid_token_ids": [
+            151745,
+            167809,
+            175115
+          ],
+          "score": -7.711690902709961
+        },
+        {
+          "sid_token_ids": [
+            155011,
+            161026,
+            168477
+          ],
+          "score": -7.716230392456055
+        },
+        {
+          "sid_token_ids": [
+            153964,
+            163585,
+            169901
+          ],
+          "score": -7.727697372436523
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167114,
+            171980
+          ],
+          "score": -7.736194610595703
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            167796,
+            170768
+          ],
+          "score": -7.737041473388672
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            162426,
+            172807
+          ],
+          "score": -7.754367828369141
+        },
+        {
+          "sid_token_ids": [
+            152284,
+            166438,
+            168486
+          ],
+          "score": -7.769319534301758
+        },
+        {
+          "sid_token_ids": [
+            158069,
+            160514,
+            171803
+          ],
+          "score": -7.77861213684082
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164821,
+            174259
+          ],
+          "score": -7.780069351196289
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            161750,
+            169904
+          ],
+          "score": -7.780849456787109
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167167,
+            172527
+          ],
+          "score": -7.78175163269043
+        },
+        {
+          "sid_token_ids": [
+            159555,
+            162126,
+            175220
+          ],
+          "score": -7.782932281494141
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            160682,
+            175709
+          ],
+          "score": -7.783905029296875
+        },
+        {
+          "sid_token_ids": [
+            158412,
+            163173,
+            168066
+          ],
+          "score": -7.794649124145508
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            167258,
+            171135
+          ],
+          "score": -7.795991897583008
+        },
+        {
+          "sid_token_ids": [
+            153459,
+            166068,
+            169924
+          ],
+          "score": -7.797954559326172
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            165580,
+            168738
+          ],
+          "score": -7.807477951049805
+        },
+        {
+          "sid_token_ids": [
+            156593,
+            163471,
+            170970
+          ],
+          "score": -7.826839447021484
+        },
+        {
+          "sid_token_ids": [
+            157748,
+            160581,
+            171064
+          ],
+          "score": -7.845542907714844
+        },
+        {
+          "sid_token_ids": [
+            157771,
+            167607,
+            168420
+          ],
+          "score": -7.847749710083008
+        },
+        {
+          "sid_token_ids": [
+            157482,
+            166351,
+            174825
+          ],
+          "score": -7.848142623901367
+        },
+        {
+          "sid_token_ids": [
+            157427,
+            164085,
+            168198
+          ],
+          "score": -7.852367401123047
+        },
+        {
+          "sid_token_ids": [
+            159607,
+            161096,
+            172256
+          ],
+          "score": -7.863405227661133
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            166629,
+            174561
+          ],
+          "score": -7.882518768310547
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            162284,
+            173566
+          ],
+          "score": -7.886629104614258
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162293,
+            175703
+          ],
+          "score": -7.904008865356445
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            165827,
+            171434
+          ],
+          "score": -7.914056777954102
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            165126,
+            171352
+          ],
+          "score": -7.9168243408203125
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            160237,
+            174768
+          ],
+          "score": -7.917942047119141
+        },
+        {
+          "sid_token_ids": [
+            152127,
+            163040,
+            172588
+          ],
+          "score": -7.92009162902832
+        },
+        {
+          "sid_token_ids": [
+            152834,
+            167696,
+            175958
+          ],
+          "score": -7.920635223388672
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            166438,
+            170604
+          ],
+          "score": -7.929203033447266
+        },
+        {
+          "sid_token_ids": [
+            157296,
+            160315,
+            175499
+          ],
+          "score": -7.934825897216797
+        },
+        {
+          "sid_token_ids": [
+            157304,
+            165779,
+            174832
+          ],
+          "score": -7.953317642211914
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            163040,
+            171684
+          ],
+          "score": -7.959453582763672
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            163040,
+            174870
+          ],
+          "score": -7.959453582763672
+        },
+        {
+          "sid_token_ids": [
+            156817,
+            165184,
+            175839
+          ],
+          "score": -7.960920333862305
+        },
+        {
+          "sid_token_ids": [
+            151930,
+            167011,
+            170970
+          ],
+          "score": -7.970684051513672
+        },
+        {
+          "sid_token_ids": [
+            158809,
+            160280,
+            170917
+          ],
+          "score": -7.9727325439453125
+        },
+        {
+          "sid_token_ids": [
+            159077,
+            167093,
+            168899
+          ],
+          "score": -7.974164962768555
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            165331,
+            168248
+          ],
+          "score": -7.977132797241211
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            159906,
+            169175
+          ],
+          "score": -7.9852294921875
+        },
+        {
+          "sid_token_ids": [
+            152496,
+            167066,
+            172049
+          ],
+          "score": -7.992744445800781
+        },
+        {
+          "sid_token_ids": [
+            157905,
+            159916,
+            174037
+          ],
+          "score": -7.994342803955078
+        },
+        {
+          "sid_token_ids": [
+            157905,
+            162854,
+            172342
+          ],
+          "score": -7.994342803955078
+        },
+        {
+          "sid_token_ids": [
+            158889,
+            163203,
+            168411
+          ],
+          "score": -8.005088806152344
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            166859,
+            171485
+          ],
+          "score": -8.016229629516602
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            161379,
+            168411
+          ],
+          "score": -8.03084945678711
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            165655,
+            170703
+          ],
+          "score": -8.03084945678711
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            162084,
+            171352
+          ],
+          "score": -8.041824340820312
+        },
+        {
+          "sid_token_ids": [
+            157831,
+            163943,
+            168162
+          ],
+          "score": -8.04581069946289
+        },
+        {
+          "sid_token_ids": [
+            152127,
+            160415,
+            170188
+          ],
+          "score": -8.050046920776367
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            162753,
+            169616
+          ],
+          "score": -8.053529739379883
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161379,
+            176020
+          ],
+          "score": -8.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161797,
+            170848
+          ],
+          "score": -8.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            159706,
+            164249,
+            168495
+          ],
+          "score": -8.059711456298828
+        },
+        {
+          "sid_token_ids": [
+            154367,
+            160682,
+            173380
+          ],
+          "score": -8.06503677368164
+        },
+        {
+          "sid_token_ids": [
+            153890,
+            166261,
+            174643
+          ],
+          "score": -8.066556930541992
+        },
+        {
+          "sid_token_ids": [
+            158644,
+            163220,
+            174825
+          ],
+          "score": -8.088241577148438
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162900,
+            171684
+          ],
+          "score": -8.12503433227539
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            160237,
+            172968
+          ],
+          "score": -8.138677597045898
+        },
+        {
+          "sid_token_ids": [
+            153356,
+            166293,
+            169002
+          ],
+          "score": -8.148094177246094
+        },
+        {
+          "sid_token_ids": [
+            154101,
+            160996,
+            170505
+          ],
+          "score": -8.150876998901367
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164821,
+            175403
+          ],
+          "score": -8.155069351196289
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            164618,
+            170546
+          ],
+          "score": -8.176454544067383
+        }
+      ]
+    },
+    {
+      "beam_count": 128,
+      "catalog_legal": true,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2",
+      "rows": [
+        {
+          "sid_token_ids": [
+            156597,
+            165559,
+            168909
+          ],
+          "score": -5.408905029296875
+        },
+        {
+          "sid_token_ids": [
+            152284,
+            162766,
+            174634
+          ],
+          "score": -5.9812774658203125
+        },
+        {
+          "sid_token_ids": [
+            159607,
+            163300,
+            171866
+          ],
+          "score": -6.363405227661133
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            163993,
+            174706
+          ],
+          "score": -6.482383728027344
+        },
+        {
+          "sid_token_ids": [
+            154278,
+            165501,
+            175025
+          ],
+          "score": -6.492189407348633
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            164618,
+            173885
+          ],
+          "score": -6.509958267211914
+        },
+        {
+          "sid_token_ids": [
+            159236,
+            167114,
+            171980
+          ],
+          "score": -6.646003723144531
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            159896,
+            170315
+          ],
+          "score": -6.7195892333984375
+        },
+        {
+          "sid_token_ids": [
+            152827,
+            163471,
+            169885
+          ],
+          "score": -6.722570419311523
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            167759,
+            171440
+          ],
+          "score": -6.780849456787109
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            160614,
+            174832
+          ],
+          "score": -6.7918243408203125
+        },
+        {
+          "sid_token_ids": [
+            152292,
+            163278,
+            170588
+          ],
+          "score": -6.843685150146484
+        },
+        {
+          "sid_token_ids": [
+            156062,
+            160237,
+            172981
+          ],
+          "score": -6.869836807250977
+        },
+        {
+          "sid_token_ids": [
+            157120,
+            161470,
+            175498
+          ],
+          "score": -6.912710189819336
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            163166,
+            174186
+          ],
+          "score": -7.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            163993,
+            176217
+          ],
+          "score": -7.107383728027344
+        },
+        {
+          "sid_token_ids": [
+            157831,
+            165126,
+            172423
+          ],
+          "score": -7.1602630615234375
+        },
+        {
+          "sid_token_ids": [
+            155831,
+            162881,
+            174960
+          ],
+          "score": -7.181037902832031
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            164131,
+            173546
+          ],
+          "score": -7.182491302490234
+        },
+        {
+          "sid_token_ids": [
+            154367,
+            165748,
+            172671
+          ],
+          "score": -7.187051773071289
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            161482,
+            169150
+          ],
+          "score": -7.209587097167969
+        },
+        {
+          "sid_token_ids": [
+            159261,
+            163951,
+            168259
+          ],
+          "score": -7.236177444458008
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            162128,
+            170572
+          ],
+          "score": -7.266229629516602
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            160969,
+            175419
+          ],
+          "score": -7.275745391845703
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162293,
+            171675
+          ],
+          "score": -7.279008865356445
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            165559,
+            174768
+          ],
+          "score": -7.283905029296875
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            163300,
+            175164
+          ],
+          "score": -7.285221099853516
+        },
+        {
+          "sid_token_ids": [
+            154982,
+            167607,
+            170709
+          ],
+          "score": -7.298360824584961
+        },
+        {
+          "sid_token_ids": [
+            158390,
+            167761,
+            175204
+          ],
+          "score": -7.304328918457031
+        },
+        {
+          "sid_token_ids": [
+            152907,
+            163461,
+            170911
+          ],
+          "score": -7.308013916015625
+        },
+        {
+          "sid_token_ids": [
+            159261,
+            163951,
+            168921
+          ],
+          "score": -7.361177444458008
+        },
+        {
+          "sid_token_ids": [
+            157521,
+            165126,
+            168595
+          ],
+          "score": -7.373468399047852
+        },
+        {
+          "sid_token_ids": [
+            159401,
+            165126,
+            171838
+          ],
+          "score": -7.382938385009766
+        },
+        {
+          "sid_token_ids": [
+            154731,
+            163278,
+            169844
+          ],
+          "score": -7.384849548339844
+        },
+        {
+          "sid_token_ids": [
+            157338,
+            160374,
+            174661
+          ],
+          "score": -7.416444778442383
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            162426,
+            175113
+          ],
+          "score": -7.417942047119141
+        },
+        {
+          "sid_token_ids": [
+            159024,
+            165558,
+            175422
+          ],
+          "score": -7.425312042236328
+        },
+        {
+          "sid_token_ids": [
+            155658,
+            161474,
+            173448
+          ],
+          "score": -7.426597595214844
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164018,
+            171961
+          ],
+          "score": -7.435512542724609
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            162426,
+            174768
+          ],
+          "score": -7.459142684936523
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            163908,
+            174960
+          ],
+          "score": -7.4695892333984375
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            166146,
+            168066
+          ],
+          "score": -7.471059799194336
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167114,
+            174702
+          ],
+          "score": -7.486194610595703
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            163278,
+            171980
+          ],
+          "score": -7.493349075317383
+        },
+        {
+          "sid_token_ids": [
+            156731,
+            164258,
+            168779
+          ],
+          "score": -7.501802444458008
+        },
+        {
+          "sid_token_ids": [
+            156731,
+            167254,
+            170542
+          ],
+          "score": -7.501802444458008
+        },
+        {
+          "sid_token_ids": [
+            153356,
+            166293,
+            170383
+          ],
+          "score": -7.523094177246094
+        },
+        {
+          "sid_token_ids": [
+            157125,
+            160485,
+            175164
+          ],
+          "score": -7.524873733520508
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            161096,
+            175850
+          ],
+          "score": -7.557477951049805
+        },
+        {
+          "sid_token_ids": [
+            158391,
+            167467,
+            175556
+          ],
+          "score": -7.561010360717773
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161482,
+            168451
+          ],
+          "score": -7.56230354309082
+        },
+        {
+          "sid_token_ids": [
+            157482,
+            164018,
+            173051
+          ],
+          "score": -7.598142623901367
+        },
+        {
+          "sid_token_ids": [
+            157350,
+            165582,
+            170538
+          ],
+          "score": -7.599729537963867
+        },
+        {
+          "sid_token_ids": [
+            158100,
+            163823,
+            168425
+          ],
+          "score": -7.628227233886719
+        },
+        {
+          "sid_token_ids": [
+            153890,
+            164652,
+            174171
+          ],
+          "score": -7.648557662963867
+        },
+        {
+          "sid_token_ids": [
+            154144,
+            167365,
+            175376
+          ],
+          "score": -7.667123794555664
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            164618,
+            173095
+          ],
+          "score": -7.667942047119141
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            167507,
+            172223
+          ],
+          "score": -7.677715301513672
+        },
+        {
+          "sid_token_ids": [
+            155497,
+            163040,
+            170538
+          ],
+          "score": -7.680902481079102
+        },
+        {
+          "sid_token_ids": [
+            156274,
+            167277,
+            170911
+          ],
+          "score": -7.6950531005859375
+        },
+        {
+          "sid_token_ids": [
+            153459,
+            163951,
+            169263
+          ],
+          "score": -7.699865341186523
+        },
+        {
+          "sid_token_ids": [
+            152014,
+            163920,
+            168543
+          ],
+          "score": -7.703832626342773
+        },
+        {
+          "sid_token_ids": [
+            157039,
+            163028,
+            173037
+          ],
+          "score": -7.70513916015625
+        },
+        {
+          "sid_token_ids": [
+            151745,
+            167809,
+            175115
+          ],
+          "score": -7.711690902709961
+        },
+        {
+          "sid_token_ids": [
+            155011,
+            161026,
+            168477
+          ],
+          "score": -7.716230392456055
+        },
+        {
+          "sid_token_ids": [
+            153964,
+            163585,
+            169901
+          ],
+          "score": -7.727697372436523
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167114,
+            171980
+          ],
+          "score": -7.736194610595703
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            167796,
+            170768
+          ],
+          "score": -7.737041473388672
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            162426,
+            172807
+          ],
+          "score": -7.754367828369141
+        },
+        {
+          "sid_token_ids": [
+            152284,
+            166438,
+            168486
+          ],
+          "score": -7.769319534301758
+        },
+        {
+          "sid_token_ids": [
+            158069,
+            160514,
+            171803
+          ],
+          "score": -7.77861213684082
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164821,
+            174259
+          ],
+          "score": -7.780069351196289
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            161750,
+            169904
+          ],
+          "score": -7.780849456787109
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167167,
+            172527
+          ],
+          "score": -7.78175163269043
+        },
+        {
+          "sid_token_ids": [
+            159555,
+            162126,
+            175220
+          ],
+          "score": -7.782932281494141
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            160682,
+            175709
+          ],
+          "score": -7.783905029296875
+        },
+        {
+          "sid_token_ids": [
+            158412,
+            163173,
+            168066
+          ],
+          "score": -7.794649124145508
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            167258,
+            171135
+          ],
+          "score": -7.795991897583008
+        },
+        {
+          "sid_token_ids": [
+            153459,
+            166068,
+            169924
+          ],
+          "score": -7.797954559326172
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            165580,
+            168738
+          ],
+          "score": -7.807477951049805
+        },
+        {
+          "sid_token_ids": [
+            156593,
+            163471,
+            170970
+          ],
+          "score": -7.826839447021484
+        },
+        {
+          "sid_token_ids": [
+            157748,
+            160581,
+            171064
+          ],
+          "score": -7.845542907714844
+        },
+        {
+          "sid_token_ids": [
+            157771,
+            167607,
+            168420
+          ],
+          "score": -7.847749710083008
+        },
+        {
+          "sid_token_ids": [
+            157482,
+            166351,
+            174825
+          ],
+          "score": -7.848142623901367
+        },
+        {
+          "sid_token_ids": [
+            157427,
+            164085,
+            168198
+          ],
+          "score": -7.852367401123047
+        },
+        {
+          "sid_token_ids": [
+            159607,
+            161096,
+            172256
+          ],
+          "score": -7.863405227661133
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            166629,
+            174561
+          ],
+          "score": -7.882518768310547
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            162284,
+            173566
+          ],
+          "score": -7.886629104614258
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162293,
+            175703
+          ],
+          "score": -7.904008865356445
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            165827,
+            171434
+          ],
+          "score": -7.914056777954102
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            165126,
+            171352
+          ],
+          "score": -7.9168243408203125
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            160237,
+            174768
+          ],
+          "score": -7.917942047119141
+        },
+        {
+          "sid_token_ids": [
+            152127,
+            163040,
+            172588
+          ],
+          "score": -7.92009162902832
+        },
+        {
+          "sid_token_ids": [
+            152834,
+            167696,
+            175958
+          ],
+          "score": -7.920635223388672
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            166438,
+            170604
+          ],
+          "score": -7.929203033447266
+        },
+        {
+          "sid_token_ids": [
+            157296,
+            160315,
+            175499
+          ],
+          "score": -7.934825897216797
+        },
+        {
+          "sid_token_ids": [
+            157304,
+            165779,
+            174832
+          ],
+          "score": -7.953317642211914
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            163040,
+            171684
+          ],
+          "score": -7.959453582763672
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            163040,
+            174870
+          ],
+          "score": -7.959453582763672
+        },
+        {
+          "sid_token_ids": [
+            156817,
+            165184,
+            175839
+          ],
+          "score": -7.960920333862305
+        },
+        {
+          "sid_token_ids": [
+            151930,
+            167011,
+            170970
+          ],
+          "score": -7.970684051513672
+        },
+        {
+          "sid_token_ids": [
+            158809,
+            160280,
+            170917
+          ],
+          "score": -7.9727325439453125
+        },
+        {
+          "sid_token_ids": [
+            159077,
+            167093,
+            168899
+          ],
+          "score": -7.974164962768555
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            165331,
+            168248
+          ],
+          "score": -7.977132797241211
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            159906,
+            169175
+          ],
+          "score": -7.9852294921875
+        },
+        {
+          "sid_token_ids": [
+            152496,
+            167066,
+            172049
+          ],
+          "score": -7.992744445800781
+        },
+        {
+          "sid_token_ids": [
+            157905,
+            159916,
+            174037
+          ],
+          "score": -7.994342803955078
+        },
+        {
+          "sid_token_ids": [
+            157905,
+            162854,
+            172342
+          ],
+          "score": -7.994342803955078
+        },
+        {
+          "sid_token_ids": [
+            158889,
+            163203,
+            168411
+          ],
+          "score": -8.005088806152344
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            166859,
+            171485
+          ],
+          "score": -8.016229629516602
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            161379,
+            168411
+          ],
+          "score": -8.03084945678711
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            165655,
+            170703
+          ],
+          "score": -8.03084945678711
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            162084,
+            171352
+          ],
+          "score": -8.041824340820312
+        },
+        {
+          "sid_token_ids": [
+            157831,
+            163943,
+            168162
+          ],
+          "score": -8.04581069946289
+        },
+        {
+          "sid_token_ids": [
+            152127,
+            160415,
+            170188
+          ],
+          "score": -8.050046920776367
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            162753,
+            169616
+          ],
+          "score": -8.053529739379883
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161379,
+            176020
+          ],
+          "score": -8.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161797,
+            170848
+          ],
+          "score": -8.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            159706,
+            164249,
+            168495
+          ],
+          "score": -8.059711456298828
+        },
+        {
+          "sid_token_ids": [
+            154367,
+            160682,
+            173380
+          ],
+          "score": -8.06503677368164
+        },
+        {
+          "sid_token_ids": [
+            153890,
+            166261,
+            174643
+          ],
+          "score": -8.066556930541992
+        },
+        {
+          "sid_token_ids": [
+            158644,
+            163220,
+            174825
+          ],
+          "score": -8.088241577148438
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162900,
+            171684
+          ],
+          "score": -8.12503433227539
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            160237,
+            172968
+          ],
+          "score": -8.138677597045898
+        },
+        {
+          "sid_token_ids": [
+            153356,
+            166293,
+            169002
+          ],
+          "score": -8.148094177246094
+        },
+        {
+          "sid_token_ids": [
+            154101,
+            160996,
+            170505
+          ],
+          "score": -8.150876998901367
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164821,
+            175403
+          ],
+          "score": -8.155069351196289
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            164618,
+            170546
+          ],
+          "score": -8.176454544067383
+        }
+      ]
+    },
+    {
+      "beam_count": 128,
+      "catalog_legal": true,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2",
+      "rows": [
+        {
+          "sid_token_ids": [
+            156597,
+            165559,
+            168909
+          ],
+          "score": -5.408905029296875
+        },
+        {
+          "sid_token_ids": [
+            152284,
+            162766,
+            174634
+          ],
+          "score": -5.9812774658203125
+        },
+        {
+          "sid_token_ids": [
+            159607,
+            163300,
+            171866
+          ],
+          "score": -6.363405227661133
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            163993,
+            174706
+          ],
+          "score": -6.482383728027344
+        },
+        {
+          "sid_token_ids": [
+            154278,
+            165501,
+            175025
+          ],
+          "score": -6.492189407348633
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            164618,
+            173885
+          ],
+          "score": -6.509958267211914
+        },
+        {
+          "sid_token_ids": [
+            159236,
+            167114,
+            171980
+          ],
+          "score": -6.646003723144531
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            159896,
+            170315
+          ],
+          "score": -6.7195892333984375
+        },
+        {
+          "sid_token_ids": [
+            152827,
+            163471,
+            169885
+          ],
+          "score": -6.722570419311523
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            167759,
+            171440
+          ],
+          "score": -6.780849456787109
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            160614,
+            174832
+          ],
+          "score": -6.7918243408203125
+        },
+        {
+          "sid_token_ids": [
+            152292,
+            163278,
+            170588
+          ],
+          "score": -6.843685150146484
+        },
+        {
+          "sid_token_ids": [
+            156062,
+            160237,
+            172981
+          ],
+          "score": -6.869836807250977
+        },
+        {
+          "sid_token_ids": [
+            157120,
+            161470,
+            175498
+          ],
+          "score": -6.912710189819336
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            163166,
+            174186
+          ],
+          "score": -7.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            163993,
+            176217
+          ],
+          "score": -7.107383728027344
+        },
+        {
+          "sid_token_ids": [
+            157831,
+            165126,
+            172423
+          ],
+          "score": -7.1602630615234375
+        },
+        {
+          "sid_token_ids": [
+            155831,
+            162881,
+            174960
+          ],
+          "score": -7.181037902832031
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            164131,
+            173546
+          ],
+          "score": -7.182491302490234
+        },
+        {
+          "sid_token_ids": [
+            154367,
+            165748,
+            172671
+          ],
+          "score": -7.187051773071289
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            161482,
+            169150
+          ],
+          "score": -7.209587097167969
+        },
+        {
+          "sid_token_ids": [
+            159261,
+            163951,
+            168259
+          ],
+          "score": -7.236177444458008
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            162128,
+            170572
+          ],
+          "score": -7.266229629516602
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            160969,
+            175419
+          ],
+          "score": -7.275745391845703
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162293,
+            171675
+          ],
+          "score": -7.279008865356445
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            165559,
+            174768
+          ],
+          "score": -7.283905029296875
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            163300,
+            175164
+          ],
+          "score": -7.285221099853516
+        },
+        {
+          "sid_token_ids": [
+            154982,
+            167607,
+            170709
+          ],
+          "score": -7.298360824584961
+        },
+        {
+          "sid_token_ids": [
+            158390,
+            167761,
+            175204
+          ],
+          "score": -7.304328918457031
+        },
+        {
+          "sid_token_ids": [
+            152907,
+            163461,
+            170911
+          ],
+          "score": -7.308013916015625
+        },
+        {
+          "sid_token_ids": [
+            159261,
+            163951,
+            168921
+          ],
+          "score": -7.361177444458008
+        },
+        {
+          "sid_token_ids": [
+            157521,
+            165126,
+            168595
+          ],
+          "score": -7.373468399047852
+        },
+        {
+          "sid_token_ids": [
+            159401,
+            165126,
+            171838
+          ],
+          "score": -7.382938385009766
+        },
+        {
+          "sid_token_ids": [
+            154731,
+            163278,
+            169844
+          ],
+          "score": -7.384849548339844
+        },
+        {
+          "sid_token_ids": [
+            157338,
+            160374,
+            174661
+          ],
+          "score": -7.416444778442383
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            162426,
+            175113
+          ],
+          "score": -7.417942047119141
+        },
+        {
+          "sid_token_ids": [
+            159024,
+            165558,
+            175422
+          ],
+          "score": -7.425312042236328
+        },
+        {
+          "sid_token_ids": [
+            155658,
+            161474,
+            173448
+          ],
+          "score": -7.426597595214844
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164018,
+            171961
+          ],
+          "score": -7.435512542724609
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            162426,
+            174768
+          ],
+          "score": -7.459142684936523
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            163908,
+            174960
+          ],
+          "score": -7.4695892333984375
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            166146,
+            168066
+          ],
+          "score": -7.471059799194336
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167114,
+            174702
+          ],
+          "score": -7.486194610595703
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            163278,
+            171980
+          ],
+          "score": -7.493349075317383
+        },
+        {
+          "sid_token_ids": [
+            156731,
+            164258,
+            168779
+          ],
+          "score": -7.501802444458008
+        },
+        {
+          "sid_token_ids": [
+            156731,
+            167254,
+            170542
+          ],
+          "score": -7.501802444458008
+        },
+        {
+          "sid_token_ids": [
+            153356,
+            166293,
+            170383
+          ],
+          "score": -7.523094177246094
+        },
+        {
+          "sid_token_ids": [
+            157125,
+            160485,
+            175164
+          ],
+          "score": -7.524873733520508
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            161096,
+            175850
+          ],
+          "score": -7.557477951049805
+        },
+        {
+          "sid_token_ids": [
+            158391,
+            167467,
+            175556
+          ],
+          "score": -7.561010360717773
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161482,
+            168451
+          ],
+          "score": -7.56230354309082
+        },
+        {
+          "sid_token_ids": [
+            157482,
+            164018,
+            173051
+          ],
+          "score": -7.598142623901367
+        },
+        {
+          "sid_token_ids": [
+            157350,
+            165582,
+            170538
+          ],
+          "score": -7.599729537963867
+        },
+        {
+          "sid_token_ids": [
+            158100,
+            163823,
+            168425
+          ],
+          "score": -7.628227233886719
+        },
+        {
+          "sid_token_ids": [
+            153890,
+            164652,
+            174171
+          ],
+          "score": -7.648557662963867
+        },
+        {
+          "sid_token_ids": [
+            154144,
+            167365,
+            175376
+          ],
+          "score": -7.667123794555664
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            164618,
+            173095
+          ],
+          "score": -7.667942047119141
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            167507,
+            172223
+          ],
+          "score": -7.677715301513672
+        },
+        {
+          "sid_token_ids": [
+            155497,
+            163040,
+            170538
+          ],
+          "score": -7.680902481079102
+        },
+        {
+          "sid_token_ids": [
+            156274,
+            167277,
+            170911
+          ],
+          "score": -7.6950531005859375
+        },
+        {
+          "sid_token_ids": [
+            153459,
+            163951,
+            169263
+          ],
+          "score": -7.699865341186523
+        },
+        {
+          "sid_token_ids": [
+            152014,
+            163920,
+            168543
+          ],
+          "score": -7.703832626342773
+        },
+        {
+          "sid_token_ids": [
+            157039,
+            163028,
+            173037
+          ],
+          "score": -7.70513916015625
+        },
+        {
+          "sid_token_ids": [
+            151745,
+            167809,
+            175115
+          ],
+          "score": -7.711690902709961
+        },
+        {
+          "sid_token_ids": [
+            155011,
+            161026,
+            168477
+          ],
+          "score": -7.716230392456055
+        },
+        {
+          "sid_token_ids": [
+            153964,
+            163585,
+            169901
+          ],
+          "score": -7.727697372436523
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167114,
+            171980
+          ],
+          "score": -7.736194610595703
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            167796,
+            170768
+          ],
+          "score": -7.737041473388672
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            162426,
+            172807
+          ],
+          "score": -7.754367828369141
+        },
+        {
+          "sid_token_ids": [
+            152284,
+            166438,
+            168486
+          ],
+          "score": -7.769319534301758
+        },
+        {
+          "sid_token_ids": [
+            158069,
+            160514,
+            171803
+          ],
+          "score": -7.77861213684082
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164821,
+            174259
+          ],
+          "score": -7.780069351196289
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            161750,
+            169904
+          ],
+          "score": -7.780849456787109
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167167,
+            172527
+          ],
+          "score": -7.78175163269043
+        },
+        {
+          "sid_token_ids": [
+            159555,
+            162126,
+            175220
+          ],
+          "score": -7.782932281494141
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            160682,
+            175709
+          ],
+          "score": -7.783905029296875
+        },
+        {
+          "sid_token_ids": [
+            158412,
+            163173,
+            168066
+          ],
+          "score": -7.794649124145508
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            167258,
+            171135
+          ],
+          "score": -7.795991897583008
+        },
+        {
+          "sid_token_ids": [
+            153459,
+            166068,
+            169924
+          ],
+          "score": -7.797954559326172
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            165580,
+            168738
+          ],
+          "score": -7.807477951049805
+        },
+        {
+          "sid_token_ids": [
+            156593,
+            163471,
+            170970
+          ],
+          "score": -7.826839447021484
+        },
+        {
+          "sid_token_ids": [
+            157748,
+            160581,
+            171064
+          ],
+          "score": -7.845542907714844
+        },
+        {
+          "sid_token_ids": [
+            157771,
+            167607,
+            168420
+          ],
+          "score": -7.847749710083008
+        },
+        {
+          "sid_token_ids": [
+            157482,
+            166351,
+            174825
+          ],
+          "score": -7.848142623901367
+        },
+        {
+          "sid_token_ids": [
+            157427,
+            164085,
+            168198
+          ],
+          "score": -7.852367401123047
+        },
+        {
+          "sid_token_ids": [
+            159607,
+            161096,
+            172256
+          ],
+          "score": -7.863405227661133
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            166629,
+            174561
+          ],
+          "score": -7.882518768310547
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            162284,
+            173566
+          ],
+          "score": -7.886629104614258
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162293,
+            175703
+          ],
+          "score": -7.904008865356445
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            165827,
+            171434
+          ],
+          "score": -7.914056777954102
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            165126,
+            171352
+          ],
+          "score": -7.9168243408203125
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            160237,
+            174768
+          ],
+          "score": -7.917942047119141
+        },
+        {
+          "sid_token_ids": [
+            152127,
+            163040,
+            172588
+          ],
+          "score": -7.92009162902832
+        },
+        {
+          "sid_token_ids": [
+            152834,
+            167696,
+            175958
+          ],
+          "score": -7.920635223388672
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            166438,
+            170604
+          ],
+          "score": -7.929203033447266
+        },
+        {
+          "sid_token_ids": [
+            157296,
+            160315,
+            175499
+          ],
+          "score": -7.934825897216797
+        },
+        {
+          "sid_token_ids": [
+            157304,
+            165779,
+            174832
+          ],
+          "score": -7.953317642211914
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            163040,
+            171684
+          ],
+          "score": -7.959453582763672
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            163040,
+            174870
+          ],
+          "score": -7.959453582763672
+        },
+        {
+          "sid_token_ids": [
+            156817,
+            165184,
+            175839
+          ],
+          "score": -7.960920333862305
+        },
+        {
+          "sid_token_ids": [
+            151930,
+            167011,
+            170970
+          ],
+          "score": -7.970684051513672
+        },
+        {
+          "sid_token_ids": [
+            158809,
+            160280,
+            170917
+          ],
+          "score": -7.9727325439453125
+        },
+        {
+          "sid_token_ids": [
+            159077,
+            167093,
+            168899
+          ],
+          "score": -7.974164962768555
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            165331,
+            168248
+          ],
+          "score": -7.977132797241211
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            159906,
+            169175
+          ],
+          "score": -7.9852294921875
+        },
+        {
+          "sid_token_ids": [
+            152496,
+            167066,
+            172049
+          ],
+          "score": -7.992744445800781
+        },
+        {
+          "sid_token_ids": [
+            157905,
+            159916,
+            174037
+          ],
+          "score": -7.994342803955078
+        },
+        {
+          "sid_token_ids": [
+            157905,
+            162854,
+            172342
+          ],
+          "score": -7.994342803955078
+        },
+        {
+          "sid_token_ids": [
+            158889,
+            163203,
+            168411
+          ],
+          "score": -8.005088806152344
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            166859,
+            171485
+          ],
+          "score": -8.016229629516602
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            161379,
+            168411
+          ],
+          "score": -8.03084945678711
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            165655,
+            170703
+          ],
+          "score": -8.03084945678711
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            162084,
+            171352
+          ],
+          "score": -8.041824340820312
+        },
+        {
+          "sid_token_ids": [
+            157831,
+            163943,
+            168162
+          ],
+          "score": -8.04581069946289
+        },
+        {
+          "sid_token_ids": [
+            152127,
+            160415,
+            170188
+          ],
+          "score": -8.050046920776367
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            162753,
+            169616
+          ],
+          "score": -8.053529739379883
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161379,
+            176020
+          ],
+          "score": -8.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161797,
+            170848
+          ],
+          "score": -8.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            159706,
+            164249,
+            168495
+          ],
+          "score": -8.059711456298828
+        },
+        {
+          "sid_token_ids": [
+            154367,
+            160682,
+            173380
+          ],
+          "score": -8.06503677368164
+        },
+        {
+          "sid_token_ids": [
+            153890,
+            166261,
+            174643
+          ],
+          "score": -8.066556930541992
+        },
+        {
+          "sid_token_ids": [
+            158644,
+            163220,
+            174825
+          ],
+          "score": -8.088241577148438
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162900,
+            171684
+          ],
+          "score": -8.12503433227539
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            160237,
+            172968
+          ],
+          "score": -8.138677597045898
+        },
+        {
+          "sid_token_ids": [
+            153356,
+            166293,
+            169002
+          ],
+          "score": -8.148094177246094
+        },
+        {
+          "sid_token_ids": [
+            154101,
+            160996,
+            170505
+          ],
+          "score": -8.150876998901367
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164821,
+            175403
+          ],
+          "score": -8.155069351196289
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            164618,
+            170546
+          ],
+          "score": -8.176454544067383
+        }
+      ]
+    },
+    {
+      "beam_count": 128,
+      "catalog_legal": true,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2",
+      "rows": [
+        {
+          "sid_token_ids": [
+            156597,
+            165559,
+            168909
+          ],
+          "score": -5.408905029296875
+        },
+        {
+          "sid_token_ids": [
+            152284,
+            162766,
+            174634
+          ],
+          "score": -5.9812774658203125
+        },
+        {
+          "sid_token_ids": [
+            159607,
+            163300,
+            171866
+          ],
+          "score": -6.363405227661133
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            163993,
+            174706
+          ],
+          "score": -6.482383728027344
+        },
+        {
+          "sid_token_ids": [
+            154278,
+            165501,
+            175025
+          ],
+          "score": -6.492189407348633
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            164618,
+            173885
+          ],
+          "score": -6.509958267211914
+        },
+        {
+          "sid_token_ids": [
+            159236,
+            167114,
+            171980
+          ],
+          "score": -6.646003723144531
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            159896,
+            170315
+          ],
+          "score": -6.7195892333984375
+        },
+        {
+          "sid_token_ids": [
+            152827,
+            163471,
+            169885
+          ],
+          "score": -6.722570419311523
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            167759,
+            171440
+          ],
+          "score": -6.780849456787109
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            160614,
+            174832
+          ],
+          "score": -6.7918243408203125
+        },
+        {
+          "sid_token_ids": [
+            152292,
+            163278,
+            170588
+          ],
+          "score": -6.843685150146484
+        },
+        {
+          "sid_token_ids": [
+            156062,
+            160237,
+            172981
+          ],
+          "score": -6.869836807250977
+        },
+        {
+          "sid_token_ids": [
+            157120,
+            161470,
+            175498
+          ],
+          "score": -6.912710189819336
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            163166,
+            174186
+          ],
+          "score": -7.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            163993,
+            176217
+          ],
+          "score": -7.107383728027344
+        },
+        {
+          "sid_token_ids": [
+            157831,
+            165126,
+            172423
+          ],
+          "score": -7.1602630615234375
+        },
+        {
+          "sid_token_ids": [
+            155831,
+            162881,
+            174960
+          ],
+          "score": -7.181037902832031
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            164131,
+            173546
+          ],
+          "score": -7.182491302490234
+        },
+        {
+          "sid_token_ids": [
+            154367,
+            165748,
+            172671
+          ],
+          "score": -7.187051773071289
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            161482,
+            169150
+          ],
+          "score": -7.209587097167969
+        },
+        {
+          "sid_token_ids": [
+            159261,
+            163951,
+            168259
+          ],
+          "score": -7.236177444458008
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            162128,
+            170572
+          ],
+          "score": -7.266229629516602
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            160969,
+            175419
+          ],
+          "score": -7.275745391845703
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162293,
+            171675
+          ],
+          "score": -7.279008865356445
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            165559,
+            174768
+          ],
+          "score": -7.283905029296875
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            163300,
+            175164
+          ],
+          "score": -7.285221099853516
+        },
+        {
+          "sid_token_ids": [
+            154982,
+            167607,
+            170709
+          ],
+          "score": -7.298360824584961
+        },
+        {
+          "sid_token_ids": [
+            158390,
+            167761,
+            175204
+          ],
+          "score": -7.304328918457031
+        },
+        {
+          "sid_token_ids": [
+            152907,
+            163461,
+            170911
+          ],
+          "score": -7.308013916015625
+        },
+        {
+          "sid_token_ids": [
+            159261,
+            163951,
+            168921
+          ],
+          "score": -7.361177444458008
+        },
+        {
+          "sid_token_ids": [
+            157521,
+            165126,
+            168595
+          ],
+          "score": -7.373468399047852
+        },
+        {
+          "sid_token_ids": [
+            159401,
+            165126,
+            171838
+          ],
+          "score": -7.382938385009766
+        },
+        {
+          "sid_token_ids": [
+            154731,
+            163278,
+            169844
+          ],
+          "score": -7.384849548339844
+        },
+        {
+          "sid_token_ids": [
+            157338,
+            160374,
+            174661
+          ],
+          "score": -7.416444778442383
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            162426,
+            175113
+          ],
+          "score": -7.417942047119141
+        },
+        {
+          "sid_token_ids": [
+            159024,
+            165558,
+            175422
+          ],
+          "score": -7.425312042236328
+        },
+        {
+          "sid_token_ids": [
+            155658,
+            161474,
+            173448
+          ],
+          "score": -7.426597595214844
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164018,
+            171961
+          ],
+          "score": -7.435512542724609
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            162426,
+            174768
+          ],
+          "score": -7.459142684936523
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            163908,
+            174960
+          ],
+          "score": -7.4695892333984375
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            166146,
+            168066
+          ],
+          "score": -7.471059799194336
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167114,
+            174702
+          ],
+          "score": -7.486194610595703
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            163278,
+            171980
+          ],
+          "score": -7.493349075317383
+        },
+        {
+          "sid_token_ids": [
+            156731,
+            164258,
+            168779
+          ],
+          "score": -7.501802444458008
+        },
+        {
+          "sid_token_ids": [
+            156731,
+            167254,
+            170542
+          ],
+          "score": -7.501802444458008
+        },
+        {
+          "sid_token_ids": [
+            153356,
+            166293,
+            170383
+          ],
+          "score": -7.523094177246094
+        },
+        {
+          "sid_token_ids": [
+            157125,
+            160485,
+            175164
+          ],
+          "score": -7.524873733520508
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            161096,
+            175850
+          ],
+          "score": -7.557477951049805
+        },
+        {
+          "sid_token_ids": [
+            158391,
+            167467,
+            175556
+          ],
+          "score": -7.561010360717773
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161482,
+            168451
+          ],
+          "score": -7.56230354309082
+        },
+        {
+          "sid_token_ids": [
+            157482,
+            164018,
+            173051
+          ],
+          "score": -7.598142623901367
+        },
+        {
+          "sid_token_ids": [
+            157350,
+            165582,
+            170538
+          ],
+          "score": -7.599729537963867
+        },
+        {
+          "sid_token_ids": [
+            158100,
+            163823,
+            168425
+          ],
+          "score": -7.628227233886719
+        },
+        {
+          "sid_token_ids": [
+            153890,
+            164652,
+            174171
+          ],
+          "score": -7.648557662963867
+        },
+        {
+          "sid_token_ids": [
+            154144,
+            167365,
+            175376
+          ],
+          "score": -7.667123794555664
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            164618,
+            173095
+          ],
+          "score": -7.667942047119141
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            167507,
+            172223
+          ],
+          "score": -7.677715301513672
+        },
+        {
+          "sid_token_ids": [
+            155497,
+            163040,
+            170538
+          ],
+          "score": -7.680902481079102
+        },
+        {
+          "sid_token_ids": [
+            156274,
+            167277,
+            170911
+          ],
+          "score": -7.6950531005859375
+        },
+        {
+          "sid_token_ids": [
+            153459,
+            163951,
+            169263
+          ],
+          "score": -7.699865341186523
+        },
+        {
+          "sid_token_ids": [
+            152014,
+            163920,
+            168543
+          ],
+          "score": -7.703832626342773
+        },
+        {
+          "sid_token_ids": [
+            157039,
+            163028,
+            173037
+          ],
+          "score": -7.70513916015625
+        },
+        {
+          "sid_token_ids": [
+            151745,
+            167809,
+            175115
+          ],
+          "score": -7.711690902709961
+        },
+        {
+          "sid_token_ids": [
+            155011,
+            161026,
+            168477
+          ],
+          "score": -7.716230392456055
+        },
+        {
+          "sid_token_ids": [
+            153964,
+            163585,
+            169901
+          ],
+          "score": -7.727697372436523
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167114,
+            171980
+          ],
+          "score": -7.736194610595703
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            167796,
+            170768
+          ],
+          "score": -7.737041473388672
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            162426,
+            172807
+          ],
+          "score": -7.754367828369141
+        },
+        {
+          "sid_token_ids": [
+            152284,
+            166438,
+            168486
+          ],
+          "score": -7.769319534301758
+        },
+        {
+          "sid_token_ids": [
+            158069,
+            160514,
+            171803
+          ],
+          "score": -7.77861213684082
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164821,
+            174259
+          ],
+          "score": -7.780069351196289
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            161750,
+            169904
+          ],
+          "score": -7.780849456787109
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167167,
+            172527
+          ],
+          "score": -7.78175163269043
+        },
+        {
+          "sid_token_ids": [
+            159555,
+            162126,
+            175220
+          ],
+          "score": -7.782932281494141
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            160682,
+            175709
+          ],
+          "score": -7.783905029296875
+        },
+        {
+          "sid_token_ids": [
+            158412,
+            163173,
+            168066
+          ],
+          "score": -7.794649124145508
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            167258,
+            171135
+          ],
+          "score": -7.795991897583008
+        },
+        {
+          "sid_token_ids": [
+            153459,
+            166068,
+            169924
+          ],
+          "score": -7.797954559326172
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            165580,
+            168738
+          ],
+          "score": -7.807477951049805
+        },
+        {
+          "sid_token_ids": [
+            156593,
+            163471,
+            170970
+          ],
+          "score": -7.826839447021484
+        },
+        {
+          "sid_token_ids": [
+            157748,
+            160581,
+            171064
+          ],
+          "score": -7.845542907714844
+        },
+        {
+          "sid_token_ids": [
+            157771,
+            167607,
+            168420
+          ],
+          "score": -7.847749710083008
+        },
+        {
+          "sid_token_ids": [
+            157482,
+            166351,
+            174825
+          ],
+          "score": -7.848142623901367
+        },
+        {
+          "sid_token_ids": [
+            157427,
+            164085,
+            168198
+          ],
+          "score": -7.852367401123047
+        },
+        {
+          "sid_token_ids": [
+            159607,
+            161096,
+            172256
+          ],
+          "score": -7.863405227661133
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            166629,
+            174561
+          ],
+          "score": -7.882518768310547
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            162284,
+            173566
+          ],
+          "score": -7.886629104614258
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162293,
+            175703
+          ],
+          "score": -7.904008865356445
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            165827,
+            171434
+          ],
+          "score": -7.914056777954102
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            165126,
+            171352
+          ],
+          "score": -7.9168243408203125
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            160237,
+            174768
+          ],
+          "score": -7.917942047119141
+        },
+        {
+          "sid_token_ids": [
+            152127,
+            163040,
+            172588
+          ],
+          "score": -7.92009162902832
+        },
+        {
+          "sid_token_ids": [
+            152834,
+            167696,
+            175958
+          ],
+          "score": -7.920635223388672
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            166438,
+            170604
+          ],
+          "score": -7.929203033447266
+        },
+        {
+          "sid_token_ids": [
+            157296,
+            160315,
+            175499
+          ],
+          "score": -7.934825897216797
+        },
+        {
+          "sid_token_ids": [
+            157304,
+            165779,
+            174832
+          ],
+          "score": -7.953317642211914
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            163040,
+            171684
+          ],
+          "score": -7.959453582763672
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            163040,
+            174870
+          ],
+          "score": -7.959453582763672
+        },
+        {
+          "sid_token_ids": [
+            156817,
+            165184,
+            175839
+          ],
+          "score": -7.960920333862305
+        },
+        {
+          "sid_token_ids": [
+            151930,
+            167011,
+            170970
+          ],
+          "score": -7.970684051513672
+        },
+        {
+          "sid_token_ids": [
+            158809,
+            160280,
+            170917
+          ],
+          "score": -7.9727325439453125
+        },
+        {
+          "sid_token_ids": [
+            159077,
+            167093,
+            168899
+          ],
+          "score": -7.974164962768555
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            165331,
+            168248
+          ],
+          "score": -7.977132797241211
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            159906,
+            169175
+          ],
+          "score": -7.9852294921875
+        },
+        {
+          "sid_token_ids": [
+            152496,
+            167066,
+            172049
+          ],
+          "score": -7.992744445800781
+        },
+        {
+          "sid_token_ids": [
+            157905,
+            159916,
+            174037
+          ],
+          "score": -7.994342803955078
+        },
+        {
+          "sid_token_ids": [
+            157905,
+            162854,
+            172342
+          ],
+          "score": -7.994342803955078
+        },
+        {
+          "sid_token_ids": [
+            158889,
+            163203,
+            168411
+          ],
+          "score": -8.005088806152344
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            166859,
+            171485
+          ],
+          "score": -8.016229629516602
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            161379,
+            168411
+          ],
+          "score": -8.03084945678711
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            165655,
+            170703
+          ],
+          "score": -8.03084945678711
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            162084,
+            171352
+          ],
+          "score": -8.041824340820312
+        },
+        {
+          "sid_token_ids": [
+            157831,
+            163943,
+            168162
+          ],
+          "score": -8.04581069946289
+        },
+        {
+          "sid_token_ids": [
+            152127,
+            160415,
+            170188
+          ],
+          "score": -8.050046920776367
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            162753,
+            169616
+          ],
+          "score": -8.053529739379883
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161379,
+            176020
+          ],
+          "score": -8.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161797,
+            170848
+          ],
+          "score": -8.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            159706,
+            164249,
+            168495
+          ],
+          "score": -8.059711456298828
+        },
+        {
+          "sid_token_ids": [
+            154367,
+            160682,
+            173380
+          ],
+          "score": -8.06503677368164
+        },
+        {
+          "sid_token_ids": [
+            153890,
+            166261,
+            174643
+          ],
+          "score": -8.066556930541992
+        },
+        {
+          "sid_token_ids": [
+            158644,
+            163220,
+            174825
+          ],
+          "score": -8.088241577148438
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162900,
+            171684
+          ],
+          "score": -8.12503433227539
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            160237,
+            172968
+          ],
+          "score": -8.138677597045898
+        },
+        {
+          "sid_token_ids": [
+            153356,
+            166293,
+            169002
+          ],
+          "score": -8.148094177246094
+        },
+        {
+          "sid_token_ids": [
+            154101,
+            160996,
+            170505
+          ],
+          "score": -8.150876998901367
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164821,
+            175403
+          ],
+          "score": -8.155069351196289
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            164618,
+            170546
+          ],
+          "score": -8.176454544067383
+        }
+      ]
+    },
+    {
+      "beam_count": 128,
+      "catalog_legal": true,
+      "sha256": "e2dbdafdab23c59b1384e9df456c2bf701d36b9d4671aabe98934cfea93862d2",
+      "rows": [
+        {
+          "sid_token_ids": [
+            156597,
+            165559,
+            168909
+          ],
+          "score": -5.408905029296875
+        },
+        {
+          "sid_token_ids": [
+            152284,
+            162766,
+            174634
+          ],
+          "score": -5.9812774658203125
+        },
+        {
+          "sid_token_ids": [
+            159607,
+            163300,
+            171866
+          ],
+          "score": -6.363405227661133
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            163993,
+            174706
+          ],
+          "score": -6.482383728027344
+        },
+        {
+          "sid_token_ids": [
+            154278,
+            165501,
+            175025
+          ],
+          "score": -6.492189407348633
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            164618,
+            173885
+          ],
+          "score": -6.509958267211914
+        },
+        {
+          "sid_token_ids": [
+            159236,
+            167114,
+            171980
+          ],
+          "score": -6.646003723144531
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            159896,
+            170315
+          ],
+          "score": -6.7195892333984375
+        },
+        {
+          "sid_token_ids": [
+            152827,
+            163471,
+            169885
+          ],
+          "score": -6.722570419311523
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            167759,
+            171440
+          ],
+          "score": -6.780849456787109
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            160614,
+            174832
+          ],
+          "score": -6.7918243408203125
+        },
+        {
+          "sid_token_ids": [
+            152292,
+            163278,
+            170588
+          ],
+          "score": -6.843685150146484
+        },
+        {
+          "sid_token_ids": [
+            156062,
+            160237,
+            172981
+          ],
+          "score": -6.869836807250977
+        },
+        {
+          "sid_token_ids": [
+            157120,
+            161470,
+            175498
+          ],
+          "score": -6.912710189819336
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            163166,
+            174186
+          ],
+          "score": -7.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            163993,
+            176217
+          ],
+          "score": -7.107383728027344
+        },
+        {
+          "sid_token_ids": [
+            157831,
+            165126,
+            172423
+          ],
+          "score": -7.1602630615234375
+        },
+        {
+          "sid_token_ids": [
+            155831,
+            162881,
+            174960
+          ],
+          "score": -7.181037902832031
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            164131,
+            173546
+          ],
+          "score": -7.182491302490234
+        },
+        {
+          "sid_token_ids": [
+            154367,
+            165748,
+            172671
+          ],
+          "score": -7.187051773071289
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            161482,
+            169150
+          ],
+          "score": -7.209587097167969
+        },
+        {
+          "sid_token_ids": [
+            159261,
+            163951,
+            168259
+          ],
+          "score": -7.236177444458008
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            162128,
+            170572
+          ],
+          "score": -7.266229629516602
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            160969,
+            175419
+          ],
+          "score": -7.275745391845703
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162293,
+            171675
+          ],
+          "score": -7.279008865356445
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            165559,
+            174768
+          ],
+          "score": -7.283905029296875
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            163300,
+            175164
+          ],
+          "score": -7.285221099853516
+        },
+        {
+          "sid_token_ids": [
+            154982,
+            167607,
+            170709
+          ],
+          "score": -7.298360824584961
+        },
+        {
+          "sid_token_ids": [
+            158390,
+            167761,
+            175204
+          ],
+          "score": -7.304328918457031
+        },
+        {
+          "sid_token_ids": [
+            152907,
+            163461,
+            170911
+          ],
+          "score": -7.308013916015625
+        },
+        {
+          "sid_token_ids": [
+            159261,
+            163951,
+            168921
+          ],
+          "score": -7.361177444458008
+        },
+        {
+          "sid_token_ids": [
+            157521,
+            165126,
+            168595
+          ],
+          "score": -7.373468399047852
+        },
+        {
+          "sid_token_ids": [
+            159401,
+            165126,
+            171838
+          ],
+          "score": -7.382938385009766
+        },
+        {
+          "sid_token_ids": [
+            154731,
+            163278,
+            169844
+          ],
+          "score": -7.384849548339844
+        },
+        {
+          "sid_token_ids": [
+            157338,
+            160374,
+            174661
+          ],
+          "score": -7.416444778442383
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            162426,
+            175113
+          ],
+          "score": -7.417942047119141
+        },
+        {
+          "sid_token_ids": [
+            159024,
+            165558,
+            175422
+          ],
+          "score": -7.425312042236328
+        },
+        {
+          "sid_token_ids": [
+            155658,
+            161474,
+            173448
+          ],
+          "score": -7.426597595214844
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164018,
+            171961
+          ],
+          "score": -7.435512542724609
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            162426,
+            174768
+          ],
+          "score": -7.459142684936523
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            163908,
+            174960
+          ],
+          "score": -7.4695892333984375
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            166146,
+            168066
+          ],
+          "score": -7.471059799194336
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167114,
+            174702
+          ],
+          "score": -7.486194610595703
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            163278,
+            171980
+          ],
+          "score": -7.493349075317383
+        },
+        {
+          "sid_token_ids": [
+            156731,
+            164258,
+            168779
+          ],
+          "score": -7.501802444458008
+        },
+        {
+          "sid_token_ids": [
+            156731,
+            167254,
+            170542
+          ],
+          "score": -7.501802444458008
+        },
+        {
+          "sid_token_ids": [
+            153356,
+            166293,
+            170383
+          ],
+          "score": -7.523094177246094
+        },
+        {
+          "sid_token_ids": [
+            157125,
+            160485,
+            175164
+          ],
+          "score": -7.524873733520508
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            161096,
+            175850
+          ],
+          "score": -7.557477951049805
+        },
+        {
+          "sid_token_ids": [
+            158391,
+            167467,
+            175556
+          ],
+          "score": -7.561010360717773
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161482,
+            168451
+          ],
+          "score": -7.56230354309082
+        },
+        {
+          "sid_token_ids": [
+            157482,
+            164018,
+            173051
+          ],
+          "score": -7.598142623901367
+        },
+        {
+          "sid_token_ids": [
+            157350,
+            165582,
+            170538
+          ],
+          "score": -7.599729537963867
+        },
+        {
+          "sid_token_ids": [
+            158100,
+            163823,
+            168425
+          ],
+          "score": -7.628227233886719
+        },
+        {
+          "sid_token_ids": [
+            153890,
+            164652,
+            174171
+          ],
+          "score": -7.648557662963867
+        },
+        {
+          "sid_token_ids": [
+            154144,
+            167365,
+            175376
+          ],
+          "score": -7.667123794555664
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            164618,
+            173095
+          ],
+          "score": -7.667942047119141
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            167507,
+            172223
+          ],
+          "score": -7.677715301513672
+        },
+        {
+          "sid_token_ids": [
+            155497,
+            163040,
+            170538
+          ],
+          "score": -7.680902481079102
+        },
+        {
+          "sid_token_ids": [
+            156274,
+            167277,
+            170911
+          ],
+          "score": -7.6950531005859375
+        },
+        {
+          "sid_token_ids": [
+            153459,
+            163951,
+            169263
+          ],
+          "score": -7.699865341186523
+        },
+        {
+          "sid_token_ids": [
+            152014,
+            163920,
+            168543
+          ],
+          "score": -7.703832626342773
+        },
+        {
+          "sid_token_ids": [
+            157039,
+            163028,
+            173037
+          ],
+          "score": -7.70513916015625
+        },
+        {
+          "sid_token_ids": [
+            151745,
+            167809,
+            175115
+          ],
+          "score": -7.711690902709961
+        },
+        {
+          "sid_token_ids": [
+            155011,
+            161026,
+            168477
+          ],
+          "score": -7.716230392456055
+        },
+        {
+          "sid_token_ids": [
+            153964,
+            163585,
+            169901
+          ],
+          "score": -7.727697372436523
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167114,
+            171980
+          ],
+          "score": -7.736194610595703
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            167796,
+            170768
+          ],
+          "score": -7.737041473388672
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            162426,
+            172807
+          ],
+          "score": -7.754367828369141
+        },
+        {
+          "sid_token_ids": [
+            152284,
+            166438,
+            168486
+          ],
+          "score": -7.769319534301758
+        },
+        {
+          "sid_token_ids": [
+            158069,
+            160514,
+            171803
+          ],
+          "score": -7.77861213684082
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164821,
+            174259
+          ],
+          "score": -7.780069351196289
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            161750,
+            169904
+          ],
+          "score": -7.780849456787109
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            167167,
+            172527
+          ],
+          "score": -7.78175163269043
+        },
+        {
+          "sid_token_ids": [
+            159555,
+            162126,
+            175220
+          ],
+          "score": -7.782932281494141
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            160682,
+            175709
+          ],
+          "score": -7.783905029296875
+        },
+        {
+          "sid_token_ids": [
+            158412,
+            163173,
+            168066
+          ],
+          "score": -7.794649124145508
+        },
+        {
+          "sid_token_ids": [
+            155725,
+            167258,
+            171135
+          ],
+          "score": -7.795991897583008
+        },
+        {
+          "sid_token_ids": [
+            153459,
+            166068,
+            169924
+          ],
+          "score": -7.797954559326172
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            165580,
+            168738
+          ],
+          "score": -7.807477951049805
+        },
+        {
+          "sid_token_ids": [
+            156593,
+            163471,
+            170970
+          ],
+          "score": -7.826839447021484
+        },
+        {
+          "sid_token_ids": [
+            157748,
+            160581,
+            171064
+          ],
+          "score": -7.845542907714844
+        },
+        {
+          "sid_token_ids": [
+            157771,
+            167607,
+            168420
+          ],
+          "score": -7.847749710083008
+        },
+        {
+          "sid_token_ids": [
+            157482,
+            166351,
+            174825
+          ],
+          "score": -7.848142623901367
+        },
+        {
+          "sid_token_ids": [
+            157427,
+            164085,
+            168198
+          ],
+          "score": -7.852367401123047
+        },
+        {
+          "sid_token_ids": [
+            159607,
+            161096,
+            172256
+          ],
+          "score": -7.863405227661133
+        },
+        {
+          "sid_token_ids": [
+            158249,
+            166629,
+            174561
+          ],
+          "score": -7.882518768310547
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            162284,
+            173566
+          ],
+          "score": -7.886629104614258
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162293,
+            175703
+          ],
+          "score": -7.904008865356445
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            165827,
+            171434
+          ],
+          "score": -7.914056777954102
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            165126,
+            171352
+          ],
+          "score": -7.9168243408203125
+        },
+        {
+          "sid_token_ids": [
+            157651,
+            160237,
+            174768
+          ],
+          "score": -7.917942047119141
+        },
+        {
+          "sid_token_ids": [
+            152127,
+            163040,
+            172588
+          ],
+          "score": -7.92009162902832
+        },
+        {
+          "sid_token_ids": [
+            152834,
+            167696,
+            175958
+          ],
+          "score": -7.920635223388672
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            166438,
+            170604
+          ],
+          "score": -7.929203033447266
+        },
+        {
+          "sid_token_ids": [
+            157296,
+            160315,
+            175499
+          ],
+          "score": -7.934825897216797
+        },
+        {
+          "sid_token_ids": [
+            157304,
+            165779,
+            174832
+          ],
+          "score": -7.953317642211914
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            163040,
+            171684
+          ],
+          "score": -7.959453582763672
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            163040,
+            174870
+          ],
+          "score": -7.959453582763672
+        },
+        {
+          "sid_token_ids": [
+            156817,
+            165184,
+            175839
+          ],
+          "score": -7.960920333862305
+        },
+        {
+          "sid_token_ids": [
+            151930,
+            167011,
+            170970
+          ],
+          "score": -7.970684051513672
+        },
+        {
+          "sid_token_ids": [
+            158809,
+            160280,
+            170917
+          ],
+          "score": -7.9727325439453125
+        },
+        {
+          "sid_token_ids": [
+            159077,
+            167093,
+            168899
+          ],
+          "score": -7.974164962768555
+        },
+        {
+          "sid_token_ids": [
+            153622,
+            165331,
+            168248
+          ],
+          "score": -7.977132797241211
+        },
+        {
+          "sid_token_ids": [
+            152110,
+            159906,
+            169175
+          ],
+          "score": -7.9852294921875
+        },
+        {
+          "sid_token_ids": [
+            152496,
+            167066,
+            172049
+          ],
+          "score": -7.992744445800781
+        },
+        {
+          "sid_token_ids": [
+            157905,
+            159916,
+            174037
+          ],
+          "score": -7.994342803955078
+        },
+        {
+          "sid_token_ids": [
+            157905,
+            162854,
+            172342
+          ],
+          "score": -7.994342803955078
+        },
+        {
+          "sid_token_ids": [
+            158889,
+            163203,
+            168411
+          ],
+          "score": -8.005088806152344
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            166859,
+            171485
+          ],
+          "score": -8.016229629516602
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            161379,
+            168411
+          ],
+          "score": -8.03084945678711
+        },
+        {
+          "sid_token_ids": [
+            154264,
+            165655,
+            170703
+          ],
+          "score": -8.03084945678711
+        },
+        {
+          "sid_token_ids": [
+            156514,
+            162084,
+            171352
+          ],
+          "score": -8.041824340820312
+        },
+        {
+          "sid_token_ids": [
+            157831,
+            163943,
+            168162
+          ],
+          "score": -8.04581069946289
+        },
+        {
+          "sid_token_ids": [
+            152127,
+            160415,
+            170188
+          ],
+          "score": -8.050046920776367
+        },
+        {
+          "sid_token_ids": [
+            155506,
+            162753,
+            169616
+          ],
+          "score": -8.053529739379883
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161379,
+            176020
+          ],
+          "score": -8.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            161797,
+            170848
+          ],
+          "score": -8.054203033447266
+        },
+        {
+          "sid_token_ids": [
+            159706,
+            164249,
+            168495
+          ],
+          "score": -8.059711456298828
+        },
+        {
+          "sid_token_ids": [
+            154367,
+            160682,
+            173380
+          ],
+          "score": -8.06503677368164
+        },
+        {
+          "sid_token_ids": [
+            153890,
+            166261,
+            174643
+          ],
+          "score": -8.066556930541992
+        },
+        {
+          "sid_token_ids": [
+            158644,
+            163220,
+            174825
+          ],
+          "score": -8.088241577148438
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            162900,
+            171684
+          ],
+          "score": -8.12503433227539
+        },
+        {
+          "sid_token_ids": [
+            152011,
+            160237,
+            172968
+          ],
+          "score": -8.138677597045898
+        },
+        {
+          "sid_token_ids": [
+            153356,
+            166293,
+            169002
+          ],
+          "score": -8.148094177246094
+        },
+        {
+          "sid_token_ids": [
+            154101,
+            160996,
+            170505
+          ],
+          "score": -8.150876998901367
+        },
+        {
+          "sid_token_ids": [
+            153023,
+            164821,
+            175403
+          ],
+          "score": -8.155069351196289
+        },
+        {
+          "sid_token_ids": [
+            156597,
+            164618,
+            170546
+          ],
+          "score": -8.176454544067383
+        }
+      ]
+    }
+  ],
+  "all_outputs_identical": true,
+  "graph_stats": {
+    "before_warmup": [
+      {
+        "runner": "GPUModelRunner",
+        "beam_graph_enabled": true,
+        "beam_max_width": 128,
+        "captured_widths": [
+          128
+        ],
+        "full_dispatches": 0
+      }
+    ],
+    "after_warmup": [
+      {
+        "runner": "GPUModelRunner",
+        "beam_graph_enabled": true,
+        "beam_max_width": 128,
+        "captured_widths": [
+          128
+        ],
+        "full_dispatches": 0
+      }
+    ],
+    "after_profile": [
+      {
+        "runner": "GPUModelRunner",
+        "beam_graph_enabled": true,
+        "beam_max_width": 128,
+        "captured_widths": [
+          128
+        ],
+        "full_dispatches": 0
+      }
+    ]
+  }
+}

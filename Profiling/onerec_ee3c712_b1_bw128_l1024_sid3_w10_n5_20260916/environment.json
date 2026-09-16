@@ -1,0 +1,37 @@
+{
+  "revision": "ee3c7129a47f9db688880f163dd810206e8e9b9d",
+  "tracked_diff": "",
+  "inputs": [
+    {
+      "path": "/home/z00469465/OneRec/OneRec-1.7B/model-00000-of-00001.safetensors",
+      "bytes": 4263793656,
+      "sha256": "e27ab050343a7d85503ca6ebf1adbe59ed18ef7ad65e7800e963715c7442516e"
+    },
+    {
+      "path": "/home/z00469465/OneRec/OneRec-1.7B/config.json",
+      "bytes": 1366,
+      "sha256": "43b8f3bd16d42450a441ba040bb20c0acf5e889f793d87ea4d3213d62572b94f"
+    },
+    {
+      "path": "/home/z00469465/OneRec/OneRec-1.7B/tokenizer.json",
+      "bytes": 16015414,
+      "sha256": "0ccf4231869d9f8755b55133c211b48521a298a86cddf8b59ba9fe0481ecd9ba"
+    },
+    {
+      "path": "/home/z00469465/OneRec/generated_data/video_constraint_triples.json",
+      "bytes": 40738147,
+      "sha256": "43937a715545af7ffd5d72d09e3cf7a948601ad5aa459a529de8969000e771fa"
+    },
+    {
+      "path": "/home/z00469465/PROJECT/vllm-gr/tests/resources/single_one_rec_prompt.txt",
+      "bytes": 6855,
+      "sha256": "ac2b3702efd3596944d3264da5be97f9539dfa1c8e2b33e0b857d329ccbf8463"
+    }
+  ],
+  "dependencies": {
+    "torch": "2.11.0",
+    "vllm": "0.22.1",
+    "transformers": "4.57.6",
+    "nvtx": "0.2.14"
+  }
+}

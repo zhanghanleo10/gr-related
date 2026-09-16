@@ -1,0 +1,177 @@
+{
+  "requests": [
+    {
+      "request": "onerec_request_01",
+      "cpu_range_ms": 86.245075,
+      "gpu_kernel_count": 1876,
+      "summed_kernel_ms": 52.588513,
+      "gpu_busy_union_ms": 52.781313,
+      "memcpy_count": 129,
+      "cuda_graph_launches": 3,
+      "gpu_streams": [
+        7,
+        25
+      ]
+    },
+    {
+      "request": "onerec_request_02",
+      "cpu_range_ms": 81.088965,
+      "gpu_kernel_count": 1876,
+      "summed_kernel_ms": 52.509243,
+      "gpu_busy_union_ms": 52.700348,
+      "memcpy_count": 129,
+      "cuda_graph_launches": 3,
+      "gpu_streams": [
+        7,
+        25
+      ]
+    },
+    {
+      "request": "onerec_request_03",
+      "cpu_range_ms": 79.93557,
+      "gpu_kernel_count": 1876,
+      "summed_kernel_ms": 52.486658,
+      "gpu_busy_union_ms": 52.677731,
+      "memcpy_count": 129,
+      "cuda_graph_launches": 3,
+      "gpu_streams": [
+        7,
+        25
+      ]
+    },
+    {
+      "request": "onerec_request_04",
+      "cpu_range_ms": 79.328066,
+      "gpu_kernel_count": 1876,
+      "summed_kernel_ms": 52.491841,
+      "gpu_busy_union_ms": 52.682562,
+      "memcpy_count": 129,
+      "cuda_graph_launches": 3,
+      "gpu_streams": [
+        7,
+        25
+      ]
+    },
+    {
+      "request": "onerec_request_05",
+      "cpu_range_ms": 79.034223,
+      "gpu_kernel_count": 1876,
+      "summed_kernel_ms": 52.490548,
+      "gpu_busy_union_ms": 52.681397,
+      "memcpy_count": 129,
+      "cuda_graph_launches": 3,
+      "gpu_streams": [
+        7,
+        25
+      ]
+    }
+  ],
+  "total_kernels": 9380,
+  "total_memcopies": 645,
+  "test_only_final_result_adapter_ranges": {
+    "TEST_ONLY_FINAL_RESULT_ADAPTER/worker_D2H_sort_pack": 5,
+    "TEST_ONLY_FINAL_RESULT_ADAPTER/frontend_wrap": 5
+  },
+  "native_nvtx_ranges": {
+    "vllm.v1.engine.core.EngineCore.step_with_batch_queue": 35,
+    "vllm.v1.core.sched.async_scheduler.AsyncScheduler.schedule": 30,
+    "vllm.v1.core.sched.scheduler.Scheduler.schedule": 30,
+    "vllm.v1.executor.uniproc_executor.UniProcExecutor.execute_model": 30,
+    "vllm.v1.worker.gpu_model_runner.GPUModelRunner.execute_model": 15,
+    "vllm.v1.worker.gpu_model_runner.GPUModelRunner._prepare_inputs": 5,
+    "vllm.v1.executor.uniproc_executor.UniProcExecutor.sample_tokens": 15,
+    "vllm.v1.executor.uniproc_executor.AsyncOutputFuture.result": 20,
+    "vllm.v1.core.sched.async_scheduler.AsyncScheduler.update_from_output": 30,
+    "vllm.v1.core.sched.scheduler.Scheduler.update_from_output": 30
+  },
+  "stack_and_sampling_table_counts": {
+    "CUDA_CALLCHAINS": 31675,
+    "ENUM_SAMPLING_THREAD_STATE": 11,
+    "OSRT_CALLCHAINS": 5091,
+    "SAMPLING_CALLCHAINS": 2691
+  },
+  "cuda_api_counts": {
+    "cuProfilerStart": 1,
+    "cudaGetDevice_v3020": 8085,
+    "cuDevicePrimaryCtxGetState": 3045,
+    "cuKernelGetName": 605,
+    "cudaLaunchKernel": 605,
+    "cudaLaunchKernel_v7000": 605,
+    "cudaGetLastError_v3020": 810,
+    "cudaStreamWaitEvent": 45,
+    "cudaStreamWaitEvent_v3020": 45,
+    "cudaMemcpyAsync": 225,
+    "cudaMemcpyAsync_v3020": 225,
+    "cudaEventSynchronize": 45,
+    "cudaEventSynchronize_v3020": 45,
+    "cudaStreamIsCapturing_v10000": 125,
+    "cuCtxGetCurrent": 235,
+    "cuPointerGetAttribute": 1945,
+    "cuLaunchKernelEx": 220,
+    "cudaEventRecord": 85,
+    "cudaEventRecord_v3020": 85,
+    "cudaGraphLaunch": 15,
+    "cudaGraphLaunch_v10000": 15,
+    "cudaEventQuery": 10,
+    "cudaEventQuery_v3020": 10,
+    "cudaMemsetAsync": 10,
+    "cudaMemsetAsync_v3020": 10,
+    "cudaOccupancyMaxActiveBlocksPerMultiprocessor_v6050": 10,
+    "cudaStreamSynchronize": 45,
+    "cudaStreamSynchronize_v3020": 45,
+    "cudaEventCreateWithFlags_v3020": 10,
+    "cudaEventDestroy_v3020": 10
+  },
+  "runtime_calls_with_callchains": 1085,
+  "note": "Profiled wall times include tracing overhead. CPU spans include waits; GPU busy time is a union, not a sum.",
+  "stack_injection_diagnostics": [
+    {
+      "globalPid": 297358822735872,
+      "text": "Python Functions Trace injection initialized successfully."
+    },
+    {
+      "globalPid": 297358822735872,
+      "text": "Python backtrace injection initialized successfully."
+    },
+    {
+      "globalPid": 297358822735872,
+      "text": "Python backtrace sampling injection initialized successfully."
+    },
+    {
+      "globalPid": 297358822735872,
+      "text": "CUDA backtrace injection initialized successfully."
+    },
+    {
+      "globalPid": 297362161401856,
+      "text": "Python Functions Trace injection initialized successfully."
+    },
+    {
+      "globalPid": 297362161401856,
+      "text": "Python backtrace injection initialized successfully."
+    },
+    {
+      "globalPid": 297362161401856,
+      "text": "Python backtrace sampling injection initialized successfully."
+    },
+    {
+      "globalPid": 297362144624640,
+      "text": "Python Functions Trace injection initialized successfully."
+    },
+    {
+      "globalPid": 297362144624640,
+      "text": "Python backtrace injection initialized successfully."
+    },
+    {
+      "globalPid": 297362144624640,
+      "text": "Python backtrace sampling injection initialized successfully."
+    },
+    {
+      "globalPid": 297362161401856,
+      "text": "CUDA backtrace injection initialized successfully."
+    },
+    {
+      "globalPid": 297362144624640,
+      "text": "CUDA backtrace injection initialized successfully."
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+WARNING 09-16 01:52:12 [config.py:70] Support for Transformers v4 is deprecated. The Transformers v4 codepath will become unmaintained in vLLM v0.22.0 and will be removed in vLLM v0.24.0. Please upgrade to Transformers v5: pip install --upgrade transformers
+{"artifact_digest": "sha256:227a21a0501562bdcef39b229b6167e2b0c11e9b570944b2d809bec1c2b0ffcc", "tokenizer_digest": "sha256:00119100fcd12439532a0530a884baa2b5641c362a02be3bff7aeba38a716023", "vocab_size": 176384}

@@ -1,0 +1,149 @@
+{
+  "files": [
+    {
+      "file": "frontend.pt.trace.json",
+      "event_count": 43478,
+      "categories": {
+        "user_annotation": 70,
+        "python_function": 43345,
+        "": 62,
+        "Trace": 1
+      },
+      "native_vllm_python_events": 938,
+      "native_vllm_examples": [
+        "vllm/v1/engine/core_client.py(786): process_outputs_socket",
+        "vllm/v1/engine/core_client.py(685): monitor_engine_cores",
+        "vllm/v1/engine/utils.py(213): monitor_engine_liveness",
+        "vllm/entrypoints/llm.py(786): start_profile",
+        "vllm/v1/engine/llm_engine.py(327): start_profile",
+        "vllm/v1/engine/core_client.py(864): profile",
+        "vllm/v1/engine/core_client.py(844): call_utility",
+        "vllm/v1/engine/core_client.py(830): _send_input",
+        "vllm/v1/engine/core_client.py(658): ensure_alive",
+        "vllm/v1/engine/core_client.py(666): free_pending_messages",
+        "vllm/v1/serial_utils.py(166): encode",
+        "vllm/v1/engine/core_client.py(448): validate_alive",
+        "vllm/v1/serial_utils.py(340): decode",
+        "vllm/v1/serial_utils.py(350): dec_hook",
+        "vllm/v1/serial_utils.py(367): _decode_utility_result",
+        "vllm/v1/serial_utils.py(132): __init__",
+        "vllm/v1/engine/__init__.py(239): __post_init__",
+        "vllm/v1/engine/core_client.py(726): _process_utility_output",
+        "vllm/entrypoints/llm.py(799): reset_prefix_cache",
+        "vllm/v1/engine/llm_engine.py(337): reset_prefix_cache",
+        "vllm/v1/engine/core_client.py(870): reset_prefix_cache",
+        "vllm/entrypoints/llm.py(391): get_tokenizer",
+        "vllm/v1/engine/llm_engine.py(377): get_tokenizer",
+        "vllm/renderers/base.py(139): get_tokenizer",
+        "vllm/tokenizers/hf.py(72): convert_tokens_to_ids",
+        "vllm/tokenizers/hf.py(48): _borrow_from_pool",
+        "vllm/tokenizers/hf.py(52): _borrow_from_pool",
+        "vllm/sampling_params.py(398): __post_init__",
+        "vllm/sampling_params.py(452): _verify_args",
+        "vllm/envs.py(1988): __getattr__",
+        "vllm/envs.py(1029): <lambda>",
+        "vllm/sampling_params.py(533): <genexpr>",
+        "vllm/sampling_params.py(538): <genexpr>",
+        "vllm/sampling_params.py(546): <genexpr>",
+        "vllm/sampling_params.py(552): _verify_greedy_sampling"
+      ]
+    },
+    {
+      "file": "onerec_b1_bw128_l1024_sid3_w10_n5_rank0.1789524773213766726.pt.trace.json",
+      "event_count": 204472,
+      "categories": {
+        "user_annotation": 160,
+        "cpu_op": 4690,
+        "cpu_instant_event": 1000,
+        "python_function": 174162,
+        "overhead": 1,
+        "kernel": 9800,
+        "ac2g": 12176,
+        "cuda_runtime": 1221,
+        "gpu_memcpy": 225,
+        "cuda_driver": 220,
+        "gpu_memset": 710,
+        "gpu_user_annotation": 40,
+        "": 66,
+        "Trace": 1
+      },
+      "native_vllm_python_events": 86525,
+      "native_vllm_examples": [
+        "vllm/v1/engine/utils.py(255): _run",
+        "vllm/v1/engine/core.py(1530): process_output_sockets",
+        "vllm/usage/usage_lib.py(174): _report_usage_worker",
+        "vllm/usage/usage_lib.py(256): _report_continuous_usage",
+        "vllm/v1/engine/core.py(1158): run_engine_core",
+        "vllm/v1/engine/core.py(1197): run_busy_loop",
+        "vllm/v1/engine/core.py(1220): _process_input_queue",
+        "vllm/v1/engine/core.py(1321): _handle_client_request",
+        "vllm/v1/engine/core.py(1355): _invoke_utility_method",
+        "vllm/v1/engine/core.py(1316): <lambda>",
+        "vllm/v1/engine/core.py(614): profile",
+        "vllm/v1/executor/abstract.py(261): profile",
+        "vllm/v1/executor/uniproc_executor.py(93): collective_rpc",
+        "vllm/v1/serial_utils.py(510): run_method",
+        "vllm/v1/worker/gpu_worker.py(920): profile",
+        "vllm/profiler/wrapper.py(81): start",
+        "vllm/profiler/wrapper.py(57): _call_start",
+        "vllm/profiler/wrapper.py(263): _start",
+        "vllm/v1/serial_utils.py(132): __init__",
+        "vllm/v1/engine/core.py(1318): <lambda>",
+        "vllm/v1/engine/__init__.py(239): __post_init__",
+        "vllm/v1/engine/core.py(1181): has_work",
+        "vllm/v1/core/sched/interface.py(185): has_requests",
+        "vllm/v1/core/sched/interface.py(165): has_unfinished_requests",
+        "vllm/v1/core/sched/scheduler.py(1872): get_num_unfinished_requests",
+        "vllm/v1/core/sched/request_queue.py(122): __len__",
+        "vllm/v1/core/sched/scheduler.py(1884): has_finished_requests",
+        "vllm/v1/engine/core.py(1189): is_running",
+        "vllm/v1/engine/core.py(1253): _notify_idle_state_callbacks",
+        "vllm/v1/serial_utils.py(180): encode_into",
+        "vllm/v1/serial_utils.py(191): enc_hook",
+        "vllm/v1/serial_utils.py(340): decode",
+        "vllm/v1/engine/core.py(1294): _handle_client_request",
+        "vllm/v1/engine/core.py(1337): _reject_utility_in_shutdown",
+        "vllm/v1/engine/core.py(1350): _invoke_utility_method"
+      ]
+    }
+  ],
+  "total_events": 247950,
+  "categories": {
+    "user_annotation": 230,
+    "python_function": 217507,
+    "": 128,
+    "Trace": 2,
+    "cpu_op": 4690,
+    "cpu_instant_event": 1000,
+    "overhead": 1,
+    "kernel": 9800,
+    "ac2g": 12176,
+    "cuda_runtime": 1221,
+    "gpu_memcpy": 225,
+    "cuda_driver": 220,
+    "gpu_memset": 710,
+    "gpu_user_annotation": 40
+  },
+  "requests": [
+    {
+      "name": "onerec_request_01",
+      "cpu_range_ms": 116.083236
+    },
+    {
+      "name": "onerec_request_02",
+      "cpu_range_ms": 99.229297
+    },
+    {
+      "name": "onerec_request_03",
+      "cpu_range_ms": 99.307523
+    },
+    {
+      "name": "onerec_request_04",
+      "cpu_range_ms": 100.772069
+    },
+    {
+      "name": "onerec_request_05",
+      "cpu_range_ms": 100.214482
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+WARNING 09-16 01:58:16 [config.py:70] Support for Transformers v4 is deprecated. The Transformers v4 codepath will become unmaintained in vLLM v0.22.0 and will be removed in vLLM v0.24.0. Please upgrade to Transformers v5: pip install --upgrade transformers
+INFO 09-16 01:58:26 [utils.py:278] non-default args: {'trust_remote_code': True, 'dtype': 'bfloat16', 'gpu_memory_utilization': 0.7, 'max_num_seqs': 1, 'max_logprobs': 128, 'disable_log_stats': True, 'attention_config': AttentionConfig(backend=<AttentionBackendEnum.CUSTOM: None>, flash_attn_version=None, use_prefill_decode_attention=False, flash_attn_max_num_splits_for_cuda_graph=32, tq_max_kv_splits_for_cuda_graph=32, use_trtllm_attention=None, disable_flashinfer_q_quantization=False, mla_prefill_backend=None, use_prefill_query_quantization=False, use_fp4_indexer_cache=False, use_non_causal=False, flex_attn_block_m=None, flex_attn_block_n=None, flex_attn_q_block_size=None, flex_attn_kv_block_size=None), 'profiler_config': ProfilerConfig(profiler='cuda', torch_profiler_dir='', torch_profiler_with_stack=True, torch_profiler_with_flops=False, torch_profiler_use_gzip=True, torch_profiler_dump_cuda_time_total=True, torch_profiler_record_shapes=False, torch_profiler_with_memory=False, ignore_frontend=False, delay_iterations=0, max_iterations=0, warmup_iterations=0, active_iterations=5, wait_iterations=0), 'additional_config': {'vllm_gr_beam_graph_enabled': True, 'vllm_gr_beam_max_width': 128, 'vllm_gr_beam_max_decode_steps': 3}, 'async_scheduling': True, 'model': '/home/z00469465/OneRec/OneRec-1.7B'}
+WARNING 09-16 01:58:26 [envs.py:2057] Unknown vLLM environment variable detected: VLLM_ENABLE_PREFILL_CUDAGRAPH
+INFO 09-16 01:58:26 [model.py:617] Resolved architecture: Qwen3ForCausalLM
+INFO 09-16 01:58:26 [model.py:1752] Using max model len 8192
+WARNING 09-16 01:58:26 [arg_utils.py:2383] This model does not officially support disabling chunked prefill. Disabling this manually may cause the engine to crash or produce incorrect outputs.
+INFO 09-16 01:58:26 [vllm.py:977] Asynchronous scheduling is enabled.
+INFO 09-16 01:58:26 [kernel.py:270] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+WARNING 09-16 01:59:30 [config.py:70] Support for Transformers v4 is deprecated. The Transformers v4 codepath will become unmaintained in vLLM v0.22.0 and will be removed in vLLM v0.24.0. Please upgrade to Transformers v5: pip install --upgrade transformers
+The target application terminated. One or more process it created re-parented.
+Waiting for termination of re-parented processes.
+Use the `--wait` option to modify this behavior.
+Processing events...
+Generated:
+	No reports were generated

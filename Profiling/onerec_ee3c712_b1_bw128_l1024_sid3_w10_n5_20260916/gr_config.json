@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "attention_backend": "CUSTOM",
+  "beam": {
+    "execution_mode": "v1",
+    "graph_enabled": true,
+    "max_width": 128,
+    "max_decode_steps": 3,
+    "worker_decision": true
+  },
+  "constraint_table": {
+    "enabled": true,
+    "backend": "cuda",
+    "max_top_k": 128,
+    "path": "/home/z00469465/PROJECT/vllm-gr/trace/onerec_ee3c712_b1_bw128_l1024_sid3_w10_n5_20260916/video_constraint_table.safetensors",
+    "format": "constraint_table_v1",
+    "artifact_digest": "sha256:227a21a0501562bdcef39b229b6167e2b0c11e9b570944b2d809bec1c2b0ffcc",
+    "tokenizer_digest": "sha256:00119100fcd12439532a0530a884baa2b5641c362a02be3bff7aeba38a716023"
+  }
+}

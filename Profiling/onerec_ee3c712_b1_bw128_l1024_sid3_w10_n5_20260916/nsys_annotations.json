@@ -1,0 +1,77 @@
+[
+  {
+    "module": "vllm.v1.engine.core",
+    "domain": "vllm_native",
+    "functions": [
+      "EngineCore.step_with_batch_queue",
+      "EngineCore.step",
+      "EngineCore._process_model_outputs",
+      "EngineCoreProc.process_input_queue"
+    ]
+  },
+  {
+    "module": "vllm.v1.core.sched.scheduler",
+    "domain": "vllm_native",
+    "functions": [
+      "Scheduler.schedule",
+      "Scheduler.update_from_output"
+    ]
+  },
+  {
+    "module": "vllm.v1.core.sched.async_scheduler",
+    "domain": "vllm_native",
+    "functions": [
+      "AsyncScheduler.schedule",
+      "AsyncScheduler.update_from_output"
+    ]
+  },
+  {
+    "module": "vllm.v1.executor.uniproc_executor",
+    "domain": "vllm_native",
+    "functions": [
+      "UniProcExecutor.execute_model",
+      "UniProcExecutor.sample_tokens",
+      "AsyncOutputFuture.result"
+    ]
+  },
+  {
+    "module": "vllm.v1.worker.gpu_model_runner",
+    "domain": "vllm_native",
+    "functions": [
+      "GPUModelRunner.execute_model",
+      "GPUModelRunner.sample_tokens",
+      "GPUModelRunner._prepare_inputs",
+      "AsyncGPUModelRunnerOutput.get_output"
+    ]
+  },
+  {
+    "module": "vllm_gr.entrypoints.gr",
+    "domain": "vllm_gr",
+    "functions": [
+      "GRLLM.beam_search_v1",
+      "GRLLM.beam_search"
+    ]
+  },
+  {
+    "module": "vllm_gr.entrypoints.beam_search_v1.client",
+    "domain": "vllm_gr",
+    "functions": [
+      "BeamSearchClient.prepare_request",
+      "BeamSearchClient.submit_once",
+      "BeamSearchClient.wait_final",
+      "BeamSearchClient.build_output",
+      "BeamSearchClient.close"
+    ]
+  },
+  {
+    "module": "vllm_gr.v1.worker.gpu_beam_stage_runner",
+    "domain": "vllm_gr_v1",
+    "functions": [
+      "AsyncGPUBeamOutput.get_output",
+      "GPUBeamStageRunner.admit",
+      "GPUBeamStageRunner.prepare_cpu",
+      "GPUBeamStageRunner.sample",
+      "GPUBeamStageRunner.release"
+    ]
+  }
+]
