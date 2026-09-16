@@ -153,7 +153,7 @@ flowchart TD
 
 `Host 已知的 prompt 长度 + 计划 decode_step + 本步计划输入宽度 + Host 上的 prompt block IDs + 已确定的存储布局`
 
-它主要进行列表、偏移和长度计算，再把布局写入本次 dispatch 选中的 pinned Host staging。下面先解释这些字段描述什么，再说明它们如何被消费。
+它主要进行列表、偏移和长度计算，再把布局写入本次 dispatch 选中的 pinned Host staging，即 CPU 上用于暂存待上传数据的页锁定缓冲区。下面先解释这些字段描述什么，再说明它们如何被消费。
 
 #### 先统一一个小例子
 
@@ -239,40 +239,83 @@ CPU 准备的是这些 block ID，不是在准备或复制 K/V 向量本身。�
 
 ### 3.4 buildMetadata 为什么也可以提前做
 
-本文用 `buildMetadata` 表示 Host 上构建 Attention metadata 的工作；参考实现的相应入口是 `BeamAttentionMetadataBuilder.build_async()`，由 `_bind_attention()` 调用。
+可以先把这两步理解为：**`prepare_cpu` 算出本步需要的布局数字；`buildMetadata` 把这些数字和 GPU 缓冲区的引用，整理成一份供后端使用的说明。** 本文说的 `buildMetadata`，对应参考实现中的 `BeamAttentionMetadataBuilder.build_async()`，由 `_bind_attention()` 调用。
 
-**3.3 主要回答“布局里的数值怎么算”；3.4 回答“怎样把这些数值和设备缓冲区组织成 Attention 能使用的描述”。** 这两步之后，模型和 Attention 才按该描述实际计算。
+#### 先分清：BeamWidth 是几条路径，长度是每条路径有多长
 
-#### 沿用四条 Beam 的例子
+沿用 3.3 的例子：一个请求，prompt 有 900 个 token，保留 4 条候选路径，正在准备第二次 Decode，也就是 D1。先假设四条路径都有效。
 
-继续使用 `prompt_len=900`、`W=4`、`decode_step=1`。`prepare_cpu` 已经算好了：
+| 名称 | 本例数值 | 通俗理解 |
+| --- | ---: | --- |
+| 本步输入 BeamWidth | 4 | 本步要处理 **4 条候选路径**，每条输入 1 个当前 token，共 4 行输入。 |
+| Prefix 长度 | 900 | 每条路径都使用相同的 900 个 prompt token，对应的 KV 可以共享。 |
+| 每条路径的 Suffix 长度 | 2 | 到 D1 这一步，每条路径已有 2 个生成 token，其中第 2 个是当前输入。Attention 的长度包含当前输入的 KV。 |
+| 每条路径的总长度 | 902 | 每条路径的 Attention 都要看 900 个 prefix KV，加自己的 2 个 suffix KV。 |
+
+**“4”回答有几条路径，“2”回答每条路径的生成部分有多长，二者不是同一种长度。** 本步也不是一次输入 8 个 token：每条路径只输入当前的 1 个 token，之前那个生成 token 的 KV 已有缓存。
+
+因此，CPU 可以提前算出每条路径的 suffix 长度是 `[2, 2, 2, 2]`。把四条路径的 suffix KV 按路径打包后，分段边界就是 `[0, 2, 4, 6, 8]`：第一条取第 0–1 行，第二条取第 2–3 行，依此类推。这里的 8 是打包后的 suffix KV 总行数，5 个数字则是划分 4 段所需的边界数，都不是 BeamWidth。
+
+CPU 此时不必知道这些 token 具体是什么，也不必知道上一步选中了哪些父路径。**路径数量、计划步数可以提前知道；具体 token 和父路径由 GPU 按执行顺序确定。** 本节始终使用固定的 4 条路径；不同 Step 预设不同 BeamWidth 的情况单独见 3.6。
+
+#### Metadata 保存的是“数值”和“去哪里取数据”
+
+Metadata 是 CPU 上的一个描述对象。本例中，它可以同时保存：
+
+| 保存的内容 | 例子 | 创建对象时要做什么 |
+| --- | --- | --- |
+| CPU 已经算好的数字 | 输入行数 4、请求数 1、计划总长度 902 | 直接填入对象。 |
+| 指向 GPU 缓冲区的 Tensor 引用 | 存放 suffix 分段边界的 GPU Tensor | 记录后续到哪块存储取数据，无需把其中的元素读回 CPU。 |
+
+这里的“引用”可以理解为：**CPU 已经拿到了这块 GPU 存储的地址等描述，后面还可以往这块存储里写入新数据。** 把 Tensor 放进 metadata，并不会拍下它当时内容的快照。
+
+后端启动 GPU kernel 时，CPU 侧代码从 metadata 中取出所需的 Tensor 地址和参数，交给 GPU。GPU 据此读取设备内存；GPU 不会直接读取 Python 的 metadata 对象。
+
+#### 布局上传还没结束，为什么也能先建 metadata
+
+只看刚才的分段边界 `[0, 2, 4, 6, 8]`。假设放它的 GPU 缓冲区已经分配好了，代码里用 `suffix_offsets_gpu` 表示这块存储。
+
+需要分清两个时刻：
+
+- **存储已经存在**：CPU 可以保存它的 Tensor 引用。
+- **本步数据已经写完**：GPU 可以读取其中的分段边界来做 Attention。
+
+创建 metadata 只需要第一个条件；执行 Attention 时才必须满足第二个条件。
 
 ```python
-# CPU上的计划布局；示意只列出部分字段。
-layout = {
-    "positions": [901, 901, 901, 901],
-    "query": [0, 4],
-    "sequence": [902],
-    "prefix_lengths": [900],
-    "suffix_query": [0, 1, 2, 3, 4],
-    "suffix_lengths": [2, 2, 2, 2],
-    "suffix_offsets": [0, 2, 4, 6, 8],
-}
+# 机制示意：目标 GPU 缓冲区已分配，Host 缓冲区中已有本步的边界数字。
+# 提交异步复制后，CPU 可以继续；复制本身可能还在排队。
+suffix_offsets_gpu.copy_(suffix_offsets_host, non_blocking=True)
+
+# 这里只保存 Tensor 引用，不读取 GPU 上的边界数字。
+metadata.suffix_cu_seqlens_k_device = suffix_offsets_gpu
 ```
 
-与此同时，Worker 已经持有相应设备布局缓冲区、mask buffer 和 Beam session。此时 CPU 知道这些存储在哪里、容量多大；不要求其中已经包含本轮最终有效内容。
+**这时 metadata 已经知道“将来到这里取分段边界”，即使 `[0, 2, 4, 6, 8]` 还没传完也没有关系。** 等复制完成，数据就位于它指向的那块存储里，不需要因为数据刚刚写完再建一遍 metadata。
 
-`buildMetadata` 把两类信息接起来：Host 已知的计划描述，以及稍后 GPU 将读取的设备存储引用。
+如果构建时做的是 `suffix_offsets_gpu.cpu().tolist()`，就变成了“现在把 GPU 中的数字读出来交给 CPU”，必须等待相应设备工作完成。参考实现的这条构建路径不需要这样做。
 
-#### Metadata 对象里究竟装了什么
+上面的代码只演示“保存引用”；真实实现把多组布局数组统一上传，再取得各自的 Tensor view。异步复制还需要保证源数据在复制结束前不被覆盖，3.5 会解释这点。
 
-Metadata 外层是一个 Host/Python 描述对象。它既可以持有 CPU 数值和列表，也可以持有设备 Tensor 的 Python 引用；设备 Tensor 的实际元素仍存放在 GPU 上。
+#### 那怎样保证 Attention 读到的已经是新数据
 
-| 类型 | 示例 | CPU 构造时是否需要读 GPU 结果 |
+参考路径把相关设备工作按顺序排入同一条计算流。可以理解为 GPU 的工作队列：排在前面的操作做完，才会执行后面的操作。
+
+假设 D0 还在 GPU 上运行，CPU 已经开始准备 D1：
+
+| 阶段 | CPU 在做什么 | GPU 在做什么 |
 | --- | --- | --- |
-| Host 标量、列表 | 行数、Head 数、block size、计划长度、CPU offsets | 不需要，来自配置或 prepare_cpu |
-| 设备 Tensor 的引用或 view | block table、device offsets、device lengths | 不需要，只需已有 Tensor 对象与地址 |
-| 持久对象引用 | Beam session、active mask buffer、KV pool 相关对象 | 不需要，绑定已有对象即可 |
+| 1 | 算好 D1 的长度、分段边界等数字。 | 执行 D0，计算真实 token 和 Beam 状态。 |
+| 2 | 提交 D1 布局上传任务，然后继续构建 metadata，保存目标 GPU Tensor 的引用。 | 仍可能在执行 D0；D1 上传排在它后面。 |
+| 3 | 继续提交 D1 的设备绑定和模型计算任务。 | D0 完成后，执行 D1 布局上传，再根据 D0 的真实结果绑定 D1 的 token、mask 等状态。 |
+| 4 | 可以继续处理后续 Host 工作。 | 执行 D1 模型与 Attention，此时读取的数据已经准备好。 |
+
+**被“掩盖”的是 CPU 构建 metadata 的时间：它可以与 D0 的 GPU 工作重叠。** 此处同一计算流中的 D1 上传、设备绑定和计算仍然有先后顺序，并没有要求它们和 D0 同时执行。实际能掩盖多少，还取决于 D0 剩余执行时间。
+
+P→D 也遵循“CPU 先组织描述、GPU 按序使用数据”的原理；不过参考实现仍要先满足 Prefill 的 Host 输入复用保护和所需 Host 状态更新，具体时序见 4.4。
+
+<details>
+<summary>选读：源码字段对照和 CUDA Graph 注意点</summary>
 
 本例中的具体字段映射如下：
 
@@ -293,82 +336,15 @@ Metadata 外层是一个 Host/Python 描述对象。它既可以持有 CPU 数�
 
 `positions` 的路径略有不同：它由 Worker 绑定到模型的 `positions` 输入，供位置编码使用，并不是上表 Attention metadata 中的一个同名字段。[布局构建与字段映射][gr-metadata] · [Worker 绑定入口][gr-bind-attention]
 
-#### “保存引用”和“读取设备内容”有什么区别
+本例只有一个请求，所以 `seq_lens_cpu=[902]` 只有一个元素；四条 Beam 的 suffix 长度则是 `[2, 2, 2, 2]`。一个数组按请求记录，另一个按 Beam 记录，不能只看数组长度就判断 BeamWidth。
 
-假设设备上有一块 `mask_buffer`，CPU 已经持有它的 Tensor 对象：
+参考实现的 `views["blocks"].view(1, -1)` 只给已有连续设备存储增加一个形状视图，不会把 block IDs 读回 CPU，也不会复制整份 KV。
 
-```python
-# 只把已有Tensor对象交给metadata，不把GPU元素取回CPU。
-metadata.beam_active_mask = mask_buffer
-```
+CUDA Graph 还要求设备地址、形状和 stride 等与所选图兼容。新建 Python metadata 对象不会自动修改已经捕获的图；重放仍需更新图所引用的设备存储。不同宽度所需的图或 padding 适配见 3.6 和第 10 节。
 
-这一步的含义是：“后面需要 mask 时，从这块设备存储读取。”CPU 不必先知道 buffer 中最后会是 `[True, True, False, True]` 还是其他值。
+本文的提前构建结论针对已核对的参考路径。其他后端的 metadata builder 如果需要读回 GPU 结果，仍要保留相应等待，详见 3.5。
 
-等 GPU 完成 D0 的 Beam 更新后，D1 的设备绑定根据真实状态更新这块 execution mask。随后相关 Attention/KV 操作读取的就是更新后的内容。固定四行布局仍然保留，mask 决定哪些行有效。
-
-这和下面的操作有本质上的依赖差别：
-
-```python
-# 需要把GPU元素读回CPU；会引入设备结果的完成依赖。
-host_mask = mask_buffer.cpu().tolist()
-```
-
-前者保存引用，后者读取值。允许 metadata 提前构建的关键，是这条构建路径不需要后一类设备结果读取。
-
-类似地，参考实现中 `views["blocks"].view(1, -1)` 只给已有连续设备存储增加一个形状视图，不复制整份 KV、不计算 Attention，也不把 block IDs 读回 Host。CPU 能从 Tensor 对象知道 shape、stride 和 dtype，这些描述不需要等待 GPU 生成结果。
-
-#### 布局上传还没结束，为什么也能先建 metadata
-
-`upload()` 会把 H2D 复制排进计算流，然后返回指向目标设备存储的各个 view。CPU 随后可以立即构建 metadata，因为目标存储已经存在。
-
-```python
-# 机制示意。GPU缓冲区已分配，并满足在途任务的复用保护。
-device_layout.copy_(host_staging, non_blocking=True)
-
-# 此时H2D可能还在排队；创建view不需要读取它的设备元素。
-query_view = device_layout[query_slice]
-sequence_view = device_layout[sequence_slice]
-
-# 只展示部分字段；实际构造还包含其他布局、配置和session信息。
-metadata = make_attention_metadata(
-    num_actual_tokens=4,
-    query_start_loc_cpu=[0, 4],
-    query_start_loc=query_view,
-    seq_lens_cpu=[902],
-    seq_lens=sequence_view,
-    beam_active_mask=mask_buffer,
-)
-
-# 设备真正读取前，先按流顺序完成H2D和真实状态绑定。
-enqueue_bind_actual_device_state(metadata)
-enqueue_attention_forward(metadata)
-```
-
-`non_blocking=True` 本身不是完整的正确性保证；这里还需要 pinned Host staging、有效的缓冲区生命周期，以及前一步、上传、设备绑定、Forward 之间明确的流或事件顺序。
-
-#### CPU 和 GPU 的时间线怎样错开
-
-假设 D0 仍在 GPU 上运行，D1 已经获得调度窗口名额：
-
-| 顺序 | Worker CPU | GPU 计算流 |
-| --- | --- | --- |
-| 1 | `prepare_cpu(D1)` 算出四行输入的整数布局 | 执行 D0 Forward 和后处理 |
-| 2 | 提交 D1 布局 H2D，获得目标设备存储的 view | D1 上传可以先排队，等待前面的设备工作 |
-| 3 | `buildMetadata(D1)` 构造 Host 对象、复制小列表、保存设备引用 | D0 仍可继续执行，CPU无需知道其真实 token 和 mask |
-| 4 | 提交 D1 设备绑定与 Forward | 完成 D0 状态更新，按序执行 D1 上传与动态绑定 |
-| 5 | 后续处理或推进队列 | D1 读取已经更新的 offsets、mask、token 和 KV 状态并计算 |
-
-**被提前并可能覆盖的是步骤 3 的 Host 对象构造等工作。GPU 真正消费 metadata 指向的数据时，前置写入仍然必须已经完成。** 如果步骤 3 开始时 D0 已经算完，它依然是可提前的工作，但这次执行没有获得实际覆盖窗口。
-
-P→D 使用同一原理，不过参考实现中的 metadata 构造位于 Prefill Host 输入复用保护和所需 Host 状态更新之后，具体顺序见 4.4。
-
-#### 逐步变宽和 Graph 的额外约束
-
-若 D0 输入 128 条 Beam、D1 输入 64 条 Beam，CPU 可以从预设 `W_in[t]` 分别构建 128 行和 64 行描述，不必等待具体胜出路径。设备引用必须对应已分配且有效的存储，后端也必须适配该宽度计划。
-
-Graph 模式还要求设备地址、形状、stride 和所选图兼容。**新建一个 Python metadata 对象，不会自动改写已经捕获的 CUDA Graph。** 重放时仍需更新图所引用的固定设备存储；多宽度场景则选择事先准备好的兼容图或采用已适配的 padding 方案。
-
-在本文参考路径中，`buildMetadata` 的主要 Host 工作是构造描述、列表和 Tensor 引用，布局 H2D 与动态设备绑定分别处理。其他后端的同名 builder 可能还会分配 workspace、启动 kernel 或读取设备结果；能否提前要逐项核对其依赖，不能仅根据函数名判断。
+</details>
 
 ### 3.5 能提前的前提，以及不能提前的边界
 
@@ -376,10 +352,35 @@ Graph 模式还要求设备地址、形状、stride 和所选图兼容。**新�
 | --- | --- |
 | 所需几何可从 Host 信息推导 | CPU 不必等待真实 token 或 GPU 统计结果 |
 | GPU 数据保留为 Tensor 引用，动态值在设备端更新 | 创建 metadata 时不用读取设备内容 |
-| Host 输入采用独立 staging，或等待其复用事件 | 不会覆盖仍被旧 H2D 读取的内存 |
+| 下一步先写另一块空闲的 CPU 上传缓冲区；再次使用旧缓冲区前，确认它的上传已完成 | 避免 CPU 改写 GPU 还没复制完的源数据 |
 | 设备写入与后继读取有明确顺序 | metadata 先建好，实际读取时内容也必须已经准备好 |
 | 本步计划宽度、实际有效数与终止 mask 的接口一致 | 预设的逐步变宽与提前 EOS 都能保持正确的执行几何；无效行不会被当成有效输入 |
 | KV、workspace 和 session 生命周期覆盖在途任务 | metadata 中保存的引用在执行时仍然有效 |
+
+#### staging 是什么，为什么复用前要等
+
+**Host 就是 CPU 这一侧；staging 在这里指 CPU 上暂存待上传数据的缓冲区。** `prepare_cpu` 把 offsets、长度等布局数字写进去，再通过 H2D（Host to Device，即 CPU→GPU）复制到设备内存。它既不是模型的 KV cache，也不是 GPU 上的目标缓冲区。
+
+参考实现使用 pinned Host memory，也就是供设备传输使用的页锁定 CPU 内存。先记住它的用途即可：**准备好的布局数字先放在这里，GPU 的复制任务稍后从这里取走。**
+
+异步复制的“异步”意味着：CPU 提交任务后可以继续做别的事，但复制可能还没开始，也可能尚未结束。因此，提交上传后不能马上改写这块 CPU 缓冲区。
+
+例如，D0 的 suffix 长度是 1，D1 的是 2，两步的分段边界分别如下：
+
+| 时刻 | CPU 的动作 | 为什么要注意 |
+| --- | --- | --- |
+| 准备 D0 | 把 `[0, 1, 2, 3, 4]` 写入 CPU 缓冲区 A，提交上传。 | 上传提交了，不代表 GPU 已经复制完 A。 |
+| 准备 D1 | 想把 `[0, 2, 4, 6, 8]` 写进上传缓冲区。 | 如果 A 还没复制完就改写 A，D0 可能收到错误数据，甚至新旧值混杂。 |
+| 使用另一块缓冲区 | 把 D1 的数字写进空闲的 B，保留 A 的内容。 | D0 可以继续从 A 复制，CPU 也能准备 D1。 |
+| 再次使用 A | 先检查 A 上一次上传的完成事件；若未完成，就等它完成。 | 确认复制任务不再读取 A 后，才能用新一步的数据覆盖 A。 |
+
+所谓“复用事件”，这里具体指**该缓冲区的 H2D 上传完成事件**，可以把它理解为上传任务完成的通知。实现会在上传操作之后记录事件；CPU 在复用前据此判断能否覆盖缓冲区。等待的是这次上传完成，不必等这一轮模型 Forward 全部结束。
+
+所以，“独立 staging”和“等待事件”并不是用了前者就永远不需要后者：**两块缓冲区让 CPU 有机会先写另一块；轮到旧缓冲区再次使用时，仍要检查上传是否完成。** 第 8 节进一步说明双缓冲区与固定设备地址怎样配合。
+
+这和 3.4 并不矛盾：构建 metadata 只是保存 GPU 存储的引用，可以提前；改写上传源缓冲区会改变尚未传完的数据，必须等它不再被读取。
+
+#### 哪些工作仍然不能直接提前
 
 如果某个 metadata builder 需要对 GPU 结果执行 `.item()`、`.cpu().tolist()`，根据实际 surviving Beam 数压缩形状，或先把父节点读到 Host 再重建 KV 映射，它就存在新的设备结果依赖，不能直接套用上述提前构建方式。应先拆开独立布局与动态绑定，或保留必要等待。
 
@@ -718,7 +719,7 @@ Worker 提交控制信息 D2H 后返回一个异步输出对象。输出消费�
 
 ### 8.1 为什么需要两份 Host staging
 
-CPU 准备下一步时，上一份 Host 数据可能仍被异步 H2D 使用。双 staging 让 CPU 能写另一份 Host 内存。
+如 3.5 所述，staging 就是 CPU 上暂存待上传数据的缓冲区。CPU 准备下一步时，上一块缓冲区可能还没上传完；双 staging 就是准备 A、B 两块缓冲区，让 CPU 可以先写另一块空闲的缓冲区。再次使用任何一块之前，仍要确认它上一次上传已经完成。
 
 在本文方案中，两份 Host staging 上传到一份固定地址的设备布局存储；上传与 Forward 按流顺序执行。
 
