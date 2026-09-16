@@ -124,7 +124,12 @@ prompt 长度为 900、BeamWidth 为 128 时：
 
 CPU 可以先组织好“128 行怎样排列、每行的位置在哪里”，GPU 随后补上“每行真正输入哪个 token、是否有效”。这里没有预测 token；使用的始终是前一步实际计算出的结果。
 
-```mermaid
+![图 1：CPU 提前准备与 GPU 有序执行](./assets/async-scheduling-guide/figure-01.png)
+
+<details>
+<summary>查看图 1 的 Mermaid 源码</summary>
+
+```text
 flowchart TD
     H["Host已知信息：长度、步数、宽度、block IDs"] --> C["CPU：准备下一步布局和metadata"]
     C --> Q["提前提交下一步设备操作"]
@@ -138,6 +143,8 @@ flowchart TD
     class G,S,B,F device
 ```
 
+</details>
+
 **图 1：CPU 准备与 GPU 当前步计算可以重叠；真实输入绑定必须等待前一步状态写入。** 箭头表示准备条件或设备顺序依赖，不表示 CPU 需要逐项等待 GPU 返回。
 
 ### 3.3 prepare_cpu 为什么可以提前做
@@ -146,22 +153,83 @@ flowchart TD
 
 `Host 已知的 prompt 长度 + 计划 decode_step + 本步计划输入宽度 + Host 上的 prompt block IDs + 已确定的存储布局`
 
-它主要进行列表、偏移和长度计算，再把布局写入本次 dispatch 选中的 pinned Host staging。对应例子中的计算如下：
+它主要进行列表、偏移和长度计算，再把布局写入本次 dispatch 选中的 pinned Host staging。下面先解释这些字段描述什么，再说明它们如何被消费。
 
-| 要准备的字段 | 计算来源 | 是否依赖上一轮生成结果 |
+#### 先统一一个小例子
+
+为便于展开数组，本节将 BeamWidth 缩小为 4，假设四条路径都有效：
+
+- `prompt_len = 900`：共享 prompt 的位置为 0–899。
+- `W = 4`：本步有四个输入 token，每个 Beam 一个。
+- `decode_step = 1`：正在准备 D1，即第二次 Decode Forward。
+- P 已选出各路径的第一个生成 token，D0 选出了第二个；D1 把第二个作为输入，计算第三个的 logits。
+- D1 当前输入位置为 901。Attention 读取的计划长度为 902：900 个共享 prompt token，加各路径的两个 suffix token，其中第二个就是当前输入。
+
+**Q 是当前输入 token 经过投影得到的 Query 向量，KV 是 Attention 要读取的 Key/Value。** 本例每层有四行 Q；每行 Q 都需要读取共享的 900 个 prefix KV，以及自己路径的两个 suffix KV。当前输入的 KV 会在该层计算过程中写入，长度描述包含它。
+
+| Attention 部分 | Q 怎样分组 | 每组读取多少 KV | 为什么这样组织 |
+| --- | --- | --- | --- |
+| Prefix | 一组，包含四行 Q | 同一份 900 个共享 prompt KV | 四条路径的 prompt 相同，可以复用同一份 KV |
+| Suffix | 四组，每组一行 Q | 每组两个，来自该 Beam 自己的路径 | 各路径的生成后缀不同，必须分组读取 |
+
+这解释了为什么同样的四行 Q，在 prefix 和 suffix 两部分使用不同 offsets。分组不表示四条 Beam 彼此做 Attention；每行 Q 仍然得到自己的计算结果。后端根据两部分的 softmax 统计合并 prefix/suffix 结果，不能简单把两个输出平均。[Attention 消费与合并逻辑][gr-attention]
+
+#### 字段、示例值和操作含义
+
+| 文档字段（布局键） | 本例提前准备的值 | 含义与后续操作 |
 | --- | --- | --- |
-| positions | `[prompt_len + decode_step] × W` | 否 |
-| prefix query offsets | `[0, W]` | 否 |
-| 计划总长度 | `prompt_len + decode_step + 1` | 否 |
-| prefix KV 长度 | `prompt_len` | 否 |
-| prefix block table | 已分配的 prompt block IDs，补齐固定容量 | 否 |
-| suffix query offsets | `[0, 1, ..., W]` | 否 |
-| suffix KV 计划长度 | 每行 `decode_step + 1` | 否 |
-| suffix KV offsets | 第 i 个偏移为 `i × (decode_step + 1)` | 否 |
+| positions（`positions`） | `[901, 901, 901, 901]` | 每个当前输入 token 的序列位置；模型据此应用位置编码，例如 RoPE。不是 token ID，也不是 KV 地址。 |
+| prefix query offsets（`query`） | `[0, 4]` | 把四行 Q 作为一个共享前缀组；prefix Attention 从 Q 的第 0 行取到第 4 行之前，并让它们读取同一份 prefix KV。 |
+| 计划总长度（`sequence`） | `[902]` | 当前请求在本步的完整逻辑上下文长度，包含当前输入；用于 common metadata 的 `seq_lens` 描述。本路径的两段 Attention 还分别使用 prefix/suffix 长度。 |
+| prefix KV 长度（`prefix_lengths`） | `[900]` | 共享 prompt 中有 900 个有效 KV token；prefix Attention 用它限制 block table 对应存储中的有效读取范围。 |
+| prefix block table（`blocks`） | 已分配的 prompt block IDs，末尾按容量补齐 | 将逻辑 prompt block 映射到设备 KV cache 中的物理 block，决定去哪里读取 prefix KV。 |
+| suffix query offsets（`suffix_query`） | `[0, 1, 2, 3, 4]` | 把四行 Q 分成四组，一组一个 Beam；第 i 组使用 Q 的第 i 行。 |
+| suffix KV 计划长度（`suffix_lengths`） | `[2, 2, 2, 2]` | 每条路径在本步有两个有效 suffix KV token，包含当前输入。注意这是每个 Beam 的长度，不是四条路径加起来的总数。 |
+| suffix KV offsets（`suffix_offsets`） | `[0, 2, 4, 6, 8]` | 在按 Beam 打包的 suffix KV 视图中，每组占两个 KV 行；后端据此划分各 Beam 的有效 KV 范围。不是 token 值或父节点 ID。 |
 
-其中 `W` 表示本步的计划输入 Beam 数，即 `W_in[t]`；在固定宽度例子中，每步恰好都是 128。`decode_step` 是调度器下发的计划步编号。prompt block IDs 已有 Host 记录，在途 KV 引用与资源所有权保证它们不会被其他请求提前复用。
+其中 `W` 表示本步计划输入 Beam 数，即 `W_in[t]`；`decode_step` 是调度器下发的计划步编号。这些示例值均不需要先读取上一轮的真实 token。
 
-表中的 suffix offsets 描述当前输入各行对应的逻辑 Attention 分段。若底层 KV 采用跨 Step 不同宽度的物理存储，历史段起点、stride 和祖先索引还需要独立适配，不能把这里的逻辑偏移直接当成历史 KV 的物理地址，详见 3.6。
+#### offsets 到底表示什么
+
+`offsets` 是分段边界，也常写为 `cu_seqlens`（累计长度）。约定第 i 组使用半开区间 `[offsets[i], offsets[i+1])`，因此有 N 组就需要 N+1 个边界。
+
+| 本例对象 | offsets | 实际划分 |
+| --- | --- | --- |
+| Prefix 的四行 Q | `[0, 4]` | 只有一组：Q 行 0、1、2、3 |
+| Suffix 的四行 Q | `[0, 1, 2, 3, 4]` | 四组分别取 Q 行 0、1、2、3 |
+| Suffix 的八行 KV | `[0, 2, 4, 6, 8]` | 四组分别取 KV 行 0–1、2–3、4–5、6–7 |
+
+例如 Beam 2（从 0 起算）：它的 suffix query 范围是 `[2,3)`，只取 Q 第 2 行；suffix KV 范围是 `[4,6)`，取该路径的两个 KV 行。这样 Q 不会错误地读取其他 Beam 的 suffix。
+
+这些 offsets 的单位是打包视图中的 Q/KV 行，不是字节。参考后端先把各 Beam 的有效 suffix KV 整理到打包缓冲区，再交给 Attention 使用这组边界。它们不等于原始 Beam KV pool 中的物理地址；跨 Step 变宽时，历史段起点、stride 和祖先索引仍需独立适配，详见 3.6。
+
+#### block table 到底操作哪一层地址
+
+假设 block size 为 16，prompt 长度 900 需要 `ceil(900/16) = 57` 个逻辑 block，最后一个只使用其中四个位置。举例说明其映射：
+
+| 逻辑 prompt block | 覆盖的 prompt 位置 | block table 中的物理 block ID，示意 |
+| --- | --- | --- |
+| 0 | 0–15 | 17 |
+| 1 | 16–31 | 42 |
+| 2 | 32–47 | 9 |
+| … | … | … |
+| 56 | 896–899，有效四个位置 | 63 |
+
+若要读取 prompt 位置 20，先得到逻辑 block `20 // 16 = 1`、块内偏移 `20 % 16 = 4`，再查 `block_table[1] = 42`，从物理 block 42 的第 4 个位置读取该层 KV。
+
+CPU 准备的是这些 block ID，不是在准备或复制 K/V 向量本身。固定容量末尾补齐也不代表新增有效 KV，有效范围仍由 prefix 长度等 metadata 限制。在途 KV 引用和资源所有权保证这些 block 不会被其他请求提前复用。
+
+#### CPU 准备、metadata 构建、GPU 消费的分工
+
+| 执行位置 | 具体操作 |
+| --- | --- |
+| `prepare_cpu` | 从 Host 已知的长度、步数、宽度、block IDs 计算上表整数数组，写入 pinned Host staging。 |
+| 布局上传 | 异步把整数数组复制到对应设备布局存储。 |
+| `buildMetadata` | 把标量、CPU 列表、设备 Tensor view 和 session 引用放入 Attention 描述对象。 |
+| 设备绑定 | 读取上一轮真实 token、mask 与状态，验证步数，并对终止状态进行必要的屏蔽或长度修正。 |
+| 模型与 Attention | 用 positions 处理位置编码，用 offsets 划分 Q/KV 组，用长度限定有效范围，用 block table 定位共享 prefix KV。 |
+
+源码中还有一个名为 `logits` 的布局键，值为 `[0, 1, ..., W-1]`，在这里用于提供 Beam 行的索引，例如 `prefix_indices`；它存储的是行号，不是模型计算出的词表 logits。[布局构建与字段映射][gr-metadata]
 
 **这些量依赖“准备执行哪一步”，不依赖“上一步选中了哪个 token”。** 所以只要拿到调度元信息和可用 staging，CPU 就能计算，无需等待上一轮 GPU 结果。
 
@@ -779,5 +847,6 @@ Graph 重放有助于更早结束当前阶段提交，让 CPU 更早进入下一
 [gr-worker]: https://github.com/zhanghanleo10/vllm-gr/blob/ee3c7129a47f9db688880f163dd810206e8e9b9d/vllm_gr/v1/worker/gpu_beam_stage_runner.py#L502-L604
 [gr-inputs]: https://github.com/zhanghanleo10/vllm-gr/blob/ee3c7129a47f9db688880f163dd810206e8e9b9d/vllm_gr/v1/worker/gr_inputs.py
 [gr-metadata]: https://github.com/zhanghanleo10/vllm-gr/blob/ee3c7129a47f9db688880f163dd810206e8e9b9d/vllm_gr/v1/attention/backends/beam_attn_metadata.py#L140-L244
+[gr-attention]: https://github.com/zhanghanleo10/vllm-gr/blob/ee3c7129a47f9db688880f163dd810206e8e9b9d/vllm_gr/v1/attention/backends/beam_attn_gpu.py#L204-L383
 [native-inputs]: https://github.com/vllm-project/vllm/blob/v0.22.1/vllm/v1/worker/gpu_model_runner.py#L3653-L3666
 [queue-test]: https://github.com/zhanghanleo10/vllm-gr/blob/ee3c7129a47f9db688880f163dd810206e8e9b9d/tests/test_async_scheduling_scheduler.py#L247-L305
