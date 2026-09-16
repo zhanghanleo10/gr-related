@@ -241,7 +241,32 @@ CPU 准备的是这些 block ID，不是在准备或复制 K/V 向量本身。�
 
 本文用 `buildMetadata` 表示 Host 上构建 Attention metadata 的工作；参考实现的相应入口是 `BeamAttentionMetadataBuilder.build_async()`，由 `_bind_attention()` 调用。
 
-Metadata 通常是一个描述对象，包含三类东西：
+**3.3 主要回答“布局里的数值怎么算”；3.4 回答“怎样把这些数值和设备缓冲区组织成 Attention 能使用的描述”。** 这两步之后，模型和 Attention 才按该描述实际计算。
+
+#### 沿用四条 Beam 的例子
+
+继续使用 `prompt_len=900`、`W=4`、`decode_step=1`。`prepare_cpu` 已经算好了：
+
+```python
+# CPU上的计划布局；示意只列出部分字段。
+layout = {
+    "positions": [901, 901, 901, 901],
+    "query": [0, 4],
+    "sequence": [902],
+    "prefix_lengths": [900],
+    "suffix_query": [0, 1, 2, 3, 4],
+    "suffix_lengths": [2, 2, 2, 2],
+    "suffix_offsets": [0, 2, 4, 6, 8],
+}
+```
+
+与此同时，Worker 已经持有相应设备布局缓冲区、mask buffer 和 Beam session。此时 CPU 知道这些存储在哪里、容量多大；不要求其中已经包含本轮最终有效内容。
+
+`buildMetadata` 把两类信息接起来：Host 已知的计划描述，以及稍后 GPU 将读取的设备存储引用。
+
+#### Metadata 对象里究竟装了什么
+
+Metadata 外层是一个 Host/Python 描述对象。它既可以持有 CPU 数值和列表，也可以持有设备 Tensor 的 Python 引用；设备 Tensor 的实际元素仍存放在 GPU 上。
 
 | 类型 | 示例 | CPU 构造时是否需要读 GPU 结果 |
 | --- | --- | --- |
@@ -249,30 +274,101 @@ Metadata 通常是一个描述对象，包含三类东西：
 | 设备 Tensor 的引用或 view | block table、device offsets、device lengths | 不需要，只需已有 Tensor 对象与地址 |
 | 持久对象引用 | Beam session、active mask buffer、KV pool 相关对象 | 不需要，绑定已有对象即可 |
 
-若 D0 输入 128 条 Beam、D1 输入 64 条 Beam，CPU 可以分别构建 128 行和 64 行的 metadata。需要读取的是预设的 `W_in[t]`，不是上一轮实际选出的 token 或父节点。设备引用必须对应已分配、执行期间有效的存储；图模式还要求与本步选择的 Graph 地址、形状和 stride 一致。
+本例中的具体字段映射如下：
 
-最关键的区别是：
+| 3.3 准备的内容 | buildMetadata 中的去向 | 后续作用 |
+| --- | --- | --- |
+| 输入行数 4 | `num_actual_tokens=4`、`num_prefix_indices=4` | 描述本步提交的四行输入；四行中是否有效还由 mask 控制 |
+| 请求数 1 | `num_reqs=1` | 一个请求拥有四条 Beam，不能把 Beam 数当成请求数 |
+| CPU query offsets `[0,4]` | `query_start_loc_cpu` 等 CPU 列表字段 | Host 侧可直接使用的分组描述 |
+| 设备 query offsets buffer | `query_start_loc`、`prefix_cu_seqlens_q_device` | prefix Attention 读取设备上的 `[0,4]` 分组边界 |
+| 总长度 `[902]` | CPU 版本进入 `seq_lens_cpu`，设备引用进入 `seq_lens` | 提供 Host 与设备两侧的计划长度描述 |
+| 设备 prefix 长度 buffer | `prefix_seqlens_kv_device` | prefix Attention 读取有效长度 900 |
+| 设备 block table buffer | `.view(1, -1)` 后进入 `block_table`、`prefix_block_table` | 一个请求对应一行 block IDs，供 prefix KV 寻址 |
+| 设备 suffix query offsets buffer | `suffix_cu_seqlens_q_device` | suffix Attention 将 Q 分成四个单行组 |
+| 设备 suffix KV offsets buffer | `suffix_cu_seqlens_k_device` | suffix Attention 从设备读取各 Beam 的 KV 分段边界 |
+| 设备 suffix 长度 buffer | `suffix_seqlens_kv_device` 等长度描述 | 记录每行的计划有效长度，设备绑定还可按实际状态修正相关字段 |
+| 固定设备 execution mask buffer | `beam_active_mask` | 相关设备操作读取真实有效 mask，屏蔽已经结束的路径 |
+| 已有 Beam session 对象 | `beam_session` | 后端通过它找到持久 session 与 suffix KV 相关资源 |
 
-> **把一个设备 Tensor 的引用放入 metadata，不等于现在就读取这个 Tensor 的设备内容。**
+`positions` 的路径略有不同：它由 Worker 绑定到模型的 `positions` 输入，供位置编码使用，并不是上表 Attention metadata 中的一个同名字段。[布局构建与字段映射][gr-metadata] · [Worker 绑定入口][gr-bind-attention]
 
-例如，CPU 可以先创建一份 metadata，其中 `beam_active_mask` 指向固定设备 mask buffer。此时无需知道 D0 结束后哪些 Beam 有效。GPU 稍后按序更新该 buffer，Attention 真正执行时才读取更新后的 mask。
+#### “保存引用”和“读取设备内容”有什么区别
 
-同理，H2D 上传可以先排入计算流；CPU 随后立刻把目标设备 Tensor 的 view 放进 metadata。上传尚未执行完成，也不妨碍 CPU 构建引用。只要 Attention 的设备读取排在上传与动态绑定之后，就能读到正确内容。
+假设设备上有一块 `mask_buffer`，CPU 已经持有它的 Tensor 对象：
 
 ```python
-# 机制示意：upload()提交异步复制，build_metadata()只构造Host描述。
-views = enqueue_layout_h2d(prepared_host_layout)
-metadata = build_metadata(
-    cpu_layout=prepared_host_layout,
-    device_views=views,
-    beam_session=persistent_session,
-    active_mask=fixed_device_mask_buffer,
+# 只把已有Tensor对象交给metadata，不把GPU元素取回CPU。
+metadata.beam_active_mask = mask_buffer
+```
+
+这一步的含义是：“后面需要 mask 时，从这块设备存储读取。”CPU 不必先知道 buffer 中最后会是 `[True, True, False, True]` 还是其他值。
+
+等 GPU 完成 D0 的 Beam 更新后，D1 的设备绑定根据真实状态更新这块 execution mask。随后相关 Attention/KV 操作读取的就是更新后的内容。固定四行布局仍然保留，mask 决定哪些行有效。
+
+这和下面的操作有本质上的依赖差别：
+
+```python
+# 需要把GPU元素读回CPU；会引入设备结果的完成依赖。
+host_mask = mask_buffer.cpu().tolist()
+```
+
+前者保存引用，后者读取值。允许 metadata 提前构建的关键，是这条构建路径不需要后一类设备结果读取。
+
+类似地，参考实现中 `views["blocks"].view(1, -1)` 只给已有连续设备存储增加一个形状视图，不复制整份 KV、不计算 Attention，也不把 block IDs 读回 Host。CPU 能从 Tensor 对象知道 shape、stride 和 dtype，这些描述不需要等待 GPU 生成结果。
+
+#### 布局上传还没结束，为什么也能先建 metadata
+
+`upload()` 会把 H2D 复制排进计算流，然后返回指向目标设备存储的各个 view。CPU 随后可以立即构建 metadata，因为目标存储已经存在。
+
+```python
+# 机制示意。GPU缓冲区已分配，并满足在途任务的复用保护。
+device_layout.copy_(host_staging, non_blocking=True)
+
+# 此时H2D可能还在排队；创建view不需要读取它的设备元素。
+query_view = device_layout[query_slice]
+sequence_view = device_layout[sequence_slice]
+
+# 只展示部分字段；实际构造还包含其他布局、配置和session信息。
+metadata = make_attention_metadata(
+    num_actual_tokens=4,
+    query_start_loc_cpu=[0, 4],
+    query_start_loc=query_view,
+    seq_lens_cpu=[902],
+    seq_lens=sequence_view,
+    beam_active_mask=mask_buffer,
 )
+
+# 设备真正读取前，先按流顺序完成H2D和真实状态绑定。
 enqueue_bind_actual_device_state(metadata)
 enqueue_attention_forward(metadata)
 ```
 
-`buildMetadata` 的 CPU 描述构建可以与前一步 GPU 工作重叠；H2D、真实状态绑定及 Attention 执行仍按设备依赖顺序发生。
+`non_blocking=True` 本身不是完整的正确性保证；这里还需要 pinned Host staging、有效的缓冲区生命周期，以及前一步、上传、设备绑定、Forward 之间明确的流或事件顺序。
+
+#### CPU 和 GPU 的时间线怎样错开
+
+假设 D0 仍在 GPU 上运行，D1 已经获得调度窗口名额：
+
+| 顺序 | Worker CPU | GPU 计算流 |
+| --- | --- | --- |
+| 1 | `prepare_cpu(D1)` 算出四行输入的整数布局 | 执行 D0 Forward 和后处理 |
+| 2 | 提交 D1 布局 H2D，获得目标设备存储的 view | D1 上传可以先排队，等待前面的设备工作 |
+| 3 | `buildMetadata(D1)` 构造 Host 对象、复制小列表、保存设备引用 | D0 仍可继续执行，CPU无需知道其真实 token 和 mask |
+| 4 | 提交 D1 设备绑定与 Forward | 完成 D0 状态更新，按序执行 D1 上传与动态绑定 |
+| 5 | 后续处理或推进队列 | D1 读取已经更新的 offsets、mask、token 和 KV 状态并计算 |
+
+**被提前并可能覆盖的是步骤 3 的 Host 对象构造等工作。GPU 真正消费 metadata 指向的数据时，前置写入仍然必须已经完成。** 如果步骤 3 开始时 D0 已经算完，它依然是可提前的工作，但这次执行没有获得实际覆盖窗口。
+
+P→D 使用同一原理，不过参考实现中的 metadata 构造位于 Prefill Host 输入复用保护和所需 Host 状态更新之后，具体顺序见 4.4。
+
+#### 逐步变宽和 Graph 的额外约束
+
+若 D0 输入 128 条 Beam、D1 输入 64 条 Beam，CPU 可以从预设 `W_in[t]` 分别构建 128 行和 64 行描述，不必等待具体胜出路径。设备引用必须对应已分配且有效的存储，后端也必须适配该宽度计划。
+
+Graph 模式还要求设备地址、形状、stride 和所选图兼容。**新建一个 Python metadata 对象，不会自动改写已经捕获的 CUDA Graph。** 重放时仍需更新图所引用的固定设备存储；多宽度场景则选择事先准备好的兼容图或采用已适配的 padding 方案。
+
+在本文参考路径中，`buildMetadata` 的主要 Host 工作是构造描述、列表和 Tensor 引用，布局 H2D 与动态设备绑定分别处理。其他后端的同名 builder 可能还会分配 workspace、启动 kernel 或读取设备结果；能否提前要逐项核对其依赖，不能仅根据函数名判断。
 
 ### 3.5 能提前的前提，以及不能提前的边界
 
@@ -847,6 +943,7 @@ Graph 重放有助于更早结束当前阶段提交，让 CPU 更早进入下一
 [gr-worker]: https://github.com/zhanghanleo10/vllm-gr/blob/ee3c7129a47f9db688880f163dd810206e8e9b9d/vllm_gr/v1/worker/gpu_beam_stage_runner.py#L502-L604
 [gr-inputs]: https://github.com/zhanghanleo10/vllm-gr/blob/ee3c7129a47f9db688880f163dd810206e8e9b9d/vllm_gr/v1/worker/gr_inputs.py
 [gr-metadata]: https://github.com/zhanghanleo10/vllm-gr/blob/ee3c7129a47f9db688880f163dd810206e8e9b9d/vllm_gr/v1/attention/backends/beam_attn_metadata.py#L140-L244
+[gr-bind-attention]: https://github.com/zhanghanleo10/vllm-gr/blob/ee3c7129a47f9db688880f163dd810206e8e9b9d/vllm_gr/v1/worker/gpu_beam_stage_runner.py#L413-L468
 [gr-attention]: https://github.com/zhanghanleo10/vllm-gr/blob/ee3c7129a47f9db688880f163dd810206e8e9b9d/vllm_gr/v1/attention/backends/beam_attn_gpu.py#L204-L383
 [native-inputs]: https://github.com/vllm-project/vllm/blob/v0.22.1/vllm/v1/worker/gpu_model_runner.py#L3653-L3666
 [queue-test]: https://github.com/zhanghanleo10/vllm-gr/blob/ee3c7129a47f9db688880f163dd810206e8e9b9d/tests/test_async_scheduling_scheduler.py#L247-L305
